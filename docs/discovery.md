@@ -59,6 +59,9 @@ explicit authentication source is copied or forwarded.
 - Denial of permission escalation.
 - Application-owned timeout, cancellation, child-process termination, concurrency, and
   admission bounds.
+- Repository fingerprint discovery in an isolated package-owned Python helper with strict
+  versioned stdin/stdout contracts, bounded output, minimal environment, closed descriptors,
+  and terminate/kill/reap cleanup shared by every Git inspection subprocess.
 - Isolated Codex configuration/home and an allowlisted process environment.
 - Web search, apps/connectors, multi-agent tools, goals, hooks, skill dependency installs,
   and project instruction loading disabled through isolated configuration.

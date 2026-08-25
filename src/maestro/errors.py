@@ -61,6 +61,10 @@ class RepositoryNotFoundError(MaestroError):
     default_message = "The repository path does not exist or is not a directory."
 
 
+class RepositoryInspectionError(MaestroError):
+    """A trusted repository-inspection helper failed its private protocol."""
+
+
 class RepositoryChangedError(MaestroError):
     code = ErrorCode.REPOSITORY_CHANGED_DURING_INVESTIGATION
     default_message = "The repository changed during investigation; retry against a stable state."

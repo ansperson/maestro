@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import sys
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 from helpers.audit_boundary_fixtures import audit_payload_boundary_result
 
+import maestro.repository.guard as repository_module
 from maestro.agents import FakeAgentRuntime, InvestigationRequest
 from maestro.audit.contracts import (
     MAX_AUDIT_OBJECTIVE_CHARS,
@@ -36,9 +39,10 @@ from maestro.errors import (
     ServerBusyError,
 )
 from maestro.execution import AdmissionController
-from maestro.repository.guard import AuthorizedRepository, RepositoryFingerprint, RepositoryGuard
+from maestro.repository.guard import RepositoryGuard
 
 SettingsFactory = Callable[..., Settings]
+_FINGERPRINT_PROCESS_FIXTURE = Path(__file__).parent / "helpers" / "fingerprint_process.py"
 
 
 def _request(
@@ -217,23 +221,21 @@ async def test_initial_fingerprint_timeout_cancels_before_audit_or_worker(
 ) -> None:
     settings = settings_factory(
         allowed_roots=(repository,),
-        verifier_timeout_seconds=0.01,
+        verifier_timeout_seconds=0.2,
     )
     guard = RepositoryGuard(settings)
-    entered = asyncio.Event()
-    cancelled = asyncio.Event()
-
-    async def block_fingerprint(
-        _repository: AuthorizedRepository,
-    ) -> RepositoryFingerprint:
-        entered.set()
-        try:
-            await asyncio.Event().wait()
-        finally:
-            cancelled.set()
-        raise AssertionError("unreachable")
-
-    monkeypatch.setattr(guard, "fingerprint", block_fingerprint)
+    marker = repository.parent / "service-fingerprint-timeout.pid"
+    monkeypatch.setattr(
+        repository_module,
+        "_fingerprint_worker_command",
+        lambda: (
+            sys.executable,
+            "-I",
+            str(_FINGERPRINT_PROCESS_FIXTURE),
+            "block",
+            str(marker),
+        ),
+    )
     port = FakeAuditPort()
     runtime = FakeAgentRuntime(lambda _request: _result(VerificationStatus.RESOLVED))
     service = ResolveCodebaseFactService(
@@ -246,9 +248,11 @@ async def test_initial_fingerprint_timeout_cancels_before_audit_or_worker(
     with pytest.raises(AgentTimeoutError) as error:
         await service.execute(_request(repository))
 
-    assert entered.is_set()
-    assert cancelled.is_set()
     assert "AGENT_TIMEOUT" in error.value.public_json()
+    assert await asyncio.to_thread(marker.is_file)
+    process_id = int(await asyncio.to_thread(marker.read_text, encoding="ascii"))
+    with pytest.raises(ProcessLookupError):
+        os.kill(process_id, 0)
     assert port.start_attempts == []
     assert port.completion_attempts == []
     assert runtime.requests == []

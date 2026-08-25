@@ -20,7 +20,8 @@ Maestro canonicalizes allowed roots, rejects filesystem anchors plus traversal/s
 performs bounded no-follow file discovery, isolates the Codex home and environment, disables
 inherited MCPs/skills/apps/web/subagents, selects deny-all/read-only at both SDK boundaries,
 validates structured output and evidence, sanitizes results, fingerprints the repository before
-and after investigation, bounds admission/deadlines/pipes/results, owns worker cancellation, and
+and after investigation through an isolated package-owned helper with a versioned bounded protocol,
+bounds admission/deadlines/pipes/results, owns helper/Git/worker cancellation and reaping, and
 requires durable Audit start/completion records before AI work/result release. Audit connections
 are lazy and short-lived; no database connection or transaction remains open during AI work.
 Logs exclude request text, source, credentials, transcripts, model responses, and absolute
@@ -58,6 +59,10 @@ does not persist prompts, transcripts, repository content, or model output.
 - Filesystem namespace races, a compromised Python/Codex/MCP dependency, kernel compromise,
   process inspection by the same user, and failed best-effort temporary cleanup remain outside
   the application boundary.
+- The fingerprint helper receives only a canonical root and numeric limits over stdin, runs with
+  isolated Python module discovery, closed inherited descriptors, and a minimal environment, and
+  never intentionally opens a network connection. It is not an OS network sandbox; a compromised
+  interpreter or imported dependency remains covered by the broader process-compromise risk.
 - Secret scanning and output redaction are heuristic. Audit redaction detects configured roots,
   selected private/drive/UNC paths, credential-bearing URI user information, common secret forms,
   and unsafe controls by collecting spans from the original input and applying bounded replacements

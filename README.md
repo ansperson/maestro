@@ -28,7 +28,7 @@ src/maestro/
 ├── mcp/                                  # stdio/MCP adapter
 ├── audit/                                # contracts, recorder, PostgreSQL adapter/migrations
 ├── capabilities/resolve_codebase_fact/  # contracts, policy, sanitization, service
-├── repository/                           # authorization, fingerprint, evidence guard
+├── repository/                           # authorization, isolated fingerprint helper, evidence guard
 ├── agents/                               # runtime protocol and Codex adapter
 ├── execution/                            # admission and lifecycle control
 ├── observability/                        # structured stderr logging

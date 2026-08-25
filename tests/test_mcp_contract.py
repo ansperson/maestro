@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -12,6 +13,7 @@ from helpers.audit_boundary_fixtures import audit_payload_boundary_result
 from mcp import Client, StdioServerParameters
 from mcp.types import CallToolResult, TextContent
 
+import maestro.repository.guard as repository_module
 from maestro.agents import FakeAgentRuntime
 from maestro.audit.port import AuditWriteError, AuditWriteFailureKind
 from maestro.audit.testing import FakeAuditPort, fake_audit_recorder
@@ -32,9 +34,10 @@ from maestro.mcp.server import (
     TOOL_TITLE,
     create_server,
 )
-from maestro.repository.guard import AuthorizedRepository, RepositoryFingerprint, RepositoryGuard
+from maestro.repository.guard import RepositoryGuard
 
 SettingsFactory = Callable[..., Settings]
+_FINGERPRINT_PROCESS_FIXTURE = Path(__file__).parent / "helpers" / "fingerprint_process.py"
 
 
 def _first_text(result: CallToolResult) -> str:
@@ -253,25 +256,26 @@ async def test_in_memory_fingerprint_deadline_is_safe_and_pre_audit(
 ) -> None:
     settings = settings_factory(
         allowed_roots=(repository,),
-        verifier_timeout_seconds=0.01,
+        verifier_timeout_seconds=0.2,
     )
     guard = RepositoryGuard(settings)
-    cancelled = asyncio.Event()
-
-    async def block_fingerprint(
-        _repository: AuthorizedRepository,
-    ) -> RepositoryFingerprint:
-        try:
-            await asyncio.Event().wait()
-        finally:
-            cancelled.set()
-        raise AssertionError("unreachable")
-
-    monkeypatch.setattr(guard, "fingerprint", block_fingerprint)
+    marker = repository.parent / "fingerprint-timeout.pid"
+    monkeypatch.setattr(
+        repository_module,
+        "_fingerprint_worker_command",
+        lambda: (
+            sys.executable,
+            "-I",
+            str(_FINGERPRINT_PROCESS_FIXTURE),
+            "block",
+            str(marker),
+        ),
+    )
     port = FakeAuditPort()
+    runtime = FakeAgentRuntime(lambda _request: _resolved_result())
     service = ResolveCodebaseFactService(
         settings,
-        FakeAgentRuntime(lambda _request: _resolved_result()),
+        runtime,
         fake_audit_recorder(port),
         repository_guard=guard,
     )
@@ -288,8 +292,13 @@ async def test_in_memory_fingerprint_deadline_is_safe_and_pre_audit(
     assert result.is_error is True
     assert "AGENT_TIMEOUT" in text
     assert "AUDIT_" not in text
-    assert cancelled.is_set()
+    assert await asyncio.to_thread(marker.is_file)
+    process_id = int(await asyncio.to_thread(marker.read_text, encoding="ascii"))
+    with pytest.raises(ProcessLookupError):
+        os.kill(process_id, 0)
     assert port.start_attempts == []
+    assert port.completion_attempts == []
+    assert runtime.requests == []
 
 
 @pytest.mark.asyncio
