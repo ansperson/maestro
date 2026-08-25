@@ -78,6 +78,16 @@ def _mutated_result(  # noqa: C901,PLR0912 - hostile fixture matrix
         item["relative_path"] = "src\\file.py"
     elif mode == "nul":
         item["relative_path"] = "bad\x00file"
+    elif mode == "drive":
+        item["relative_path"] = "C:/outside"
+    elif mode == "c1-path":
+        item["relative_path"] = "bad\u0085file"
+    elif mode == "c1-token":
+        item["token"] = "bad\u0085token"  # noqa: S105 - intentionally invalid state token
+    elif mode == "bidi-path":
+        item["relative_path"] = "bad\u202efile"
+    elif mode == "format-token":
+        item["token"] = "bad\u2066token"  # noqa: S105 - intentionally invalid state token
     elif mode == "wrong-version":
         result["protocol_version"] = 2
     elif mode == "count-mismatch":
@@ -132,6 +142,7 @@ def main() -> int:  # noqa: PLR0911 - process-mode fixture exits explicitly
         expected_environment = set(sys.argv[2].split(","))
         expected_environment.add("__CF_USER_TEXT_ENCODING")
         descriptor = int(sys.argv[3])
+        expected_cwd = Path(sys.argv[4])
         try:
             os.fstat(descriptor)
         except OSError:
@@ -141,7 +152,11 @@ def main() -> int:  # noqa: PLR0911 - process-mode fixture exits explicitly
         result = _valid_result()
         files = result["files"]
         item = files[0]
-        clean = set(os.environ) == expected_environment and descriptor_closed
+        clean = (
+            set(os.environ) == expected_environment
+            and descriptor_closed
+            and Path.cwd() == expected_cwd
+        )
         item["token"] = "probe:clean" if clean else "probe:unsafe"
         _write_result(result)
         return 0

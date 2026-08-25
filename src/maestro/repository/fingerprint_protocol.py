@@ -2,14 +2,23 @@
 
 from __future__ import annotations
 
-from pathlib import PurePosixPath
+import unicodedata
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
 
 FINGERPRINT_PROTOCOL_VERSION = 1
 MAX_FINGERPRINT_REQUEST_BYTES = 16_384
 MAX_FINGERPRINT_RESULT_BYTES = 16_777_216
+MAX_CANONICAL_PATH_RESULT_BYTES = 16_384
 MAX_RELATIVE_PATH_CHARS = 4_096
 MAX_STATE_TOKEN_CHARS = 8_192
 
@@ -18,8 +27,7 @@ _MAX_REPOSITORY_BYTES = 1_073_741_824
 _MAX_FILE_BYTES = 67_108_864
 _MAX_FILE_SIZE = (1 << 63) - 1
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
-_FIRST_CONTROL_FREE_CODEPOINT = 32
-_DELETE_CODEPOINT = 127
+_UNSAFE_UNICODE_CATEGORIES = frozenset({"Cc", "Cf", "Cs"})
 
 RelativePath = Annotated[
     str,
@@ -72,6 +80,30 @@ class FingerprintScanResultV1(_StrictFrozenModel):
     truncated: bool
 
 
+class CanonicalPathRequestV1(_StrictFrozenModel):
+    """One bounded Git-reported path to canonicalize in an owned child."""
+
+    protocol_version: Literal[1]
+    path: Annotated[str, StringConstraints(min_length=1, max_length=MAX_RELATIVE_PATH_CHARS)]
+
+    @field_validator("path")
+    @classmethod
+    def reject_unsafe_unicode(cls, value: str) -> str:
+        if _contains_unsafe_unicode(value):
+            raise ValueError("canonical path request contains unsafe Unicode")
+        return value
+
+
+class CanonicalPathResultV1(_StrictFrozenModel):
+    """Canonical absolute directory returned by the path helper."""
+
+    protocol_version: Literal[1]
+    canonical_path: Annotated[
+        str,
+        StringConstraints(min_length=1, max_length=MAX_RELATIVE_PATH_CHARS),
+    ]
+
+
 def validate_fingerprint_result(
     result: FingerprintScanResultV1,
     request: FingerprintScanRequestV1,
@@ -100,7 +132,7 @@ def validate_fingerprint_result(
 
 def _validate_file(item: FingerprintFileV1, request: FingerprintScanRequestV1) -> None:
     _validate_relative_path(item.relative_path)
-    if _contains_control(item.token):
+    if _contains_unsafe_unicode(item.token):
         raise ValueError("fingerprint state token contains control characters")
     if item.consumed_bytes > request.max_file_bytes:
         raise ValueError("fingerprint file exceeds requested byte bound")
@@ -115,11 +147,12 @@ def _validate_file(item: FingerprintFileV1, request: FingerprintScanRequestV1) -
 
 
 def _validate_relative_path(value: str) -> None:
-    if "\x00" in value or "\\" in value or _contains_control(value):
+    if "\\" in value or _contains_unsafe_unicode(value):
         raise ValueError("fingerprint path is not a normalized relative path")
     path = PurePosixPath(value)
     if (
         path.is_absolute()
+        or bool(PureWindowsPath(value).drive)
         or value.startswith("//")
         or ".." in path.parts
         or path.as_posix() != value
@@ -128,8 +161,15 @@ def _validate_relative_path(value: str) -> None:
         raise ValueError("fingerprint path is not a normalized relative path")
 
 
-def _contains_control(value: str) -> bool:
-    return any(
-        ord(character) < _FIRST_CONTROL_FREE_CODEPOINT or ord(character) == _DELETE_CODEPOINT
-        for character in value
-    )
+def validate_canonical_path_result(result: CanonicalPathResultV1) -> Path:
+    """Validate one untrusted helper result without touching the filesystem."""
+
+    value = result.canonical_path
+    path = Path(value)
+    if _contains_unsafe_unicode(value) or not path.is_absolute() or ".." in path.parts:
+        raise ValueError("canonical path result is invalid")
+    return path
+
+
+def _contains_unsafe_unicode(value: str) -> bool:
+    return any(unicodedata.category(character) in _UNSAFE_UNICODE_CATEGORIES for character in value)

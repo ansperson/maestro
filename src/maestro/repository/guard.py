@@ -23,9 +23,13 @@ from maestro.errors import (
 )
 from maestro.repository.fingerprint_protocol import (
     FINGERPRINT_PROTOCOL_VERSION,
+    MAX_CANONICAL_PATH_RESULT_BYTES,
     MAX_FINGERPRINT_RESULT_BYTES,
+    CanonicalPathRequestV1,
+    CanonicalPathResultV1,
     FingerprintScanRequestV1,
     FingerprintScanResultV1,
+    validate_canonical_path_result,
     validate_fingerprint_result,
 )
 from maestro.repository.fingerprint_scan import FileState, file_state
@@ -145,7 +149,7 @@ class RepositoryGuard:
             )
             completed = await run_owned_process(
                 _fingerprint_worker_command(),
-                cwd=_fingerprint_worker_cwd(),
+                cwd=_trusted_worker_cwd(root),
                 environment=_fingerprint_environment(),
                 input_data=request.model_dump_json().encode("utf-8"),
                 max_stdout_bytes=MAX_FINGERPRINT_RESULT_BYTES,
@@ -226,12 +230,8 @@ async def _git_state(root: Path) -> tuple[Path | None, str | None, str | None]:
     top_level_output = await _run_git(root, "rev-parse", "--show-toplevel")
     if top_level_output is None:
         return None, None, None
-    try:
-        top_level = await asyncio.to_thread(
-            Path(top_level_output.decode().strip()).resolve,
-            strict=True,
-        )
-    except (OSError, UnicodeDecodeError):
+    top_level = await _canonicalize_git_top_level(root, top_level_output)
+    if top_level is None:
         return None, None, None
     head_output, status_output = await asyncio.gather(
         _run_git(root, "rev-parse", "--verify", "HEAD"),
@@ -285,12 +285,44 @@ async def _run_git(root: Path, *arguments: str) -> bytes | None:
     return completed.stdout if completed.returncode == 0 else None
 
 
+async def _canonicalize_git_top_level(root: Path, output: bytes) -> Path | None:
+    try:
+        decoded = output.decode("utf-8", errors="strict")
+        if not decoded.endswith("\n"):
+            return None
+        request = CanonicalPathRequestV1(
+            protocol_version=FINGERPRINT_PROTOCOL_VERSION,
+            path=decoded.removesuffix("\n"),
+        )
+        completed = await run_owned_process(
+            _canonical_path_worker_command(),
+            cwd=_trusted_worker_cwd(root),
+            environment=_fingerprint_environment(),
+            input_data=request.model_dump_json().encode("utf-8"),
+            max_stdout_bytes=MAX_CANONICAL_PATH_RESULT_BYTES,
+        )
+        if completed.returncode != 0:
+            return None
+        result = CanonicalPathResultV1.model_validate_json(completed.stdout, strict=True)
+        canonical = validate_canonical_path_result(result)
+    except (OSError, ProcessOutputLimitError, UnicodeDecodeError, ValidationError, ValueError):
+        return None
+    return canonical if _is_within(root, canonical) else None
+
+
 def _fingerprint_worker_command() -> tuple[str, ...]:
     return (sys.executable, "-I", "-m", "maestro.repository.fingerprint_worker")
 
 
-def _fingerprint_worker_cwd() -> Path:
-    return Path(sys.executable).parent
+def _canonical_path_worker_command() -> tuple[str, ...]:
+    return (sys.executable, "-I", "-m", "maestro.repository.canonical_path_worker")
+
+
+def _trusted_worker_cwd(root: Path) -> Path:
+    cwd = Path(root.anchor)
+    if not cwd.is_absolute() or _is_within(cwd, root):
+        raise RepositoryInspectionError
+    return cwd
 
 
 def _fingerprint_environment() -> dict[str, str]:

@@ -5,6 +5,7 @@ import os
 import sys
 from collections.abc import Callable
 from pathlib import Path
+from shutil import which
 
 import pytest
 from helpers.audit_boundary_fixtures import audit_payload_boundary_result
@@ -249,6 +250,61 @@ async def test_initial_fingerprint_timeout_cancels_before_audit_or_worker(
         await service.execute(_request(repository))
 
     assert "AGENT_TIMEOUT" in error.value.public_json()
+    assert await asyncio.to_thread(marker.is_file)
+    process_id = int(await asyncio.to_thread(marker.read_text, encoding="ascii"))
+    with pytest.raises(ProcessLookupError):
+        os.kill(process_id, 0)
+    assert port.start_attempts == []
+    assert port.completion_attempts == []
+    assert runtime.requests == []
+
+
+@pytest.mark.asyncio
+async def test_git_canonicalization_timeout_quiesces_before_public_error(
+    repository: Path,
+    settings_factory: SettingsFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    git = which("git")
+    if git is None:
+        pytest.skip("git is required for repository preparation coverage")
+    init_process = await asyncio.create_subprocess_exec(
+        git,
+        "init",
+        "-q",
+        cwd=repository,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    assert await init_process.wait() == 0
+    settings = settings_factory(
+        allowed_roots=(repository,),
+        verifier_timeout_seconds=0.4,
+    )
+    marker = repository.parent / "git-canonical-timeout.pid"
+    monkeypatch.setattr(
+        repository_module,
+        "_canonical_path_worker_command",
+        lambda: (
+            sys.executable,
+            "-I",
+            str(_FINGERPRINT_PROCESS_FIXTURE),
+            "block",
+            str(marker),
+        ),
+    )
+    port = FakeAuditPort()
+    runtime = FakeAgentRuntime(lambda _request: _result(VerificationStatus.RESOLVED))
+    service = ResolveCodebaseFactService(
+        settings,
+        runtime,
+        fake_audit_recorder(port),
+    )
+
+    with pytest.raises(AgentTimeoutError):
+        await service.execute(_request(repository))
+
     assert await asyncio.to_thread(marker.is_file)
     process_id = int(await asyncio.to_thread(marker.read_text, encoding="ascii"))
     with pytest.raises(ProcessLookupError):

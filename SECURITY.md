@@ -21,8 +21,9 @@ performs bounded no-follow file discovery, isolates the Codex home and environme
 inherited MCPs/skills/apps/web/subagents, selects deny-all/read-only at both SDK boundaries,
 validates structured output and evidence, sanitizes results, fingerprints the repository before
 and after investigation through an isolated package-owned helper with a versioned bounded protocol,
-bounds admission/deadlines/pipes/results, owns helper/Git/worker cancellation and reaping, and
-requires durable Audit start/completion records before AI work/result release. Audit connections
+bounds admission/deadlines/pipes/results, owns helper/Git/worker termination and reaping after a
+child-process handle is acquired, and requires durable Audit start/completion records before AI
+work/result release. Audit connections
 are lazy and short-lived; no database connection or transaction remains open during AI work.
 Logs exclude request text, source, credentials, transcripts, model responses, and absolute
 paths. The recommended Level 2 deployment additionally encloses the unchanged application in a
@@ -60,9 +61,16 @@ does not persist prompts, transcripts, repository content, or model output.
   process inspection by the same user, and failed best-effort temporary cleanup remain outside
   the application boundary.
 - The fingerprint helper receives only a canonical root and numeric limits over stdin, runs with
-  isolated Python module discovery, closed inherited descriptors, and a minimal environment, and
-  never intentionally opens a network connection. It is not an OS network sandbox; a compromised
-  interpreter or imported dependency remains covered by the broader process-compromise risk.
+  isolated Python module discovery from a trusted directory outside the authorized repository,
+  closed inherited descriptors, and a minimal environment, and never intentionally opens a network
+  connection. It is not an OS network sandbox; a compromised interpreter or imported dependency
+  remains covered by the broader process-compromise risk.
+- Python's supported asynchronous subprocess API does not expose a child handle until process
+  creation finishes. Maestro awaits that trusted operation directly and uses the runtime's normal
+  cancellation behavior before handle acquisition; therefore it cannot claim an independent hard
+  application deadline or application-owned reaping during that narrow pre-handle interval. Once a
+  handle exists, cancellation and deadlines terminate, bounded-wait, kill if needed, and reap the
+  helper or Git process before returning.
 - Secret scanning and output redaction are heuristic. Audit redaction detects configured roots,
   selected private/drive/UNC paths, credential-bearing URI user information, common secret forms,
   and unsafe controls by collecting spans from the original input and applying bounded replacements

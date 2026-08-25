@@ -33,28 +33,18 @@ async def run_owned_process(
     input_data: bytes,
     max_stdout_bytes: int,
 ) -> ProcessResult:
-    """Run one child and always terminate/kill/reap it before cancellation returns."""
+    """Run one child and terminate/kill/reap it on failures after handle acquisition."""
 
-    creation = asyncio.create_task(
-        asyncio.create_subprocess_exec(
-            *command,
-            cwd=cwd,
-            env=environment,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-            close_fds=True,
-            start_new_session=os.name == "posix",
-        )
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        cwd=cwd,
+        env=environment,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+        close_fds=True,
+        start_new_session=os.name == "posix",
     )
-    try:
-        process = await asyncio.shield(creation)
-    except BaseException:
-        process = await _recover_created_process(creation)
-        if process is not None:
-            await _cleanup_uninterruptibly(process)
-        raise
-
     try:
         stdin, stdout_stream = _require_pipes(process)
         stdin.write(input_data)
@@ -85,24 +75,6 @@ async def _read_bounded(stream: asyncio.StreamReader, maximum: int) -> bytes:
             raise ProcessOutputLimitError
         chunks.append(chunk)
     return b"".join(chunks)
-
-
-async def _recover_created_process(
-    creation: asyncio.Task[asyncio.subprocess.Process],
-) -> asyncio.subprocess.Process | None:
-    while not creation.done():
-        try:
-            await asyncio.shield(creation)
-        except asyncio.CancelledError:
-            continue
-        except OSError:
-            return None
-    if creation.cancelled():
-        return None
-    try:
-        return creation.result()
-    except OSError:
-        return None
 
 
 async def _cleanup_uninterruptibly(process: asyncio.subprocess.Process) -> None:
