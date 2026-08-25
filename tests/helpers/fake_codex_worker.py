@@ -42,6 +42,7 @@ def _write_report(path: Path) -> None:
         "api_key_present": "MAESTRO_CODEX_API_KEY" in os.environ,
         "auth_present": auth_file.is_file(),
         "auth_contents": auth_file.read_text(encoding="utf-8") if auth_file.is_file() else None,
+        "audit_database_url_present": "MAESTRO_AUDIT_DATABASE_URL" in os.environ,
         "depth": os.environ.get("MAESTRO_VERIFIER_DEPTH"),
     }
     path.write_text(json.dumps(report), encoding="utf-8")

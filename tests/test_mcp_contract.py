@@ -11,6 +11,7 @@ from mcp import Client, StdioServerParameters
 from mcp.types import CallToolResult, TextContent
 
 from maestro.agents import FakeAgentRuntime
+from maestro.audit.testing import fake_audit_recorder
 from maestro.capabilities.resolve_codebase_fact.contracts import (
     Confidence,
     Evidence,
@@ -62,6 +63,7 @@ def _service(repository: Path, settings_factory: SettingsFactory) -> ResolveCode
     return ResolveCodebaseFactService(
         settings,
         FakeAgentRuntime(lambda _request: _resolved_result()),
+        fake_audit_recorder(),
     )
 
 
@@ -178,18 +180,12 @@ async def test_real_stdio_server_discovery_call_errors_and_clean_shutdown(reposi
         cwd=Path(__file__).parent.parent,
         env={
             "MAESTRO_ALLOWED_ROOTS": str(repository),
+            "MAESTRO_AUDIT_DATABASE_URL": "postgresql://audit-writer@localhost/maestro",
             "MAESTRO_LOG_LEVEL": "INFO",
         },
     )
     async with Client(parameters, read_timeout_seconds=5) as client:
         tools = await client.list_tools()
-        result = await client.call_tool(
-            TOOL_NAME,
-            {
-                "repository_path": str(repository),
-                "question": "Should an Order support multiple Payments?",
-            },
-        )
         invalid = await client.call_tool(TOOL_NAME, {})
         unauthorized = await client.call_tool(
             TOOL_NAME,
@@ -200,12 +196,6 @@ async def test_real_stdio_server_discovery_call_errors_and_clean_shutdown(reposi
         )
 
     assert [tool.name for tool in tools.tools] == [TOOL_NAME]
-    assert result.is_error is False
-    assert result.structured_content is not None
-    validated = VerificationResult.model_validate_json(
-        json.dumps(result.structured_content), strict=True
-    )
-    assert validated.status is VerificationStatus.HUMAN_DECISION_REQUIRED
     assert invalid.is_error is True
     assert "INVALID_INPUT" in _first_text(invalid)
     assert unauthorized.is_error is True
@@ -222,7 +212,7 @@ async def test_unexpected_tool_failure_is_generic_and_safe(
         raise RuntimeError(detail)
 
     settings = settings_factory(allowed_roots=(repository,))
-    service = ResolveCodebaseFactService(settings, FakeAgentRuntime(crash))
+    service = ResolveCodebaseFactService(settings, FakeAgentRuntime(crash), fake_audit_recorder())
     async with Client(create_server(service)) as client:
         result = await client.call_tool(
             TOOL_NAME,

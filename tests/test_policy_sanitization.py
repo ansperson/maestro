@@ -3,10 +3,15 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from hypothesis import given, strategies as st
 
+from maestro.audit.contracts import MAX_AUDIT_OBJECTIVE_CHARS, ExecutionStartedV1
+from maestro.audit.sanitization import sanitize_audit_text
 from maestro.capabilities.resolve_codebase_fact.contracts import (
+    MAX_QUESTION_CHARS,
     Confidence,
     Evidence,
+    ResolveCodebaseFactRequest,
     VerificationResult,
     VerificationStatus,
 )
@@ -43,6 +48,45 @@ def test_neutralization_removes_confirmation_bias() -> None:
     assert neutralize_question("Does the endpoint accept many IDs?") == (
         "Does the endpoint accept many IDs?"
     )
+
+
+@given(
+    prefix=st.sampled_from(("confirm ", "please confirm ", "confirm that ", "I think ")),
+    claim=st.text(
+        alphabet=st.sampled_from(tuple("abc XYZ0123/:@._-")),
+        min_size=1,
+        max_size=MAX_QUESTION_CHARS - len("confirm "),
+    ),
+)
+def test_public_factual_question_neutralization_is_bounded(prefix: str, claim: str) -> None:
+    question = f"{prefix}{claim}"[:MAX_QUESTION_CHARS]
+    assert len(question) <= MAX_QUESTION_CHARS
+    assert len(neutralize_question(question)) <= MAX_QUESTION_CHARS
+
+
+@given(
+    question=st.text(
+        alphabet=st.characters(min_codepoint=32, blacklist_categories=("Cs",)),
+        min_size=1,
+        max_size=MAX_QUESTION_CHARS,
+    ).filter(lambda value: bool(value.strip()))
+)
+def test_public_question_composes_into_bounded_audit_objective(question: str) -> None:
+    request = ResolveCodebaseFactRequest(repository_path="/repository", question=question)
+    objective = neutralize_question(request.question)
+    sanitized = sanitize_audit_text(objective, Path("/private/tmp/maestro/repository"))
+
+    payload = ExecutionStartedV1(
+        objective=sanitized,
+        server_version="1.0.0",
+        runtime_name="codex",
+        runtime_version="0.147.0",
+        model="gpt-5.4",
+        prompt_policy_version=POLICY_VERSION,
+    )
+
+    assert len(objective) <= MAX_QUESTION_CHARS
+    assert len(payload.objective) <= MAX_AUDIT_OBJECTIVE_CHARS
 
 
 def test_prompt_delimits_untrusted_values() -> None:

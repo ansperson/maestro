@@ -58,6 +58,47 @@ def test_authorize_rejects_nul(repository: Path, settings_factory: SettingsFacto
         guard.authorize(f"{repository}\x00suffix")
 
 
+def test_authorize_rejects_platform_anchor_even_if_settings_validation_is_bypassed(
+    repository: Path, settings_factory: SettingsFactory
+) -> None:
+    anchor = Path(repository.anchor)
+    settings = settings_factory(allowed_roots=(repository,)).model_copy(
+        update={"allowed_roots": (anchor,)}
+    )
+    guard = RepositoryGuard(settings)
+    with pytest.raises(RepositoryNotAllowedError):
+        guard.authorize(str(anchor))
+
+
+@given(redundant_segments=st.integers(min_value=0, max_value=8))
+@settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
+def test_authorize_rejects_every_canonical_anchor_alias(
+    repository: Path,
+    settings_factory: SettingsFactory,
+    redundant_segments: int,
+) -> None:
+    anchor = Path(repository.anchor)
+    bypassed = settings_factory(allowed_roots=(repository,)).model_copy(
+        update={"allowed_roots": (anchor,)}
+    )
+    candidate = f"{anchor}{f'.{os.sep}' * redundant_segments}"
+    with pytest.raises(RepositoryNotAllowedError):
+        RepositoryGuard(bypassed).authorize(candidate)
+
+
+@given(parts=st.lists(st.from_regex(r"[a-z]{1,8}", fullmatch=True), min_size=1, max_size=4))
+@settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
+def test_authorize_accepts_non_anchor_descendants(
+    repository: Path,
+    settings_factory: SettingsFactory,
+    parts: list[str],
+) -> None:
+    candidate = repository.joinpath(*parts)
+    candidate.mkdir(parents=True, exist_ok=True)
+    guard = RepositoryGuard(settings_factory(allowed_roots=(repository,)))
+    assert guard.authorize(str(candidate)).root == candidate.resolve()
+
+
 @given(traversals=st.lists(st.sampled_from(["..", ".", "src"]), min_size=1, max_size=6))
 @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
 def test_authorize_rejects_every_parent_traversal(

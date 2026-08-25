@@ -16,11 +16,11 @@ history, and instructions), the Codex runtime/model, and model output are untrus
 provider is an explicit data-egress recipient. A stdio client gets the privileges of the user
 who launches Maestro; v1 has no remote authentication, authorization, or multi-tenancy.
 
-Maestro canonicalizes allowed roots, rejects traversal/symlink escape, performs bounded
-no-follow file discovery, isolates the Codex home and environment, disables inherited
-MCPs/skills/apps/web/subagents, selects deny-all/read-only at both SDK boundaries, validates
-structured output and evidence, sanitizes results, fingerprints the repository before and
-after investigation, bounds admission/deadlines/pipes/results, and owns worker cancellation.
+Maestro canonicalizes allowed roots, rejects filesystem anchors plus traversal/symlink escape,
+performs bounded no-follow file discovery, isolates the Codex home and environment, disables
+inherited MCPs/skills/apps/web/subagents, selects deny-all/read-only at both SDK boundaries,
+validates structured output and evidence, sanitizes results, fingerprints the repository before
+and after investigation, bounds admission/deadlines/pipes/results, and owns worker cancellation.
 Logs exclude request text, source, credentials, transcripts, model responses, and absolute
 paths. The recommended Level 2 deployment additionally encloses the unchanged application in a
 hardened Linux container with read-only repository mounts and root filesystem, ephemeral
@@ -56,8 +56,11 @@ does not persist prompts, transcripts, repository content, or model output.
 - Filesystem namespace races, a compromised Python/Codex/MCP dependency, kernel compromise,
   process inspection by the same user, and failed best-effort temporary cleanup remain outside
   the application boundary.
-- Secret scanning and output redaction are heuristic; neither proves that a secret cannot be
-  selected by the model or encoded in an unexpected form.
+- Secret scanning and output redaction are heuristic. Audit redaction detects configured roots,
+  selected private/drive/UNC paths, credential-bearing URI user information, common secret forms,
+  and unsafe controls by collecting spans from the original input and applying bounded replacements
+  once. Unrecognized path syntax, secret formats, encodings, or deliberate obfuscation may survive;
+  neither control proves that a secret cannot be selected or encoded by the model.
 - The Level 2 container permits provider networking and cannot technically distinguish it from
   arbitrary egress by a compromised process. Every configured allowed root is readable by the
   shared container. Higher assurance requires controlled egress and/or per-worker containers.

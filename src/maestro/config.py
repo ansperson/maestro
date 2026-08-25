@@ -46,6 +46,7 @@ class Settings(BaseSettings):
     codex_model: str = "gpt-5.4"
     codex_auth_file: Path | None = None
     codex_api_key: SecretStr | None = None
+    audit_database_url: Annotated[SecretStr, Field(min_length=1, max_length=4_096)] = Field()
 
     @field_validator("allowed_roots", mode="before")
     @classmethod
@@ -77,6 +78,8 @@ class Settings(BaseSettings):
                 raise ValueError("an allowed root does not exist") from exc
             if not canonical.is_dir():
                 raise ValueError("every allowed root must be a directory")
+            if _is_filesystem_anchor(canonical):
+                raise ValueError("filesystem anchors cannot be allowed roots")
             if canonical not in resolved:
                 resolved.append(canonical)
         return tuple(resolved)
@@ -131,3 +134,7 @@ class Settings(BaseSettings):
         if self.codex_auth_file is not None and self.codex_api_key is not None:
             raise ValueError("configure only one Codex authentication source")
         return self
+
+
+def _is_filesystem_anchor(path: Path) -> bool:
+    return bool(path.anchor) and path == Path(path.anchor)

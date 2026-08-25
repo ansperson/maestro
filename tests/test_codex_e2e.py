@@ -5,13 +5,12 @@ from pathlib import Path
 
 import pytest
 
-from maestro.agents.codex import CodexAgentRuntime
 from maestro.capabilities.resolve_codebase_fact.contracts import (
     ResolveCodebaseFactRequest,
     VerificationStatus,
 )
-from maestro.capabilities.resolve_codebase_fact.service import ResolveCodebaseFactService
 from maestro.config import Settings
+from maestro.main import build_service
 from maestro.repository import RepositoryGuard
 
 pytestmark = pytest.mark.e2e
@@ -24,7 +23,9 @@ def _e2e_settings(repository: Path) -> Settings:
         pytest.skip(
             "set exactly one of MAESTRO_CODEX_AUTH_FILE or MAESTRO_CODEX_API_KEY for Codex E2E"
         )
-    return Settings(allowed_roots=(repository,))
+    return Settings(  # pyright: ignore[reportCallIssue] - Audit URL comes from BaseSettings
+        allowed_roots=(repository,)
+    )
 
 
 @pytest.mark.asyncio
@@ -32,11 +33,7 @@ async def test_real_codex_resolves_fixture_without_mutation_or_execution(reposit
     settings = _e2e_settings(repository)
     guard = RepositoryGuard(settings)
     authorized = guard.authorize(str(repository))
-    service = ResolveCodebaseFactService(
-        settings,
-        CodexAgentRuntime(settings),
-        repository_guard=guard,
-    )
+    service = build_service(settings)
     before = await guard.fingerprint(authorized)
     try:
         result = await service.execute(

@@ -9,6 +9,7 @@ from typing import cast
 import pytest
 
 from maestro.agents import FakeAgentRuntime, InvestigationRequest
+from maestro.audit.testing import fake_audit_recorder
 from maestro.capabilities.resolve_codebase_fact.contracts import (
     Confidence,
     Conflict,
@@ -68,7 +69,9 @@ async def test_service_returns_validated_resolved_result(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     runtime = FakeAgentRuntime(lambda _request: resolved_result())
-    service = ResolveCodebaseFactService(settings_factory(allowed_roots=(repository,)), runtime)
+    service = ResolveCodebaseFactService(
+        settings_factory(allowed_roots=(repository,)), runtime, fake_audit_recorder()
+    )
     with caplog.at_level(logging.INFO):
         result = await service.execute(request_for(repository))
     assert result.status is VerificationStatus.RESOLVED
@@ -83,7 +86,9 @@ async def test_human_decision_short_circuits_ai(
     repository: Path, settings_factory: SettingsFactory
 ) -> None:
     runtime = FakeAgentRuntime(lambda _request: resolved_result())
-    service = ResolveCodebaseFactService(settings_factory(allowed_roots=(repository,)), runtime)
+    service = ResolveCodebaseFactService(
+        settings_factory(allowed_roots=(repository,)), runtime, fake_audit_recorder()
+    )
     result = await service.execute(request_for(repository, "Should Order support many Payments?"))
     assert result.status is VerificationStatus.HUMAN_DECISION_REQUIRED
     assert result.answer is None
@@ -95,7 +100,9 @@ async def test_service_neutralizes_hypothesis(
     repository: Path, settings_factory: SettingsFactory
 ) -> None:
     runtime = FakeAgentRuntime(lambda _request: resolved_result())
-    service = ResolveCodebaseFactService(settings_factory(allowed_roots=(repository,)), runtime)
+    service = ResolveCodebaseFactService(
+        settings_factory(allowed_roots=(repository,)), runtime, fake_audit_recorder()
+    )
     await service.execute(
         request_for(repository, "I believe Order supports many Payments. Confirm it.")
     )
@@ -136,7 +143,9 @@ async def test_uncertain_missing_and_contradictory_evidence(
     )
     responses = iter([missing, contradictory])
     runtime = FakeAgentRuntime(lambda _request: next(responses))
-    service = ResolveCodebaseFactService(settings_factory(allowed_roots=(repository,)), runtime)
+    service = ResolveCodebaseFactService(
+        settings_factory(allowed_roots=(repository,)), runtime, fake_audit_recorder()
+    )
     assert (await service.execute(request_for(repository))).status is VerificationStatus.UNCERTAIN
     result = await service.execute(request_for(repository))
     assert result.status is VerificationStatus.UNCERTAIN
@@ -149,7 +158,9 @@ async def test_unauthorized_repository_fails_before_ai(
 ) -> None:
     runtime = FakeAgentRuntime(lambda _request: resolved_result())
     allowed = repository / "src"
-    service = ResolveCodebaseFactService(settings_factory(allowed_roots=(allowed,)), runtime)
+    service = ResolveCodebaseFactService(
+        settings_factory(allowed_roots=(allowed,)), runtime, fake_audit_recorder()
+    )
     with pytest.raises(RepositoryNotAllowedError):
         await service.execute(request_for(repository))
     assert runtime.requests == []
@@ -165,6 +176,7 @@ async def test_hallucinated_evidence_is_operational_failure(
     service = ResolveCodebaseFactService(
         settings_factory(allowed_roots=(repository,)),
         FakeAgentRuntime(lambda _request: invalid),
+        fake_audit_recorder(),
     )
     with pytest.raises(EvidenceValidationError):
         await service.execute(request_for(repository))
@@ -179,7 +191,9 @@ async def test_repository_mutation_is_typed_failure(
         return resolved_result()
 
     service = ResolveCodebaseFactService(
-        settings_factory(allowed_roots=(repository,)), FakeAgentRuntime(mutate)
+        settings_factory(allowed_roots=(repository,)),
+        FakeAgentRuntime(mutate),
+        fake_audit_recorder(),
     )
     with pytest.raises(RepositoryChangedError):
         await service.execute(request_for(repository))
@@ -198,6 +212,7 @@ async def test_secret_and_prompt_injection_are_not_echoed_or_executed(
     service = ResolveCodebaseFactService(
         settings_factory(allowed_roots=(repository,)),
         FakeAgentRuntime(lambda _request: injected),
+        fake_audit_recorder(),
     )
     result = await service.execute(request_for(repository))
     encoded = result.model_dump_json()
@@ -222,6 +237,7 @@ async def test_timeout_cancels_runtime_and_runs_cleanup(
     service = ResolveCodebaseFactService(
         settings_factory(allowed_roots=(repository,), verifier_timeout_seconds=0.2),
         FakeAgentRuntime(block),
+        fake_audit_recorder(),
     )
     with pytest.raises(AgentTimeoutError):
         await service.execute(request_for(repository))
@@ -244,7 +260,9 @@ async def test_caller_cancellation_propagates_and_cleans_runtime(
         return resolved_result()
 
     service = ResolveCodebaseFactService(
-        settings_factory(allowed_roots=(repository,)), FakeAgentRuntime(block)
+        settings_factory(allowed_roots=(repository,)),
+        FakeAgentRuntime(block),
+        fake_audit_recorder(),
     )
     task = asyncio.create_task(service.execute(request_for(repository)))
     await started.wait()
@@ -264,7 +282,9 @@ async def test_recursion_guard_blocks_nested_service_call(
         return await service.execute(request_for(repository))
 
     runtime = FakeAgentRuntime(recurse)
-    service = ResolveCodebaseFactService(settings_factory(allowed_roots=(repository,)), runtime)
+    service = ResolveCodebaseFactService(
+        settings_factory(allowed_roots=(repository,)), runtime, fake_audit_recorder()
+    )
     with pytest.raises(RecursionNotAllowedError):
         await service.execute(request_for(repository))
     assert len(runtime.requests) == 1
@@ -285,6 +305,7 @@ async def test_configured_result_limits_are_enforced(
     service = ResolveCodebaseFactService(
         settings_factory(allowed_roots=(repository,), max_evidence_items=1),
         FakeAgentRuntime(lambda _request: too_many),
+        fake_audit_recorder(),
     )
     with pytest.raises(OutputLimitExceededError, match="too many"):
         await service.execute(request_for(repository))
@@ -293,6 +314,7 @@ async def test_configured_result_limits_are_enforced(
     service = ResolveCodebaseFactService(
         settings_factory(allowed_roots=(repository,), max_result_bytes=1_024),
         FakeAgentRuntime(lambda _request: oversized),
+        fake_audit_recorder(),
     )
     with pytest.raises(OutputLimitExceededError):
         await service.execute(request_for(repository))
@@ -304,14 +326,18 @@ async def test_configured_input_and_conflict_limits_are_enforced(
 ) -> None:
     runtime = FakeAgentRuntime(lambda _request: resolved_result())
     service = ResolveCodebaseFactService(
-        settings_factory(allowed_roots=(repository,), max_question_chars=10), runtime
+        settings_factory(allowed_roots=(repository,), max_question_chars=10),
+        runtime,
+        fake_audit_recorder(),
     )
     with pytest.raises(InvalidInputError, match="question"):
         await service.execute(request_for(repository, "a" * 11))
     assert runtime.requests == []
 
     service = ResolveCodebaseFactService(
-        settings_factory(allowed_roots=(repository,), max_context_chars=10), runtime
+        settings_factory(allowed_roots=(repository,), max_context_chars=10),
+        runtime,
+        fake_audit_recorder(),
     )
     request = request_for(repository)
     request = request.model_copy(update={"context": "x" * 11})
@@ -331,6 +357,7 @@ async def test_configured_input_and_conflict_limits_are_enforced(
     service = ResolveCodebaseFactService(
         settings_factory(allowed_roots=(repository,), max_conflicts=0),
         FakeAgentRuntime(lambda _request: conflict_result),
+        fake_audit_recorder(),
     )
     with pytest.raises(OutputLimitExceededError, match="conflicts"):
         await service.execute(request_for(repository))
@@ -350,6 +377,7 @@ async def test_failure_logging_contains_code_but_not_request_text(
     service = ResolveCodebaseFactService(
         settings_factory(allowed_roots=(repository,)),
         FakeAgentRuntime(fail),
+        fake_audit_recorder(),
     )
     with caplog.at_level(logging.WARNING), pytest.raises(EvidenceValidationError):
         await service.execute(request_for(repository, question))
