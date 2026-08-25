@@ -1,0 +1,18 @@
+format: table
+exit-code: 1
+severity:
+  - HIGH
+  - CRITICAL
+scan:
+  scanners:
+    - vuln
+    - secret
+image:
+  image-config-scanners:
+    - secret
+pkg:
+  types:
+    - os
+    - library
+vulnerability:
+  ignore-unfixed: true

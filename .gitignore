@@ -1,0 +1,13 @@
+.coverage
+.container-test-tmp/
+.env
+.hypothesis/
+.pytest_cache/
+.ruff_cache/
+.venv/
+__pycache__/
+build/
+coverage.xml
+dist/
+*.egg-info/
+*.py[cod]

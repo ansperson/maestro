@@ -1,0 +1,2 @@
+#!/bin/sh
+touch REPOSITORY_CODE_WAS_EXECUTED

@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deterministic:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.13", "3.14"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.12.1"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install Python
+        run: uv python install "${{ matrix.python-version }}"
+
+      - name: Sync locked environment
+        run: uv sync --frozen --all-groups --python "${{ matrix.python-version }}"
+
+      - name: Run deterministic quality gate
+        run: |
+          uv run ruff format --check .
+          uv run ruff check .
+          uv run pyright
+          uv run pytest --strict-config --strict-markers --cov=maestro --cov-branch --cov-report=term-missing --cov-report=xml --cov-fail-under=90
+          uv run vulture src tests --min-confidence 100
+          uv run deptry .
+          uv run pip-audit
+          uv run pre-commit run --all-files
+
+      - name: Build and validate distributions
+        if: matrix.python-version == '3.13'
+        run: |
+          uv build
+          uv run twine check dist/*
+
+      - name: Smoke-test installed wheel
+        if: matrix.python-version == '3.13'
+        run: |
+          uv venv --python 3.13 "$RUNNER_TEMP/maestro-smoke"
+          uv pip install --python "$RUNNER_TEMP/maestro-smoke/bin/python" dist/*.whl
+          "$RUNNER_TEMP/maestro-smoke/bin/python" scripts/package_smoke.py "$RUNNER_TEMP/maestro-smoke/bin/maestro" tests/fixtures/codebase
+
+  container:
+    name: Hardened container
+    runs-on: ubuntu-latest
+    needs: deterministic
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.12.1"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install Python
+        run: uv python install 3.13
+
+      - name: Sync locked environment
+        run: uv sync --frozen --all-groups --python 3.13
+
+      - name: Run official Dockerfile build checks
+        run: docker build --check .
+
+      - name: Build hardened runtime image
+        run: docker build --tag maestro-verifier:ci .
+
+      - name: Run deterministic container security tests
+        env:
+          MAESTRO_CONTAINER_IMAGE: maestro-verifier:ci
+          MAESTRO_CONTAINER_SKIP_BUILD: "1"
+        run: uv run pytest -m "container and not e2e" tests/container
+
+      - name: Install image scanner
+        uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+        with:
+          version: v0.74.0
+          cache: true
+
+      - name: Report all high and critical image findings
+        run: trivy image --config trivy.yaml --ignore-unfixed=false --exit-code 0 maestro-verifier:ci
+
+      - name: Enforce fixable image findings and secret policy
+        run: trivy image --config trivy.yaml maestro-verifier:ci

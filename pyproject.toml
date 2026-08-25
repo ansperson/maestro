@@ -1,0 +1,168 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "maestro-verifier"
+version = "1.0.0"
+description = "A bounded MCP capability for resolving objective codebase facts."
+readme = "README.md"
+requires-python = ">=3.13"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Maestro maintainers" }]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.13",
+  "Typing :: Typed",
+]
+dependencies = [
+  "mcp==2.1.0",
+  "openai-codex==0.147.0",
+  "pydantic>=2.12,<3",
+  "pydantic-settings>=2.10,<3",
+]
+
+[project.scripts]
+maestro = "maestro.main:main"
+
+[dependency-groups]
+dev = [
+  "deptry>=0.23",
+  "detect-secrets>=1.5",
+  "hypothesis>=6.138",
+  "pip-audit>=2.9",
+  "pre-commit>=4.3",
+  "pyright>=1.1.404",
+  "pytest>=8.4",
+  "pytest-asyncio>=1.1",
+  "pytest-cov>=6.2",
+  "pytest-socket>=0.7",
+  "pytest-timeout>=2.4",
+  "ruff>=0.12",
+  "twine>=6.1",
+  "vulture>=2.14",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/maestro"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/src",
+  "/tests",
+  "/docs",
+  "/evals",
+  "/scripts",
+  "/README.md",
+  "/SECURITY.md",
+  "/CONTRIBUTING.md",
+  "/LICENSE",
+  "/pyproject.toml",
+]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+extend-exclude = ["tests/fixtures"]
+
+[tool.ruff.lint]
+select = [
+  "A",
+  "ANN",
+  "ASYNC",
+  "B",
+  "C4",
+  "C90",
+  "E",
+  "F",
+  "I",
+  "N",
+  "PERF",
+  "PIE",
+  "PL",
+  "PTH",
+  "PT",
+  "RSE",
+  "RUF",
+  "S",
+  "SIM",
+  "TRY",
+  "UP",
+]
+ignore = [
+  "ANN401", # Isolated SDK/protocol boundaries occasionally expose Any.
+  "TRY003", # Typed application errors intentionally carry safe messages.
+]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 12
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["ANN", "PLR2004", "S101", "S603", "S607"]
+"src/maestro/agents/codex/worker.py" = ["T201"]
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+
+[tool.pyright]
+pythonVersion = "3.13"
+typeCheckingMode = "strict"
+include = ["src", "tests", "scripts"]
+exclude = ["tests/fixtures"]
+venvPath = "."
+venv = ".venv"
+
+[tool.pytest.ini_options]
+addopts = [
+  "--strict-config",
+  "--strict-markers",
+  "--disable-socket",
+  "--allow-unix-socket",
+  "-m",
+  "not e2e and not container",
+]
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"
+filterwarnings = ["error"]
+markers = [
+  "container: deterministic test requiring a local Docker daemon and built image",
+  "e2e: opt-in test requiring a configured Codex authentication source",
+]
+testpaths = ["tests"]
+norecursedirs = [".*", "build", "dist", "CVS", "_darcs", "{arch}", "*.egg", "venv", "tests/fixtures"]
+timeout = 10
+
+[tool.coverage.run]
+branch = true
+source = ["maestro"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+exclude_also = [
+  "if TYPE_CHECKING:",
+  "if __name__ == .__main__.:",
+]
+
+[tool.deptry]
+extend_exclude = ["tests/fixtures"]
+known_first_party = ["maestro"]
+
+[tool.deptry.per_rule_ignores]
+DEP002 = [
+  "deptry",
+  "detect-secrets",
+  "hypothesis",
+  "pip-audit",
+  "pre-commit",
+  "pyright",
+  "pytest",
+  "pytest-asyncio",
+  "pytest-cov",
+  "pytest-socket",
+  "pytest-timeout",
+  "ruff",
+  "twine",
+  "vulture",
+]
