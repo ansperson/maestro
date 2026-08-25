@@ -7,15 +7,21 @@ from pathlib import Path
 import pytest
 
 from maestro.agents import FakeAgentRuntime, InvestigationRequest
-from maestro.audit.contracts import InvestigationCompletedV1
+from maestro.audit.contracts import (
+    MAX_AUDIT_OBJECTIVE_CHARS,
+    ExecutionStartedV1,
+    InvestigationCompletedV1,
+)
 from maestro.audit.testing import FakeAuditPort, fake_audit_recorder
 from maestro.capabilities.resolve_codebase_fact.contracts import (
     Confidence,
+    Conflict,
     Evidence,
     ResolveCodebaseFactRequest,
     VerificationResult,
     VerificationStatus,
 )
+from maestro.capabilities.resolve_codebase_fact.policy import neutralize_question
 from maestro.capabilities.resolve_codebase_fact.service import ResolveCodebaseFactService
 from maestro.config import Settings
 from maestro.errors import (
@@ -55,6 +61,35 @@ def _result(status: VerificationStatus) -> VerificationResult:
         ),
         conflicts=[],
         reason="The accepted repository evidence determines this status.",
+    )
+
+
+def _sensitive_result() -> VerificationResult:
+    return VerificationResult(
+        status=VerificationStatus.RESOLVED,
+        answer="Found postgresql://reader:fixture-password@db/maestro.",  # pragma: allowlist secret
+        confidence=Confidence.HIGH,
+        evidence=[
+            Evidence(
+                path="src/models.py",
+                line_start=1,
+                symbol=r"C:\Users\alice\secrets.txt",
+                finding="See (/Users/alice/.aws/credentials).",
+            )
+        ],
+        conflicts=[
+            Conflict(
+                description=r"Compare \\server\share\private\settings.toml.",
+                evidence=[
+                    Evidence(
+                        path="migrations/001_payments.sql",
+                        symbol="postgresql://reader:" + "other-password@db/maestro",
+                        finding="Compare /opt/company/private/settings.toml.",
+                    )
+                ],
+            )
+        ],
+        reason="Validated at path:/srv/company/private/config.toml.",
     )
 
 
@@ -238,22 +273,58 @@ async def test_repository_stability_and_sanitization_precede_completion(
     assert port.completions == []
 
     (repository / "changed-after-start.txt").unlink()
-    secret_result = _result(VerificationStatus.RESOLVED).model_copy(
-        update={
-            "answer": "token=fixture-secret-value-123456",
-            "reason": f"Validated in {repository}/src/models.py.",
-        }
-    )
     clean_port = FakeAuditPort()
     clean_service = ResolveCodebaseFactService(
         settings_factory(allowed_roots=(repository,)),
-        FakeAgentRuntime(lambda _request: secret_result),
+        FakeAgentRuntime(lambda _request: _sensitive_result()),
         fake_audit_recorder(clean_port),
     )
-    await clean_service.execute(_request(repository))
-    encoded = clean_port.completions[0].model_dump_json()
-    assert "fixture-secret-value" not in encoded
+    await clean_service.execute(
+        _request(
+            repository,
+            "Is postgresql://audit_writer:" + "objective-password@db/maestro configured?",
+        )
+    )
+    encoded = clean_port.starts[0].model_dump_json() + clean_port.completions[0].model_dump_json()
+    for forbidden in (
+        "objective-password",
+        "fixture-password",
+        "other-password",
+        "/Users/alice",
+        "/opt/company",
+        "/srv/company",
+        r"C:\\Users\\alice",
+        r"\\\\server\\share",
+    ):
+        assert forbidden not in encoded
     assert str(repository) not in encoded
+
+
+@pytest.mark.asyncio
+async def test_maximum_normalization_expansion_fits_audited_execution(
+    repository: Path, settings_factory: SettingsFactory
+) -> None:
+    question = "confirm " + "x" * (4_000 - len("confirm "))
+    objective = neutralize_question(question)
+    assert len(question) == 4_000
+    assert len(objective) == MAX_AUDIT_OBJECTIVE_CHARS
+    port = FakeAuditPort()
+    runtime = FakeAgentRuntime(lambda _request: _result(VerificationStatus.RESOLVED))
+    service = ResolveCodebaseFactService(
+        settings_factory(allowed_roots=(repository,)),
+        runtime,
+        fake_audit_recorder(port),
+    )
+
+    result = await service.execute(_request(repository, question))
+
+    assert result.status is VerificationStatus.RESOLVED
+    assert runtime.requests[0].question == objective
+    assert len(port.starts) == 1
+    start_payload = port.starts[0].event.payload
+    assert isinstance(start_payload, ExecutionStartedV1)
+    assert start_payload.objective == objective
+    assert len(port.completions) == 1
 
 
 @pytest.mark.asyncio

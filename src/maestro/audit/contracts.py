@@ -12,7 +12,10 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
-MAX_AUDIT_OBJECTIVE_CHARS = 4_000
+# The current capability's public 4,000-character question may grow by eleven
+# characters during decision-language neutralization. Audit owns its persistence
+# contract and deliberately accommodates that complete normalized objective.
+MAX_AUDIT_OBJECTIVE_CHARS = 4_011
 MAX_AUDIT_ANSWER_CHARS = 8_000
 MAX_AUDIT_RATIONALE_CHARS = 4_000
 MAX_AUDIT_FINDING_CHARS = 1_000

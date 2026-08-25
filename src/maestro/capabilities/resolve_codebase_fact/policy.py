@@ -6,6 +6,7 @@ import json
 import re
 
 POLICY_VERSION = "repository-verifier/v1"
+_NEUTRALIZED_PREFIX = "Determine whether "
 
 _DECISION_PATTERNS = (
     re.compile(r"^\s*should\b", re.IGNORECASE),
@@ -38,10 +39,10 @@ def neutralize_question(question: str) -> str:
             match.group("claim"),
             flags=re.IGNORECASE,
         ).strip(" .!?")
-        return f"Determine whether {claim}."
+        return f"{_NEUTRALIZED_PREFIX}{claim}."
     if _CONFIRM.match(question):
         claim = _CONFIRM.sub("", question).strip(" .!?")
-        return f"Determine whether {claim}."
+        return f"{_NEUTRALIZED_PREFIX}{claim}."
     return question.strip()
 
 

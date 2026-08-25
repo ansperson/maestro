@@ -17,9 +17,11 @@ from maestro.audit.contracts import (
     InvestigationCompletedV1,
 )
 from maestro.audit.recorder import AuditRecorder, AuditRuntimeMetadata
+from maestro.audit.sanitization import sanitize_audit_text
 from maestro.audit.testing import FakeAuditPort
 from maestro.capabilities.resolve_codebase_fact.contracts import (
     Confidence,
+    Conflict,
     Evidence,
     VerificationResult,
     VerificationStatus,
@@ -55,15 +57,55 @@ def _fingerprint() -> RepositoryFingerprint:
     )
 
 
-def _resolved() -> VerificationResult:
+def _sensitive_result() -> VerificationResult:
     return VerificationResult(
         status=VerificationStatus.RESOLVED,
-        answer="The current model supports many payments.",
+        answer="Found postgresql://reader:fixture-password@db/maestro.",  # pragma: allowlist secret
         confidence=Confidence.HIGH,
-        evidence=[Evidence(path="src/models.py", finding="The field is a list.")],
-        conflicts=[],
-        reason="Validated source evidence establishes the fact.",
+        evidence=[
+            Evidence(
+                path="src/models.py",
+                symbol=r"C:\Users\alice\secrets.txt",
+                finding="See (/Users/alice/.aws/credentials).",
+            )
+        ],
+        conflicts=[
+            Conflict(
+                description=r"Compare \\server\share\private\settings.toml.",
+                evidence=[
+                    Evidence(
+                        path="src/models.py",
+                        symbol="postgresql://reader:" + "other-password@db/maestro",
+                        finding="Compare /opt/company/private/settings.toml.",
+                    )
+                ],
+            )
+        ],
+        reason="Validated at path:/srv/company/private/config.toml.",
     )
+
+
+@pytest.mark.parametrize(
+    ("value", "forbidden"),
+    [
+        (
+            "Is postgresql://audit_writer:" + "fixture-password@db/maestro configured?",
+            "fixture-password",
+        ),
+        ("See /opt/company/private/settings.toml", "/opt/company"),
+        ("See (/Users/alice/.aws/credentials)", "/Users/alice"),
+        (r"See [C:\Users\alice\private\settings.toml]", r"C:\Users\alice"),
+        (r"See {\\server\share\private\settings.toml}", r"\\server\share"),
+    ],
+)
+def test_audit_sanitizer_redacts_sensitive_categories_independent_of_prefix(
+    tmp_path: Path,
+    value: str,
+    forbidden: str,
+) -> None:
+    sanitized = sanitize_audit_text(value, tmp_path)
+    assert forbidden not in sanitized
+    assert "[REDACTED]" in sanitized or "<absolute-path>" in sanitized
 
 
 @pytest.mark.asyncio
@@ -83,7 +125,7 @@ async def test_recorder_builds_immutable_strict_versioned_records(tmp_path: Path
         _fingerprint(),
         f"Is token=fixture-secret-value-123456 in {tmp_path}/file.py?\x00",
     )
-    await recorder.record_investigation_completed(handle, repository, _resolved())
+    await recorder.record_investigation_completed(handle, repository, _sensitive_result())
 
     assert len(port.starts) == 1
     assert len(port.completions) == 1
@@ -99,7 +141,14 @@ async def test_recorder_builds_immutable_strict_versioned_records(tmp_path: Path
     assert completion.event.audit_id == handle.audit_id
     encoded = start.model_dump_json() + completion.model_dump_json()
     assert "fixture-secret-value" not in encoded
+    assert "fixture-password" not in encoded
+    assert "other-password" not in encoded
     assert str(tmp_path) not in encoded
+    assert "/Users/alice" not in encoded
+    assert "/opt/company" not in encoded
+    assert "/srv/company" not in encoded
+    assert r"C:\\Users\\alice" not in encoded
+    assert r"\\\\server\\share" not in encoded
     assert "context" not in encoded
     assert "\u0000" not in encoded
     assert len(completion.event.content_hash()) == 64
