@@ -53,7 +53,9 @@ uv run maestro
 ```
 
 `MAESTRO_ALLOWED_ROOTS` is required and accepts multiple canonical roots separated by the OS
-path separator (`:` on POSIX). Configure exactly one explicit Codex authentication source:
+path separator (`:` on POSIX). Each root must be a directory below the filesystem anchor;
+the anchor itself (`/` on POSIX, or the platform equivalent) is rejected. Configure exactly
+one explicit Codex authentication source:
 `MAESTRO_CODEX_AUTH_FILE` or `MAESTRO_CODEX_API_KEY`. Neither is inherited by repository
 shell commands. stdout is reserved for newline-delimited MCP protocol messages; structured
 JSON application logs go to stderr.
@@ -150,6 +152,8 @@ question characters, 8,000 context characters, 128 KiB worker stdout/stderr, 64 
 result, 20 evidence items, 10 conflicts, 10,000 discovered files, 64 MiB aggregate discovery,
 and 1 MiB per file. Every limit is environment-configurable with the corresponding
 `MAESTRO_` setting in `.env.example`. Invalid configuration fails before the server starts.
+Allowed roots are canonicalized and filesystem anchors are prohibited; repository requests for
+an anchor fail with the existing `REPOSITORY_NOT_ALLOWED` public error.
 
 File discovery does not follow symlinks, skips `.git`, dependency/build caches, binary,
 non-UTF-8, and oversized content, and preserves an explicitly requested subdirectory rather
@@ -166,7 +170,10 @@ minimal allowlisted environment, no inherited MCPs/skills/plugins, no project in
 no apps, web search, hooks, goals, memories, subagents, or escalation. Thread and turn both
 select `deny_all` approvals and `read_only`. Repository content, caller text, Git history, and
 model output remain untrusted data. Results are redacted, bounded, schema-checked, evidence-
-checked, and rejected if the repository changes.
+checked, and rejected if the repository changes. Durable Audit text redaction detects configured
+repository roots, selected private absolute-path forms, credential-bearing URI user information,
+common secret forms, and unsafe controls from the same original input before applying bounded
+replacements once. It is heuristic and does not establish a general data-loss-prevention boundary.
 
 These controls do not make the cloud investigation offline: selected repository content is
 sent to the configured model provider. The SDK has no repository-only confidentiality

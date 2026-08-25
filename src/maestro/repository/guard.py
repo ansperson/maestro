@@ -96,6 +96,8 @@ class RepositoryGuard:
             raise RepositoryNotFoundError from exc
         if not canonical.is_dir():
             raise RepositoryNotFoundError
+        if _is_filesystem_anchor(canonical):
+            raise RepositoryNotAllowedError
         if not any(_is_within(canonical, root) for root in self._settings.allowed_roots):
             raise RepositoryNotAllowedError
         return AuthorizedRepository(root=canonical, repository_id=_private_path_id(canonical))
@@ -233,6 +235,10 @@ def _validated_relative_evidence_path(raw_path: str) -> PurePosixPath:
             "Evidence paths must be normalized repository-relative paths."
         )
     return path
+
+
+def _is_filesystem_anchor(path: Path) -> bool:
+    return bool(path.anchor) and path == Path(path.anchor)
 
 
 def _file_state(path: Path, *, max_file_bytes: int, remaining_bytes: int) -> tuple[FileState, int]:

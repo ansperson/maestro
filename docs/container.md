@@ -83,6 +83,9 @@ Multiple allowed roots use the host path separator (`:` on supported hosts). The
 each root before Docker starts, rejects missing/non-directory roots and ambiguous comma-bearing
 `--mount` paths, and mounts only those roots at identical absolute paths with
 `readonly,bind-recursive=readonly,bind-propagation=rprivate`. The MCP caller cannot add mounts.
+A filesystem anchor such as `/` is not an allowed root: the server rejects it during typed startup
+validation. Operators must configure narrower non-anchor directories; launcher canonicalization
+does not broaden that application policy.
 
 The image defaults to UID/GID 65532. The launcher normally overrides this with the invoking
 non-root UID/GID so read-only host files remain readable. A launcher invoked as root fails closed;

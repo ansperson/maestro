@@ -206,6 +206,29 @@ async def test_preflight_rejections_and_waiting_cancellation_create_no_audit(
 
 
 @pytest.mark.asyncio
+async def test_filesystem_anchor_request_is_safely_rejected_before_audit(
+    repository: Path, settings_factory: SettingsFactory
+) -> None:
+    port = FakeAuditPort()
+    runtime = FakeAgentRuntime(lambda _request: _result(VerificationStatus.RESOLVED))
+    service = ResolveCodebaseFactService(
+        settings_factory(allowed_roots=(repository,)), runtime, fake_audit_recorder(port)
+    )
+    request = _request(repository).model_copy(update={"repository_path": repository.anchor})
+
+    with pytest.raises(RepositoryNotAllowedError) as error:
+        await service.execute(request)
+
+    assert error.value.public_json() == (
+        '{"code":"REPOSITORY_NOT_ALLOWED",'
+        '"message":"The repository is outside the configured allowed roots."}'
+    )
+    assert port.starts == []
+    assert port.completions == []
+    assert runtime.requests == []
+
+
+@pytest.mark.asyncio
 async def test_start_failure_prevents_worker_invocation(
     repository: Path, settings_factory: SettingsFactory
 ) -> None:

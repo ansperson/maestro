@@ -78,6 +78,8 @@ class Settings(BaseSettings):
                 raise ValueError("an allowed root does not exist") from exc
             if not canonical.is_dir():
                 raise ValueError("every allowed root must be a directory")
+            if _is_filesystem_anchor(canonical):
+                raise ValueError("filesystem anchors cannot be allowed roots")
             if canonical not in resolved:
                 resolved.append(canonical)
         return tuple(resolved)
@@ -132,3 +134,7 @@ class Settings(BaseSettings):
         if self.codex_auth_file is not None and self.codex_api_key is not None:
             raise ValueError("configure only one Codex authentication source")
         return self
+
+
+def _is_filesystem_anchor(path: Path) -> bool:
+    return bool(path.anchor) and path == Path(path.anchor)

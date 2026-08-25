@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 
 import pytest
+from hypothesis import HealthCheck, given, settings, strategies as st
 from pydantic import ValidationError
 
 from maestro.config import Settings
@@ -101,6 +102,45 @@ def test_settings_deduplicates_roots(tmp_path: Path) -> None:
         allowed_roots=(tmp_path, tmp_path)
     )
     assert settings.allowed_roots == (tmp_path,)
+
+
+def test_settings_rejects_platform_filesystem_anchor() -> None:
+    anchor = Path(Path.cwd().anchor)
+    with pytest.raises(ValidationError, match="filesystem anchors"):
+        Settings.model_validate(
+            {
+                "allowed_roots": (anchor,),
+                "audit_database_url": "postgresql://audit-writer@localhost/maestro",
+            }
+        )
+
+
+@given(redundant_segments=st.integers(min_value=0, max_value=8))
+@settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
+def test_settings_rejects_every_canonical_anchor_alias(redundant_segments: int) -> None:
+    anchor = Path(Path.cwd().anchor)
+    candidate = f"{anchor}{f'.{os.sep}' * redundant_segments}"
+    with pytest.raises(ValidationError, match="filesystem anchors"):
+        Settings.model_validate(
+            {
+                "allowed_roots": (candidate,),
+                "audit_database_url": "postgresql://audit-writer@localhost/maestro",
+            }
+        )
+
+
+@given(parts=st.lists(st.from_regex(r"[a-z]{1,8}", fullmatch=True), min_size=1, max_size=4))
+@settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
+def test_settings_accepts_canonical_non_anchor_roots(tmp_path: Path, parts: list[str]) -> None:
+    root = tmp_path.joinpath(*parts)
+    root.mkdir(parents=True, exist_ok=True)
+    configured = Settings.model_validate(
+        {
+            "allowed_roots": (root,),
+            "audit_database_url": "postgresql://audit-writer@localhost/maestro",
+        }
+    )
+    assert configured.allowed_roots == (root.resolve(),)
 
 
 def test_settings_requires_audit_database_url(

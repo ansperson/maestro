@@ -167,38 +167,66 @@ def _stored_field(
     return stored
 
 
-def _semantic_case(category: str, repository_root: Path) -> tuple[str, str, str]:
+def _semantic_case(category: str, repository_root: Path) -> tuple[str, tuple[str, ...], str]:
     root = str(repository_root)
     if category == "root_punctuation":
-        case = (f"Repository is {root}.", root, "Repository is")
+        case = (f"Repository is {root}.", (root,), "Repository is")
     elif category == "root_continuation":
         regex = r"\\d+\s+"
-        case = (f"Regex {regex}; file {root}/src/models.py", root, regex)
+        case = (f"Regex {regex}; file {root}/src/models.py", (root,), regex)
     elif category == "root_embedded_prose":
         case = (
             f"before({root}), symbol Order.payment_ids after",
-            root,
+            (root,),
             "Order.payment_ids",
         )
     elif category == "backslash_unc":
         path = r"\\server.example\share_name-1$\private\settings.toml"
         regex = r"\\w+\d+"
-        case = (f"Regex {regex}; host {path}.", path, regex)
+        case = (f"Regex {regex}; host {path}.", (path,), regex)
     elif category == "forward_unc":
         path = "//server-name/share_name/private/settings.toml"
-        case = (f"Domain example.com; host {path}.", path, "example.com")
+        case = (f"Domain example.com; host {path}.", (path,), "example.com")
     elif category == "credential_uri":
         credential = "fixture-password"
         value = "API /api/v1/items uses postgresql://reader:" + credential + "@db/maestro"
-        case = (value, credential, "/api/v1/items")
-    else:
+        case = (value, (credential,), "/api/v1/items")
+    elif category == "private_host_path":
         path = "/opt/company/private/settings.toml"
         code = (
             r"\\server\share+ \\server\share* \\server\share? "
             r"\\server\share[0] \\server\share{x} \\server\share(x) "
             r"\\server\share^ \\server\share|"
         )
-        case = (f"Code {code}; host {path}.", path, code)
+        case = (f"Code {code}; host {path}.", (path,), code)
+    elif category == "drive_path":
+        path = r"C:\Users\alice\private\settings.toml"
+        case = (f"Symbol Order.payment_ids; host {path}.", (path,), "Order.payment_ids")
+    elif category == "secret_assignment":
+        fixture_value = "fixture-secret-value"
+        case = (
+            f"Symbol Order.payment_ids; api_key={fixture_value}",
+            (fixture_value,),
+            "Order.payment_ids",
+        )
+    elif category == "control":
+        case = ("Symbol Order.payment_ids\x07 remains", ("\x07",), "Order.payment_ids")
+    else:
+        credential = "fixture-password"
+        fixture_value = "fixture-secret-value"
+        unc = r"\\server.example\share_name-1$\private\settings.toml"
+        drive = r"C:\Users\alice\private\settings.toml"
+        private = "/opt/company/private/settings.toml"
+        value = (
+            "API /api/v1/items uses postgresql://token="
+            f"{credential}@db/maestro; api_key={fixture_value}; root {root}/src/models.py; "
+            f"private {private}; drive {drive}; host ({unc}); unsafe\x07control."
+        )
+        case = (
+            value,
+            (credential, fixture_value, root, private, drive, unc, "\x07"),
+            "/api/v1/items",
+        )
     return case
 
 
@@ -222,11 +250,18 @@ def _semantic_case(category: str, repository_root: Path) -> tuple[str, str, str]
         (r"See [C:\Users\alice\private\settings.toml]", r"C:\Users\alice"),
         ("See D:/Users/alice/private/settings.toml", "D:/Users/alice"),
         (r"See: \\server\share\private\settings.toml", r"\\server\share"),
+        (r"See (\\server\share\private\settings.toml).", r"\\server\share"),
+        (r"See [\\server\share\private\settings.toml].", r"\\server\share"),
+        (r'See "\\server\share\private\settings.toml".', r"\\server\share"),
         (
             r"See \\server.example\share_name-1$\private\settings.toml",
             r"\\server.example\share_name-1$",
         ),
         ("See //server/share/private/settings.toml", "//server/share"),
+        ("See (//server/share/private/settings.toml).", "//server/share"),
+        ("See {//server/share/private/settings.toml}.", "//server/share"),
+        ("See '//server/share/private/settings.toml'.", "//server/share"),
+        (r"Ambiguous \\word\word redacts.", r"\\word\word"),
     ],
 )
 def test_audit_sanitizer_redacts_sensitive_categories_independent_of_prefix(
@@ -287,6 +322,53 @@ def test_audit_sanitizer_is_nonempty_and_nonexpanding(value: str) -> None:
     assert len(sanitized) <= len(value)
 
 
+def test_audit_sanitizer_does_not_treat_invalid_anchor_as_a_literal_root() -> None:
+    value = "The endpoint is /api/v1/items."
+    assert sanitize_audit_text(value, Path(Path.cwd().anchor)) == value
+
+
+@given(
+    order=st.permutations(
+        (
+            "credential_uri",
+            "secret",
+            "repository",
+            "private_path",
+            "drive_path",
+            "unc_path",
+            "control",
+        )
+    )
+)
+def test_audit_sanitizer_detectors_cannot_disable_each_other(order: list[str]) -> None:
+    root = Path("/private/tmp/maestro/repository")
+    governed = {
+        "credential_uri": "postgresql://token=fixture-password@db/maestro",
+        "secret": "api_key=fixture-secret-value",  # pragma: allowlist secret
+        "repository": f"{root}/src/models.py",
+        "private_path": "/opt/company/private/settings.toml",
+        "drive_path": r"C:\Users\alice\private\settings.toml",
+        "unc_path": r"(\\server.example\share_name-1$\private\settings.toml)",
+        "control": "unsafe\x07control",
+    }
+    value = "; ".join(governed[item] for item in order)
+
+    sanitized = sanitize_audit_text(value, root)
+
+    for forbidden in (
+        "fixture-password",
+        "fixture-secret-value",
+        str(root),
+        "/opt/company",
+        r"C:\Users\alice",
+        r"\\server.example\share_name-1$",
+        "\x07",
+    ):
+        assert forbidden not in sanitized
+    assert "postgresql://*@" in sanitized
+    assert len(sanitized) <= len(value)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "field",
@@ -311,6 +393,10 @@ def test_audit_sanitizer_is_nonempty_and_nonexpanding(value: str) -> None:
         "forward_unc",
         "credential_uri",
         "private_host_path",
+        "drive_path",
+        "secret_assignment",
+        "control",
+        "composed",
     ],
 )
 async def test_recorder_redacts_governed_data_and_preserves_semantics_in_every_text_field(
@@ -340,7 +426,8 @@ async def test_recorder_redacts_governed_data_and_preserves_semantics_in_every_t
     )
 
     stored = _stored_field(port, field)
-    assert governed not in stored
+    for forbidden in governed:
+        assert forbidden not in stored
     assert preserved in stored
     assert len(stored) <= len(value)
 
