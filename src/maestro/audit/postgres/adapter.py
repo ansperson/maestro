@@ -11,12 +11,13 @@ from pydantic import SecretStr
 
 from maestro.audit.contracts import (
     AuditEventV1,
+    AuditExecutionFailureV1,
     AuditExecutionStartV1,
     AuditInvestigationCompletionV1,
 )
 from maestro.audit.port import AuditWriteError, AuditWriteFailureKind
 
-_SUPPORTED_SCHEMA_VERSION = 1
+_SUPPORTED_SCHEMA_VERSION = 2
 _RETRYABLE_SQLSTATES = frozenset({"40001", "40P01", "53300", "57P01", "57P02", "57P03"})
 _TRANSACTION_ABORT_SQLSTATES = frozenset({"40001", "40P01"})
 
@@ -58,6 +59,15 @@ class PostgresAuditPort:
 
     async def complete_investigation(self, record: AuditInvestigationCompletionV1) -> None:
         """Insert the single sequence-two completion in its own short transaction."""
+
+        async def write(connection: AsyncConnection[tuple[object, ...]]) -> None:
+            await _verify_schema(connection)
+            await _insert_event(connection, record.event)
+
+        await _run_transaction(self._database_url.get_secret_value(), write)
+
+    async def fail_execution(self, record: AuditExecutionFailureV1) -> None:
+        """Insert the single sequence-two operational failure in a short transaction."""
 
         async def write(connection: AsyncConnection[tuple[object, ...]]) -> None:
             await _verify_schema(connection)

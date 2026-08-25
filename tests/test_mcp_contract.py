@@ -15,6 +15,7 @@ from mcp.types import CallToolResult, TextContent
 
 import maestro.repository.guard as repository_module
 from maestro.agents import FakeAgentRuntime
+from maestro.audit.contracts import ExecutionFailedV1
 from maestro.audit.port import AuditWriteError, AuditWriteFailureKind
 from maestro.audit.testing import FakeAuditPort, fake_audit_recorder
 from maestro.capabilities.resolve_codebase_fact.contracts import (
@@ -448,7 +449,12 @@ async def test_unexpected_tool_failure_is_generic_and_safe(
         raise RuntimeError(detail)
 
     settings = settings_factory(allowed_roots=(repository,))
-    service = ResolveCodebaseFactService(settings, FakeAgentRuntime(crash), fake_audit_recorder())
+    port = FakeAuditPort()
+    service = ResolveCodebaseFactService(
+        settings,
+        FakeAgentRuntime(crash),
+        fake_audit_recorder(port),
+    )
     async with Client(create_server(service)) as client:
         result = await client.call_tool(
             TOOL_NAME,
@@ -461,3 +467,7 @@ async def test_unexpected_tool_failure_is_generic_and_safe(
     assert result.is_error is True
     assert "INTERNAL_ERROR" in text
     assert detail not in text
+    assert len(port.failures) == 1
+    payload = port.failures[0].event.payload
+    assert isinstance(payload, ExecutionFailedV1)
+    assert payload.error_code == "INTERNAL_ERROR"

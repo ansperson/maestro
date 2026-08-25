@@ -17,8 +17,10 @@ from maestro.audit.contracts import (
     AuditConfidence,
     AuditEventType,
     AuditEventV1,
+    AuditExecutionFailureV1,
     AuditExecutionStartV1,
     AuditExecutionV1,
+    AuditFailureStage,
     AuditInvestigationCompletionV1,
     AuditResultStatus,
 )
@@ -31,6 +33,7 @@ from maestro.audit.recorder import (
     AuditRuntimeMetadata,
 )
 from maestro.audit.testing import FakeAuditPort
+from maestro.errors import ErrorCode
 from maestro.repository.guard import AuthorizedRepository, RepositoryFingerprint
 
 _TEST_DSN_ENV = "MAESTRO_TEST_POSTGRES_DSN"
@@ -61,7 +64,7 @@ class _FakeConnection:
         *,
         transaction_exit_error: Exception | None = None,
         close_error: Exception | None = None,
-        schema_version: int | None = 1,
+        schema_version: int | None = 2,
     ) -> None:
         self._transaction_exit_error = transaction_exit_error
         self._close_error = close_error
@@ -110,12 +113,18 @@ def _patch_connection(
 def test_migration_is_an_ordered_packaged_explicit_resource() -> None:
     migrations = packaged_migrations()
     assert [(migration.version, migration.name) for migration in migrations] == [
-        (1, "0001_audit_tracer.sql")
+        (1, "0001_audit_tracer.sql"),
+        (2, "0002_execution_failed.sql"),
     ]
     assert migrations[0].sql.startswith("BEGIN;")
     assert migrations[0].sql.rstrip().endswith("COMMIT;")
     assert "CREATE TABLE audit.executions" in migrations[0].sql
     assert "CREATE TABLE audit.events" in migrations[0].sql
+    assert migrations[1].sql.startswith("BEGIN;")
+    assert migrations[1].sql.rstrip().endswith("COMMIT;")
+    assert "execution.failed" in migrations[1].sql
+    assert "UPDATE audit.events" not in migrations[1].sql
+    assert "DELETE FROM audit.events" not in migrations[1].sql
 
 
 @pytest.mark.parametrize(
@@ -189,27 +198,29 @@ def test_postgres_commit_failure_is_conservative(
 
 
 @pytest.mark.asyncio
-async def test_postgres_port_runs_both_short_transaction_shapes(
+async def test_postgres_port_runs_all_short_transaction_shapes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     connection = _FakeConnection()
     _patch_connection(monkeypatch, connection)
     start, completion, _repository = await _records()
+    failure = await _failure_record()
     port = PostgresAuditPort(SecretStr("postgresql:///synthetic"))
 
     await port.start_execution(start)
     await port.complete_investigation(completion)
+    await port.fail_execution(failure)
 
-    assert len(connection.statements) == 5
-    assert sum("SELECT version" in statement for statement in connection.statements) == 2
+    assert len(connection.statements) == 7
+    assert sum("SELECT version" in statement for statement in connection.statements) == 3
     assert (
         sum("INSERT INTO audit.executions" in statement for statement in connection.statements) == 1
     )
-    assert sum("INSERT INTO audit.events" in statement for statement in connection.statements) == 2
+    assert sum("INSERT INTO audit.events" in statement for statement in connection.statements) == 3
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("schema_version", [None, 999])
+@pytest.mark.parametrize("schema_version", [None, 1, 999])
 async def test_postgres_port_rejects_unsupported_schema_without_writing(
     monkeypatch: pytest.MonkeyPatch,
     schema_version: int | None,
@@ -381,17 +392,56 @@ async def _records() -> tuple[
     return fake.starts[0], fake.completions[0], repository
 
 
+async def _failure_record() -> AuditExecutionFailureV1:
+    identifiers = iter(UUID(int=value) for value in range(101, 106))
+    fake = FakeAuditPort()
+    recorder = AuditRecorder(
+        fake,
+        AuditRuntimeMetadata(
+            server_version="1.0.0",
+            runtime_name="codex",
+            runtime_version="0.147.0",
+            model="gpt-5.4",
+            prompt_policy_version="repository-verifier/v1",
+        ),
+        id_factory=lambda: next(identifiers),
+        clock=lambda: datetime(2026, 8, 25, tzinfo=UTC),
+    )
+    repository = AuthorizedRepository(root=Path.cwd(), repository_id="e" * 16)
+    fingerprint = RepositoryFingerprint(
+        digest="f" * 64,
+        repository_id=repository.repository_id,
+        git_top_level_id=None,
+        head=None,
+        dirty_digest=None,
+        files={},
+        truncated=False,
+    )
+    handle = await recorder.start_resolve_codebase_fact(
+        repository,
+        fingerprint,
+        "Can the operation complete?",
+    )
+    await recorder.record_execution_failed(
+        handle,
+        ErrorCode.AGENT_RUNTIME_ERROR,
+        AuditFailureStage.INVESTIGATION,
+    )
+    return fake.failures[0]
+
+
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("socket_enabled")
 async def test_postgres_atomic_start_terminal_uniqueness_and_connection_lifetime() -> None:
     raw_dsn = os.environ.get(_TEST_DSN_ENV)
     if raw_dsn is None:
         pytest.skip(f"set {_TEST_DSN_ENV} to run PostgreSQL Audit adapter tests")
-    migration = packaged_migrations()[0]
+    migrations = packaged_migrations()
     migration_connection = await AsyncConnection.connect(raw_dsn)
     try:
-        reviewed_sql = cast(LiteralString, migration.sql)
-        await migration_connection.execute(sql.SQL(reviewed_sql))
+        for migration in migrations:
+            reviewed_sql = cast(LiteralString, migration.sql)
+            await migration_connection.execute(sql.SQL(reviewed_sql))
         await migration_connection.commit()
     finally:
         await migration_connection.close()
