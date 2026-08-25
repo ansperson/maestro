@@ -6,10 +6,12 @@ from typing import Literal
 from uuid import UUID
 
 import pytest
+from helpers.audit_boundary_fixtures import audit_payload_boundary_result
 from hypothesis import given, strategies as st
 from pydantic import ValidationError
 
 from maestro.audit.contracts import (
+    MAX_AUDIT_PAYLOAD_BYTES,
     AuditConfidence,
     AuditEventType,
     AuditEventV1,
@@ -26,7 +28,11 @@ from maestro.audit.recorder import (
     AuditRuntimeMetadata,
 )
 from maestro.audit.sanitization import sanitize_audit_text
-from maestro.audit.testing import FakeAuditPort
+from maestro.audit.testing import FakeAuditPort, fake_audit_recorder
+from maestro.capabilities.resolve_codebase_fact.audit_mapping import (
+    map_result_to_audit_completion,
+)
+from maestro.errors import AuditPersistenceError
 from maestro.repository.guard import AuthorizedRepository, RepositoryFingerprint
 
 _NOW = datetime(2026, 8, 25, 12, 0, tzinfo=UTC)
@@ -478,6 +484,95 @@ async def test_recorder_builds_immutable_strict_versioned_records(tmp_path: Path
     assert len(completion.event.content_hash()) == 64
     with pytest.raises(ValidationError, match="frozen"):
         start.event.sequence = 2  # type: ignore[misc]
+
+
+@pytest.mark.asyncio
+async def test_recorder_accepts_completion_payload_at_exact_byte_limit(tmp_path: Path) -> None:
+    port = FakeAuditPort()
+    recorder = fake_audit_recorder(port)
+    repository = _repository(tmp_path)
+    handle = await recorder.start_resolve_codebase_fact(
+        repository,
+        _fingerprint(),
+        "Is the fact established?",
+    )
+
+    await recorder.record_investigation_completed(
+        handle,
+        repository,
+        map_result_to_audit_completion(audit_payload_boundary_result(overflow=False)),
+    )
+
+    payload = port.completions[0].event.payload
+    assert len(payload.model_dump_json().encode("utf-8")) == MAX_AUDIT_PAYLOAD_BYTES
+
+
+@pytest.mark.asyncio
+async def test_recorder_maps_completion_payload_overflow_before_port_call(tmp_path: Path) -> None:
+    port = FakeAuditPort()
+    recorder = fake_audit_recorder(port)
+    repository = _repository(tmp_path)
+    handle = await recorder.start_resolve_codebase_fact(
+        repository,
+        _fingerprint(),
+        "Is the fact established?",
+    )
+
+    with pytest.raises(AuditPersistenceError):
+        await recorder.record_investigation_completed(
+            handle,
+            repository,
+            map_result_to_audit_completion(audit_payload_boundary_result(overflow=True)),
+        )
+
+    assert len(port.starts) == 1
+    assert port.completion_attempts == []
+
+
+@pytest.mark.asyncio
+async def test_recorder_maps_start_contract_construction_failure_before_port_call(
+    tmp_path: Path,
+) -> None:
+    port = FakeAuditPort()
+    metadata = _metadata()
+    recorder = AuditRecorder(
+        port,
+        AuditRuntimeMetadata(
+            server_version=metadata.server_version,
+            runtime_name=metadata.runtime_name,
+            runtime_version=metadata.runtime_version,
+            model="m" * 129,
+            prompt_policy_version=metadata.prompt_policy_version,
+        ),
+    )
+
+    with pytest.raises(AuditPersistenceError):
+        await recorder.start_resolve_codebase_fact(
+            _repository(tmp_path),
+            _fingerprint(),
+            "Is the fact established?",
+        )
+
+    assert port.start_attempts == []
+
+
+@pytest.mark.asyncio
+async def test_recorder_does_not_hide_non_contract_programmer_errors(tmp_path: Path) -> None:
+    port = FakeAuditPort()
+
+    def broken_clock() -> datetime:
+        raise RuntimeError("synthetic programmer error")
+
+    recorder = AuditRecorder(port, _metadata(), clock=broken_clock)
+
+    with pytest.raises(RuntimeError, match="programmer error"):
+        await recorder.start_resolve_codebase_fact(
+            _repository(tmp_path),
+            _fingerprint(),
+            "Is the fact established?",
+        )
+
+    assert port.start_attempts == []
 
 
 def test_event_contract_rejects_extra_fields_and_mismatched_sequence() -> None:

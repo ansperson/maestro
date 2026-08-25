@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import NoReturn
 from uuid import UUID, uuid4
 
+from pydantic import ValidationError
+
 from maestro.audit.contracts import (
     AuditConfidence,
     AuditConflictV1,
@@ -138,24 +140,28 @@ class AuditRecorder:
             execution_id=self._id_factory(),
             completion_event_id=self._id_factory(),
         )
-        execution = AuditExecutionV1(
-            audit_id=handle.audit_id,
-            execution_id=handle.execution_id,
-            repository_id=repository.repository_id,
-            repository_fingerprint=fingerprint.digest,
-        )
-        event = AuditEventV1(
-            event_id=self._id_factory(),
-            audit_id=handle.audit_id,
-            sequence=1,
-            event_type=AuditEventType.EXECUTION_STARTED,
-            occurred_at=self._clock(),
-            payload=ExecutionStartedV1(
-                objective=sanitize_audit_text(objective, repository.root),
-                **self._metadata_fields(),
-            ),
-        )
-        record = AuditExecutionStartV1(execution=execution, event=event)
+        sanitized_objective = sanitize_audit_text(objective, repository.root)
+        try:
+            execution = AuditExecutionV1(
+                audit_id=handle.audit_id,
+                execution_id=handle.execution_id,
+                repository_id=repository.repository_id,
+                repository_fingerprint=fingerprint.digest,
+            )
+            event = AuditEventV1(
+                event_id=self._id_factory(),
+                audit_id=handle.audit_id,
+                sequence=1,
+                event_type=AuditEventType.EXECUTION_STARTED,
+                occurred_at=self._clock(),
+                payload=ExecutionStartedV1(
+                    objective=sanitized_objective,
+                    **self._metadata_fields(),
+                ),
+            )
+            record = AuditExecutionStartV1(execution=execution, event=event)
+        except ValidationError:
+            self._raise_public(AuditPersistenceError(), "start", 0)
         await self._persist("start", lambda: self._port.start_execution(record))
         return handle
 
@@ -167,24 +173,29 @@ class AuditRecorder:
     ) -> None:
         """Persist one accepted semantic result as the sequence-two completion."""
 
-        payload = InvestigationCompletedV1(
-            status=result.status,
-            answer=self._sanitize_optional(result.answer, repository.root),
-            confidence=result.confidence,
-            rationale=sanitize_audit_text(result.rationale, repository.root),
-            evidence=tuple(self._evidence(item, repository.root) for item in result.evidence),
-            conflicts=tuple(self._conflict(item, repository.root) for item in result.conflicts),
-            **self._metadata_fields(),
-        )
-        event = AuditEventV1(
-            event_id=handle.completion_event_id,
-            audit_id=handle.audit_id,
-            sequence=2,
-            event_type=AuditEventType.INVESTIGATION_COMPLETED,
-            occurred_at=self._clock(),
-            payload=payload,
-        )
-        record = AuditInvestigationCompletionV1(event=event)
+        sanitized_answer = self._sanitize_optional(result.answer, repository.root)
+        sanitized_rationale = sanitize_audit_text(result.rationale, repository.root)
+        try:
+            payload = InvestigationCompletedV1(
+                status=result.status,
+                answer=sanitized_answer,
+                confidence=result.confidence,
+                rationale=sanitized_rationale,
+                evidence=tuple(self._evidence(item, repository.root) for item in result.evidence),
+                conflicts=tuple(self._conflict(item, repository.root) for item in result.conflicts),
+                **self._metadata_fields(),
+            )
+            event = AuditEventV1(
+                event_id=handle.completion_event_id,
+                audit_id=handle.audit_id,
+                sequence=2,
+                event_type=AuditEventType.INVESTIGATION_COMPLETED,
+                occurred_at=self._clock(),
+                payload=payload,
+            )
+            record = AuditInvestigationCompletionV1(event=event)
+        except ValidationError:
+            self._raise_public(AuditPersistenceError(), "completion", 0)
         await self._persist("completion", lambda: self._port.complete_investigation(record))
 
     async def _persist(self, operation_name: str, operation: _PersistenceOperation) -> None:

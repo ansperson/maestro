@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import sys
@@ -7,6 +8,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+from helpers.audit_boundary_fixtures import audit_payload_boundary_result
 from mcp import Client, StdioServerParameters
 from mcp.types import CallToolResult, TextContent
 
@@ -30,6 +32,7 @@ from maestro.mcp.server import (
     TOOL_TITLE,
     create_server,
 )
+from maestro.repository.guard import AuthorizedRepository, RepositoryFingerprint, RepositoryGuard
 
 SettingsFactory = Callable[..., Settings]
 
@@ -243,6 +246,84 @@ async def test_in_memory_untyped_audit_failure_does_not_expose_adapter_detail(
 
 
 @pytest.mark.asyncio
+async def test_in_memory_fingerprint_deadline_is_safe_and_pre_audit(
+    repository: Path,
+    settings_factory: SettingsFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = settings_factory(
+        allowed_roots=(repository,),
+        verifier_timeout_seconds=0.01,
+    )
+    guard = RepositoryGuard(settings)
+    cancelled = asyncio.Event()
+
+    async def block_fingerprint(
+        _repository: AuthorizedRepository,
+    ) -> RepositoryFingerprint:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(guard, "fingerprint", block_fingerprint)
+    port = FakeAuditPort()
+    service = ResolveCodebaseFactService(
+        settings,
+        FakeAgentRuntime(lambda _request: _resolved_result()),
+        fake_audit_recorder(port),
+        repository_guard=guard,
+    )
+    async with Client(create_server(service)) as client:
+        result = await client.call_tool(
+            TOOL_NAME,
+            {
+                "repository_path": str(repository),
+                "question": "Is the payment field a list?",
+            },
+        )
+
+    text = _first_text(result)
+    assert result.is_error is True
+    assert "AGENT_TIMEOUT" in text
+    assert "AUDIT_" not in text
+    assert cancelled.is_set()
+    assert port.start_attempts == []
+
+
+@pytest.mark.asyncio
+async def test_in_memory_audit_payload_overflow_is_persistence_error(
+    repository: Path,
+    settings_factory: SettingsFactory,
+) -> None:
+    overflow = audit_payload_boundary_result(overflow=True)
+    settings = settings_factory(allowed_roots=(repository,))
+    assert len(overflow.model_dump_json().encode("utf-8")) <= settings.max_result_bytes
+    port = FakeAuditPort()
+    service = ResolveCodebaseFactService(
+        settings,
+        FakeAgentRuntime(lambda _request: overflow),
+        fake_audit_recorder(port),
+    )
+    async with Client(create_server(service)) as client:
+        result = await client.call_tool(
+            TOOL_NAME,
+            {
+                "repository_path": str(repository),
+                "question": "Is the payment field a list?",
+            },
+        )
+
+    text = _first_text(result)
+    assert result.is_error is True
+    assert "AUDIT_PERSISTENCE_ERROR" in text
+    assert "INVALID_INPUT" not in text
+    assert len(port.starts) == 1
+    assert port.completion_attempts == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("failure", "code"),
     [
@@ -277,6 +358,36 @@ async def test_real_stdio_maps_both_audit_error_categories(
     assert [tool.name for tool in tools.tools] == [TOOL_NAME]
     assert result.is_error is True
     assert code in _first_text(result)
+
+
+@pytest.mark.asyncio
+async def test_real_stdio_maps_audit_payload_overflow_to_persistence_error(
+    repository: Path,
+) -> None:
+    parameters = StdioServerParameters(
+        command=sys.executable,
+        args=[
+            str(Path(__file__).parent / "helpers" / "fake_audit_error_server.py"),
+            str(repository),
+            "payload_overflow",
+        ],
+        cwd=Path(__file__).parent.parent,
+    )
+    async with Client(parameters, read_timeout_seconds=5) as client:
+        tools = await client.list_tools()
+        result = await client.call_tool(
+            TOOL_NAME,
+            {
+                "repository_path": str(repository),
+                "question": "Is the payment field a list?",
+            },
+        )
+
+    text = _first_text(result)
+    assert [tool.name for tool in tools.tools] == [TOOL_NAME]
+    assert result.is_error is True
+    assert "AUDIT_PERSISTENCE_ERROR" in text
+    assert "INVALID_INPUT" not in text
 
 
 @pytest.mark.asyncio

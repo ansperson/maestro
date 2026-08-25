@@ -5,6 +5,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+from audit_boundary_fixtures import audit_payload_boundary_result
+
 from maestro.agents import FakeAgentRuntime
 from maestro.audit.port import AuditWriteError, AuditWriteFailureKind
 from maestro.audit.testing import FakeAuditPort, fake_audit_recorder
@@ -22,10 +24,7 @@ def main() -> None:
     """Run a fixture whose Audit start fails with the selected safe classification."""
 
     repository = Path(sys.argv[1])
-    kind = AuditWriteFailureKind(sys.argv[2])
-
-    def fail_start(_record: object) -> None:
-        raise AuditWriteError(kind)
+    mode = sys.argv[2]
 
     settings = Settings.model_validate(
         {
@@ -33,11 +32,18 @@ def main() -> None:
             "audit_database_url": "postgresql://audit-writer@127.0.0.1:1/maestro",
         }
     )
-    service = ResolveCodebaseFactService(
-        settings,
-        FakeAgentRuntime(_unexpected_worker),
-        fake_audit_recorder(FakeAuditPort(on_start=fail_start)),
-    )
+    if mode == "payload_overflow":
+        runtime = FakeAgentRuntime(lambda _request: audit_payload_boundary_result(overflow=True))
+        audit = fake_audit_recorder()
+    else:
+        kind = AuditWriteFailureKind(mode)
+
+        def fail_start(_record: object) -> None:
+            raise AuditWriteError(kind)
+
+        runtime = FakeAgentRuntime(_unexpected_worker)
+        audit = fake_audit_recorder(FakeAuditPort(on_start=fail_start))
+    service = ResolveCodebaseFactService(settings, runtime, audit)
     create_server(service).run(transport="stdio")
 
 

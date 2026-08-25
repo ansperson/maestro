@@ -5,6 +5,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+from helpers.audit_boundary_fixtures import audit_payload_boundary_result
 
 from maestro.agents import FakeAgentRuntime, InvestigationRequest
 from maestro.audit.contracts import (
@@ -25,6 +26,7 @@ from maestro.capabilities.resolve_codebase_fact.policy import neutralize_questio
 from maestro.capabilities.resolve_codebase_fact.service import ResolveCodebaseFactService
 from maestro.config import Settings
 from maestro.errors import (
+    AgentTimeoutError,
     AuditPersistenceError,
     EvidenceValidationError,
     InvalidInputError,
@@ -34,6 +36,7 @@ from maestro.errors import (
     ServerBusyError,
 )
 from maestro.execution import AdmissionController
+from maestro.repository.guard import AuthorizedRepository, RepositoryFingerprint, RepositoryGuard
 
 SettingsFactory = Callable[..., Settings]
 
@@ -207,6 +210,51 @@ async def test_preflight_rejections_and_waiting_cancellation_create_no_audit(
 
 
 @pytest.mark.asyncio
+async def test_initial_fingerprint_timeout_cancels_before_audit_or_worker(
+    repository: Path,
+    settings_factory: SettingsFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = settings_factory(
+        allowed_roots=(repository,),
+        verifier_timeout_seconds=0.01,
+    )
+    guard = RepositoryGuard(settings)
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def block_fingerprint(
+        _repository: AuthorizedRepository,
+    ) -> RepositoryFingerprint:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(guard, "fingerprint", block_fingerprint)
+    port = FakeAuditPort()
+    runtime = FakeAgentRuntime(lambda _request: _result(VerificationStatus.RESOLVED))
+    service = ResolveCodebaseFactService(
+        settings,
+        runtime,
+        fake_audit_recorder(port),
+        repository_guard=guard,
+    )
+
+    with pytest.raises(AgentTimeoutError) as error:
+        await service.execute(_request(repository))
+
+    assert entered.is_set()
+    assert cancelled.is_set()
+    assert "AGENT_TIMEOUT" in error.value.public_json()
+    assert port.start_attempts == []
+    assert port.completion_attempts == []
+    assert runtime.requests == []
+
+
+@pytest.mark.asyncio
 async def test_filesystem_anchor_request_is_safely_rejected_before_audit(
     repository: Path, settings_factory: SettingsFactory
 ) -> None:
@@ -278,6 +326,29 @@ async def test_invalid_or_oversized_result_is_not_persisted_as_completion(
         await service.execute(_request(repository))
     assert len(port.starts) == 1
     assert port.completions == []
+
+
+@pytest.mark.asyncio
+async def test_valid_public_result_with_oversized_audit_payload_is_withheld(
+    repository: Path,
+    settings_factory: SettingsFactory,
+) -> None:
+    result = audit_payload_boundary_result(overflow=True)
+    settings = settings_factory(allowed_roots=(repository,))
+    encoded_size = len(result.model_dump_json().encode("utf-8"))
+    assert encoded_size <= settings.max_result_bytes
+    assert encoded_size <= settings.max_agent_output_bytes
+    port = FakeAuditPort()
+    runtime = FakeAgentRuntime(lambda _request: result)
+    service = ResolveCodebaseFactService(settings, runtime, fake_audit_recorder(port))
+
+    with pytest.raises(AuditPersistenceError) as error:
+        await service.execute(_request(repository))
+
+    assert "AUDIT_PERSISTENCE_ERROR" in error.value.public_json()
+    assert len(runtime.requests) == 1
+    assert len(port.starts) == 1
+    assert port.completion_attempts == []
 
 
 @pytest.mark.asyncio

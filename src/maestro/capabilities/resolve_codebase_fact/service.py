@@ -78,8 +78,9 @@ class ResolveCodebaseFactService:
         try:
             async with self._admission.slot():
                 queue_duration_ms = round((time.monotonic() - queued_at) * 1_000, 2)
-                fingerprint = await self._repository.fingerprint(repository)
-                objective = neutralize_question(request.question)
+                async with asyncio.timeout(self._settings.verifier_timeout_seconds):
+                    fingerprint = await self._repository.fingerprint(repository)
+                    objective = neutralize_question(request.question)
                 audit_handle = await self._audit.start_resolve_codebase_fact(
                     repository,
                     fingerprint,
