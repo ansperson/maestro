@@ -78,24 +78,24 @@ class ResolveCodebaseFactService:
         try:
             async with self._admission.slot():
                 queue_duration_ms = round((time.monotonic() - queued_at) * 1_000, 2)
+                fingerprint = await self._repository.fingerprint(repository)
+                objective = neutralize_question(request.question)
+                audit_handle = await self._audit.start_resolve_codebase_fact(
+                    repository,
+                    fingerprint,
+                    objective,
+                )
                 async with asyncio.timeout(self._settings.verifier_timeout_seconds):
-                    fingerprint = await self._repository.fingerprint(repository)
-                    objective = neutralize_question(request.question)
-                    audit_handle = await self._audit.start_resolve_codebase_fact(
-                        repository,
-                        fingerprint,
-                        objective,
-                    )
                     request_id = audit_handle.execution_id.hex
                     result = await self._investigate(repository, request, fingerprint, objective)
                     await self._validate_result(repository, fingerprint, result)
                     result = sanitize_result(result, repository.root)
                     self._validate_result_size(result)
-                    await self._audit.record_investigation_completed(
-                        audit_handle,
-                        repository,
-                        map_result_to_audit_completion(result),
-                    )
+                await self._audit.record_investigation_completed(
+                    audit_handle,
+                    repository,
+                    map_result_to_audit_completion(result),
+                )
         except TimeoutError as exc:
             error = AgentTimeoutError()
             self._log_failure(

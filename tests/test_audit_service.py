@@ -25,6 +25,7 @@ from maestro.capabilities.resolve_codebase_fact.policy import neutralize_questio
 from maestro.capabilities.resolve_codebase_fact.service import ResolveCodebaseFactService
 from maestro.config import Settings
 from maestro.errors import (
+    AuditPersistenceError,
     EvidenceValidationError,
     InvalidInputError,
     OutputLimitExceededError,
@@ -241,7 +242,7 @@ async def test_start_failure_prevents_worker_invocation(
         settings_factory(allowed_roots=(repository,)), runtime, fake_audit_recorder(port)
     )
 
-    with pytest.raises(RuntimeError, match="start failure"):
+    with pytest.raises(AuditPersistenceError):
         await service.execute(_request(repository))
     assert runtime.requests == []
     assert port.starts == []

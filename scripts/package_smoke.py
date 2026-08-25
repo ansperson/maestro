@@ -8,8 +8,7 @@ import sys
 from pathlib import Path
 
 from mcp import Client, StdioServerParameters
-
-from maestro.capabilities.resolve_codebase_fact import VerificationResult, VerificationStatus
+from mcp.types import TextContent
 
 _EXPECTED_ARGUMENT_COUNT = 3
 
@@ -21,6 +20,7 @@ async def run(executable: Path, repository: Path) -> None:
         command=str(executable),
         env={
             "MAESTRO_ALLOWED_ROOTS": str(repository),
+            "MAESTRO_AUDIT_DATABASE_URL": "postgresql://audit-writer@127.0.0.1:1/maestro",
             "MAESTRO_LOG_LEVEL": "WARNING",
         },
     )
@@ -35,19 +35,17 @@ async def run(executable: Path, repository: Path) -> None:
         )
     if [tool.name for tool in tools.tools] != ["resolve_codebase_fact"]:
         raise RuntimeError("installed server exposed an unexpected tool contract")
-    if result.is_error or result.structured_content is None:
-        raise RuntimeError("installed server did not return structured content")
-    validated = VerificationResult.model_validate_json(
-        json.dumps(result.structured_content), strict=True
-    )
-    if validated.status is not VerificationStatus.HUMAN_DECISION_REQUIRED:
-        raise RuntimeError("installed server returned an unexpected smoke-test status")
+    block = result.content[0]
+    if not result.is_error or not isinstance(block, TextContent):
+        raise RuntimeError("installed server did not fail closed without Audit connectivity")
+    if "AUDIT_UNAVAILABLE" not in block.text:
+        raise RuntimeError("installed server returned an unexpected Audit error")
     print(
         json.dumps(
             {
                 "package_smoke": "passed",
                 "tool": "resolve_codebase_fact",
-                "status": "human_decision_required",
+                "status": "audit_unavailable",
             },
             separators=(",", ":"),
         )

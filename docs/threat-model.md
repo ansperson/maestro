@@ -2,8 +2,9 @@
 
 ## Scope and assumptions
 
-This model covers the local stdio `resolve_codebase_fact` capability at server version 1.0.0.
-It excludes remote transport, Jobs, persistence, external MCP/integrations, PR/Issue work,
+This model covers the local stdio `resolve_codebase_fact` capability and its PostgreSQL Audit
+tracer at server version 1.0.0. It excludes remote transport, Jobs, non-Audit durable state,
+external MCP/integrations, PR/Issue work,
 multi-tenancy, and subagents. The operator and host kernel are trusted; the MCP caller,
 repository, model/runtime output, and dependency supply chain are not. The model provider is
 trusted to receive selected authorized-repository data under the operator's provider terms.
@@ -24,6 +25,7 @@ Linux kernel/VM, official pinned base manifests, and configured host filesystem 
 | Credential leakage | Explicit single auth source, no inherited full environment, mode-0700/0600 temporary files, shell env allowlist, log/output redaction; hardened mode mounts only the dedicated file read-only | Docker inspectors can see environment API keys; same-user/daemon process inspection, compromised runtime/provider, or cleanup failure can expose secrets |
 | Recursion | No worker MCP configuration, depth marker propagated to shell, server startup/context recursion guards | A compromised runtime could bypass process policy; external process controls remain stronger |
 | Denial of service | Input/file/byte/output bounds, timeout, bounded concurrency and queue, bounded stdout/stderr, process-group termination; hardened launcher adds memory, CPU, PID, and tmpfs limits plus init | Provider/tool latency and host-wide Docker resource contention remain; defaults need operational tuning for unusually large workloads |
+| Audit persistence failure | Mandatory typed configuration, lazy short transactions, fail-closed start/completion, three attempts in a five-second budget only for failures known not committed, safe public errors/log metadata | Ambiguous writes fail conservatively and can leave a start-only or complete-but-unacknowledged trail; duplicate verification and recovery are deferred |
 | Repository mutation | SDK read-only/deny-all, evidence file identity checks, before/after content/Git fingerprint; hardened mode bind-mounts roots recursively read-only | Native mode retains the upstream bypass risk; Docker daemon/kernel compromise remains outside Level 2 |
 | Compromised dependency/runtime | Exact MCP/Codex/runtime pins, lockfile, startup version check, digest-pinned image inputs, pip-audit, Trivy, Dependabot, CodeQL, pinned actions | Locking/scanning is not compromise prevention; the Docker daemon, host kernel/VM, registry, and scanner databases remain trusted dependencies |
 | Container breakout or daemon exposure | Non-root UID, all capabilities dropped, no-new-privileges, default seccomp/LSM, no privileged/host namespaces/devices/socket, read-only root | Kernel/runtime vulnerabilities and access to the host Docker daemon are outside the container boundary; rootless Docker further reduces daemon impact on native Linux |
@@ -36,8 +38,9 @@ path enter application memory. The child gets a non-secret request, explicit cre
 its isolated environment/home, and reads the repository during one ephemeral Codex thread and
 turn. The provider may receive selected repository content. The parent accepts only a bounded
 private JSON envelope, validates and redacts it, and returns structured MCP content. Temporary
-Codex state is recursively removed best-effort. No cache, database, transcript, telemetry, or
-external log sink exists.
+Codex state is recursively removed best-effort. PostgreSQL retains bounded, sanitized semantic
+Audit records; it does not retain caller context, prompts, transcripts, repository content, raw
+model output, or credentials. No cache, telemetry, or external log sink exists.
 
 In hardened mode the MCP client starts a local Docker CLI process over stdio. The launcher
 canonicalizes configured roots, builds an argument vector without a shell, and mounts those roots

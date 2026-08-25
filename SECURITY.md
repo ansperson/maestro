@@ -20,7 +20,9 @@ Maestro canonicalizes allowed roots, rejects filesystem anchors plus traversal/s
 performs bounded no-follow file discovery, isolates the Codex home and environment, disables
 inherited MCPs/skills/apps/web/subagents, selects deny-all/read-only at both SDK boundaries,
 validates structured output and evidence, sanitizes results, fingerprints the repository before
-and after investigation, bounds admission/deadlines/pipes/results, and owns worker cancellation.
+and after investigation, bounds admission/deadlines/pipes/results, owns worker cancellation, and
+requires durable Audit start/completion records before AI work/result release. Audit connections
+are lazy and short-lived; no database connection or transaction remains open during AI work.
 Logs exclude request text, source, credentials, transcripts, model responses, and absolute
 paths. The recommended Level 2 deployment additionally encloses the unchanged application in a
 hardened Linux container with read-only repository mounts and root filesystem, ephemeral
@@ -61,6 +63,10 @@ does not persist prompts, transcripts, repository content, or model output.
   and unsafe controls by collecting spans from the original input and applying bounded replacements
   once. Unrecognized path syntax, secret formats, encodings, or deliberate obfuscation may survive;
   neither control proves that a secret cannot be selected or encoded by the model.
+- Audit retries are limited to failures known not committed. An unverifiable or ambiguous write
+  returns `AUDIT_PERSISTENCE_ERROR` and may leave a start-only or complete-but-unacknowledged
+  trail; duplicate verification and recovery remain outside this release boundary. Adapter
+  details, SQL, SQLSTATE, hosts, users, and credentials are excluded from public errors and logs.
 - The Level 2 container permits provider networking and cannot technically distinguish it from
   arbitrary egress by a compromised process. Every configured allowed root is readable by the
   shared container. Higher assurance requires controlled egress and/or per-worker containers.

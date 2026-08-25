@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 from typing import Annotated, Self
 
+from psycopg.conninfo import conninfo_to_dict
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -124,6 +125,17 @@ class Settings(BaseSettings):
         if not canonical.is_file():
             raise ValueError("MAESTRO_CODEX_AUTH_FILE must be a regular non-symlink file")
         return canonical
+
+    @field_validator("audit_database_url")
+    @classmethod
+    def validate_audit_database_url(_cls, value: SecretStr) -> SecretStr:  # noqa: N804
+        """Reject malformed PostgreSQL connection configuration without connecting."""
+
+        try:
+            conninfo_to_dict(value.get_secret_value())
+        except Exception:
+            raise ValueError("MAESTRO_AUDIT_DATABASE_URL is invalid") from None
+        return value
 
     @model_validator(mode="after")
     def validate_cross_field_limits(self) -> Self:

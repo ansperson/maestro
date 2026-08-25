@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import asyncio
+import logging
+import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import NoReturn
 from uuid import UUID, uuid4
 
 from maestro.audit.contracts import (
@@ -21,9 +25,37 @@ from maestro.audit.contracts import (
     ExecutionStartedV1,
     InvestigationCompletedV1,
 )
-from maestro.audit.port import AuditPort
+from maestro.audit.port import AuditPort, AuditWriteError, AuditWriteFailureKind
 from maestro.audit.sanitization import sanitize_audit_text
+from maestro.errors import AuditPersistenceError, AuditUnavailableError, MaestroError
 from maestro.repository.guard import AuthorizedRepository, RepositoryFingerprint
+
+_LOGGER = logging.getLogger("maestro.audit")
+
+type _PersistenceOperation = Callable[[], Awaitable[None]]
+type _Sleep = Callable[[float], Awaitable[None]]
+
+
+@dataclass(frozen=True, slots=True)
+class _AuditRetryPolicy:
+    max_attempts: int
+    total_budget_seconds: float
+    backoffs_seconds: tuple[float, ...]
+
+
+_AUDIT_RETRY_POLICY = _AuditRetryPolicy(
+    max_attempts=3,
+    total_budget_seconds=5.0,
+    backoffs_seconds=(0.1, 0.25),
+)
+
+
+@dataclass(frozen=True, slots=True)
+class AuditRetryTiming:
+    """Injectable monotonic time and sleep behavior for deterministic retry tests."""
+
+    monotonic_clock: Callable[[], float] = time.monotonic
+    sleep: _Sleep = asyncio.sleep
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,11 +117,13 @@ class AuditRecorder:
         *,
         id_factory: Callable[[], UUID] = uuid4,
         clock: Callable[[], datetime] | None = None,
+        retry_timing: AuditRetryTiming | None = None,
     ) -> None:
         self._port = port
         self._metadata = metadata
         self._id_factory = id_factory
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._retry_timing = retry_timing or AuditRetryTiming()
 
     async def start_resolve_codebase_fact(
         self,
@@ -121,7 +155,8 @@ class AuditRecorder:
                 **self._metadata_fields(),
             ),
         )
-        await self._port.start_execution(AuditExecutionStartV1(execution=execution, event=event))
+        record = AuditExecutionStartV1(execution=execution, event=event)
+        await self._persist("start", lambda: self._port.start_execution(record))
         return handle
 
     async def record_investigation_completed(
@@ -149,7 +184,85 @@ class AuditRecorder:
             occurred_at=self._clock(),
             payload=payload,
         )
-        await self._port.complete_investigation(AuditInvestigationCompletionV1(event=event))
+        record = AuditInvestigationCompletionV1(event=event)
+        await self._persist("completion", lambda: self._port.complete_investigation(record))
+
+    async def _persist(self, operation_name: str, operation: _PersistenceOperation) -> None:
+        policy = _AUDIT_RETRY_POLICY
+        started = self._retry_timing.monotonic_clock()
+        attempts = 0
+        for attempt in range(1, policy.max_attempts + 1):
+            remaining = self._remaining_budget(started)
+            if remaining <= 0:
+                self._raise_public(AuditUnavailableError(), operation_name, attempts)
+            attempts = attempt
+            failure = await self._attempt(operation, remaining)
+            if failure is None:
+                return
+            if failure is not AuditWriteFailureKind.RETRYABLE_NOT_COMMITTED:
+                self._raise_public(AuditPersistenceError(), operation_name, attempts)
+            if attempt == policy.max_attempts:
+                self._raise_public(AuditUnavailableError(), operation_name, attempts)
+            backoff = policy.backoffs_seconds[attempt - 1]
+            remaining = self._remaining_budget(started)
+            if backoff >= remaining:
+                self._raise_public(AuditUnavailableError(), operation_name, attempts)
+            await self._backoff(backoff, remaining, operation_name, attempts)
+
+    @staticmethod
+    async def _attempt(
+        operation: _PersistenceOperation,
+        remaining: float,
+    ) -> AuditWriteFailureKind | None:
+        try:
+            async with asyncio.timeout(remaining):
+                await operation()
+        except AuditWriteError as exc:
+            return exc.kind
+        except TimeoutError:
+            return AuditWriteFailureKind.AMBIGUOUS
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return AuditWriteFailureKind.PERMANENT
+        return None
+
+    async def _backoff(
+        self,
+        backoff: float,
+        remaining: float,
+        operation_name: str,
+        attempts: int,
+    ) -> None:
+        try:
+            async with asyncio.timeout(remaining):
+                await self._retry_timing.sleep(backoff)
+        except TimeoutError:
+            self._raise_public(AuditUnavailableError(), operation_name, attempts)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._raise_public(AuditPersistenceError(), operation_name, attempts)
+
+    def _remaining_budget(self, started: float) -> float:
+        return _AUDIT_RETRY_POLICY.total_budget_seconds - (
+            self._retry_timing.monotonic_clock() - started
+        )
+
+    @staticmethod
+    def _raise_public(error: MaestroError, operation_name: str, attempts: int) -> NoReturn:
+        _LOGGER.warning(
+            "audit persistence failed",
+            extra={
+                "metadata": {
+                    "error_code": error.code.value,
+                    "audit_operation": operation_name,
+                    "attempts": attempts,
+                    "retry_count": max(0, attempts - 1),
+                }
+            },
+        )
+        raise error from None
 
     def _metadata_fields(self) -> dict[str, str]:
         return {
