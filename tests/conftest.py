@@ -8,6 +8,15 @@ import pytest
 
 from maestro.config import Settings
 
+_TEST_AUDIT_DATABASE_URL = "postgresql://audit-writer@localhost/maestro"
+
+
+@pytest.fixture(autouse=True)
+def configured_test_audit_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Supply non-secret typed Audit configuration to deterministic tests."""
+
+    monkeypatch.setenv("MAESTRO_AUDIT_DATABASE_URL", _TEST_AUDIT_DATABASE_URL)
+
 
 @pytest.fixture
 def repository(tmp_path: Path) -> Path:
@@ -25,6 +34,7 @@ def settings_factory() -> Callable[..., Settings]:
     def factory(**overrides: object) -> Settings:
         values: dict[str, object] = {
             "allowed_roots": (Path.cwd(),),
+            "audit_database_url": _TEST_AUDIT_DATABASE_URL,
             "max_file_bytes": 1_024,
             "max_repository_bytes": 1_048_576,
         }

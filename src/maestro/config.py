@@ -46,6 +46,7 @@ class Settings(BaseSettings):
     codex_model: str = "gpt-5.4"
     codex_auth_file: Path | None = None
     codex_api_key: SecretStr | None = None
+    audit_database_url: Annotated[SecretStr, Field(min_length=1, max_length=4_096)] = Field()
 
     @field_validator("allowed_roots", mode="before")
     @classmethod

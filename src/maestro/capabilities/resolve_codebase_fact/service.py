@@ -11,6 +11,7 @@ from collections.abc import Iterable
 
 from maestro import __version__
 from maestro.agents.runtime import AgentRuntime, InvestigationRequest
+from maestro.audit import AuditRecorder
 from maestro.capabilities.resolve_codebase_fact.contracts import (
     Evidence,
     ResolveCodebaseFactRequest,
@@ -47,11 +48,13 @@ class ResolveCodebaseFactService:
         self,
         settings: Settings,
         runtime: AgentRuntime,
+        audit: AuditRecorder,
         repository_guard: RepositoryGuard | None = None,
         admission: AdmissionController | None = None,
     ) -> None:
         self._settings = settings
         self._runtime = runtime
+        self._audit = audit
         self._repository = repository_guard or RepositoryGuard(settings)
         self._admission = admission or AdmissionController(
             settings.max_concurrency, settings.max_queue_size
@@ -73,10 +76,23 @@ class ResolveCodebaseFactService:
             async with self._admission.slot():
                 queue_duration_ms = round((time.monotonic() - queued_at) * 1_000, 2)
                 async with asyncio.timeout(self._settings.verifier_timeout_seconds):
-                    result, fingerprint = await self._investigate(repository, request)
+                    fingerprint = await self._repository.fingerprint(repository)
+                    objective = neutralize_question(request.question)
+                    audit_handle = await self._audit.start_resolve_codebase_fact(
+                        repository,
+                        fingerprint,
+                        objective,
+                    )
+                    request_id = audit_handle.execution_id.hex
+                    result = await self._investigate(repository, request, fingerprint, objective)
                     await self._validate_result(repository, fingerprint, result)
                     result = sanitize_result(result, repository.root)
                     self._validate_result_size(result)
+                    await self._audit.record_investigation_completed(
+                        audit_handle,
+                        repository,
+                        result,
+                    )
         except TimeoutError as exc:
             error = AgentTimeoutError()
             self._log_failure(
@@ -138,24 +154,22 @@ class ResolveCodebaseFactService:
         self,
         repository: AuthorizedRepository,
         request: ResolveCodebaseFactRequest,
-    ) -> tuple[VerificationResult, RepositoryFingerprint]:
-        fingerprint = await self._repository.fingerprint(repository)
+        fingerprint: RepositoryFingerprint,
+        objective: str,
+    ) -> VerificationResult:
         if requires_human_decision(request.question):
-            return (
-                human_decision_result(
-                    "The question asks what should be decided, not what is currently true."
-                ),
-                fingerprint,
+            return human_decision_result(
+                "The question asks what should be decided, not what is currently true."
             )
         investigation = InvestigationRequest(
             repository_root=repository.root,
-            question=neutralize_question(request.question),
+            question=objective,
             context=request.context,
             repository_fingerprint=fingerprint.digest,
             model=self._settings.codex_model,
             max_output_bytes=self._settings.max_agent_output_bytes,
         )
-        return await self._runtime.investigate(investigation), fingerprint
+        return await self._runtime.investigate(investigation)
 
     async def _validate_result(
         self,

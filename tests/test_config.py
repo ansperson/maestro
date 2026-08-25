@@ -30,14 +30,18 @@ def test_settings_parse_and_canonicalize_allowed_roots(
     ],
 )
 def test_settings_reject_invalid_values(tmp_path: Path, field: str, value: object) -> None:
-    payload: dict[str, object] = {"allowed_roots": (tmp_path,), field: value}
+    payload: dict[str, object] = {
+        "allowed_roots": (tmp_path,),
+        "audit_database_url": "postgresql://audit-writer@localhost/maestro",
+        field: value,
+    }
     with pytest.raises(ValidationError):
         Settings.model_validate(payload)
 
 
 def test_settings_reject_incoherent_file_limits(tmp_path: Path) -> None:
     with pytest.raises(ValidationError, match="cannot exceed"):
-        Settings(
+        Settings(  # pyright: ignore[reportCallIssue] - Audit URL comes from BaseSettings
             allowed_roots=(tmp_path,),
             max_file_bytes=2_048,
             max_repository_bytes=1_024,
@@ -46,13 +50,17 @@ def test_settings_reject_incoherent_file_limits(tmp_path: Path) -> None:
 
 def test_settings_reject_missing_root_and_auth_symlink(tmp_path: Path) -> None:
     with pytest.raises(ValidationError, match="does not exist"):
-        Settings(allowed_roots=(tmp_path / "missing",))
+        Settings(  # pyright: ignore[reportCallIssue] - Audit URL comes from BaseSettings
+            allowed_roots=(tmp_path / "missing",)
+        )
     auth = tmp_path / "auth.json"
     auth.write_text("{}", encoding="utf-8")
     link = tmp_path / "auth-link.json"
     link.symlink_to(auth)
     with pytest.raises(ValidationError, match="non-symlink"):
-        Settings(allowed_roots=(tmp_path,), codex_auth_file=link)
+        Settings(  # pyright: ignore[reportCallIssue] - Audit URL comes from BaseSettings
+            allowed_roots=(tmp_path,), codex_auth_file=link
+        )
 
 
 def test_settings_reject_two_auth_sources(tmp_path: Path) -> None:
@@ -64,6 +72,7 @@ def test_settings_reject_two_auth_sources(tmp_path: Path) -> None:
                 "allowed_roots": (tmp_path,),
                 "codex_auth_file": auth,
                 "codex_api_key": "secret",
+                "audit_database_url": "postgresql://audit-writer@localhost/maestro",
             }
         )
 
@@ -75,11 +84,30 @@ def test_settings_reject_empty_roots_and_non_file_auth(
     with pytest.raises(ValidationError, match="at least one"):
         Settings()  # pyright: ignore[reportCallIssue]
     with pytest.raises(ValidationError, match="at least one"):
-        Settings.model_validate({"allowed_roots": ()})
+        Settings.model_validate(
+            {
+                "allowed_roots": (),
+                "audit_database_url": "postgresql://audit-writer@localhost/maestro",
+            }
+        )
     with pytest.raises(ValidationError, match="regular"):
-        Settings(allowed_roots=(tmp_path,), codex_auth_file=tmp_path)
+        Settings(  # pyright: ignore[reportCallIssue] - Audit URL comes from BaseSettings
+            allowed_roots=(tmp_path,), codex_auth_file=tmp_path
+        )
 
 
 def test_settings_deduplicates_roots(tmp_path: Path) -> None:
-    settings = Settings(allowed_roots=(tmp_path, tmp_path))
+    settings = Settings(  # pyright: ignore[reportCallIssue] - Audit URL comes from BaseSettings
+        allowed_roots=(tmp_path, tmp_path)
+    )
     assert settings.allowed_roots == (tmp_path,)
+
+
+def test_settings_requires_audit_database_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("MAESTRO_AUDIT_DATABASE_URL")
+    with pytest.raises(ValidationError, match="audit_database_url"):
+        Settings(  # pyright: ignore[reportCallIssue] - intentionally missing Audit URL
+            allowed_roots=(tmp_path,)
+        )

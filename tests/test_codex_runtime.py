@@ -61,7 +61,7 @@ async def test_runtime_uses_minimal_environment_and_cleans_temporary_state(
     assert result.status is VerificationStatus.RESOLVED
     assert report["unrelated_secret_inherited"] is False
     assert report["api_key_present"] is False
-    assert report["auth_present"] is False
+    assert report["auth_present"] is report["audit_database_url_present"] is False
     assert report["depth"] == "1"
     assert not _path_exists(Path(cast(str, report["temporary_root"])))
 
