@@ -67,24 +67,28 @@ def _result(status: VerificationStatus) -> VerificationResult:
 def _sensitive_result() -> VerificationResult:
     return VerificationResult(
         status=VerificationStatus.RESOLVED,
-        answer="Found postgresql://reader:fixture-password@db/maestro.",  # pragma: allowlist secret
+        answer=(
+            "Endpoint /api/v1/items uses postgresql://reader:" + "fixture-password@db/maestro."
+        ),
         confidence=Confidence.HIGH,
         evidence=[
             Evidence(
                 path="src/models.py",
                 line_start=1,
                 symbol=r"C:\Users\alice\secrets.txt",
-                finding="See (/Users/alice/.aws/credentials).",
+                finding=r"Regex \\d+; see (/Users/alice/.aws/credentials).",
             )
         ],
         conflicts=[
             Conflict(
-                description=r"Compare \\server\share\private\settings.toml.",
+                description=(
+                    r"Symbol Order.payment_ids; compare \\server\share\private\settings.toml."
+                ),
                 evidence=[
                     Evidence(
                         path="migrations/001_payments.sql",
                         symbol="postgresql://reader:" + "other-password@db/maestro",
-                        finding="Compare /opt/company/private/settings.toml.",
+                        finding="Domain example.com; compare /opt/company/private/settings.toml.",
                     )
                 ],
             )
@@ -297,6 +301,14 @@ async def test_repository_stability_and_sanitization_precede_completion(
         r"\\\\server\\share",
     ):
         assert forbidden not in encoded
+    for preserved in (
+        "/api/v1/items",
+        r"\\\\d+",
+        "Order.payment_ids",
+        "example.com",
+        "postgresql://*@db/maestro",
+    ):
+        assert preserved in encoded
     assert str(repository) not in encoded
 
 
@@ -304,10 +316,13 @@ async def test_repository_stability_and_sanitization_precede_completion(
 async def test_maximum_normalization_expansion_fits_audited_execution(
     repository: Path, settings_factory: SettingsFactory
 ) -> None:
-    question = "confirm " + "x" * (4_000 - len("confirm "))
+    private_root = "/" + "tmp"
+    claim = f"{private_root} " * 798 + "/t"
+    question = "confirm " + claim
     objective = neutralize_question(question)
     assert len(question) == 4_000
-    assert len(objective) == MAX_AUDIT_OBJECTIVE_CHARS
+    assert objective == f"Verify {claim}"
+    assert len(objective) < MAX_AUDIT_OBJECTIVE_CHARS
     port = FakeAuditPort()
     runtime = FakeAgentRuntime(lambda _request: _result(VerificationStatus.RESOLVED))
     service = ResolveCodebaseFactService(
@@ -323,7 +338,31 @@ async def test_maximum_normalization_expansion_fits_audited_execution(
     assert len(port.starts) == 1
     start_payload = port.starts[0].event.payload
     assert isinstance(start_payload, ExecutionStartedV1)
-    assert start_payload.objective == objective
+    assert len(start_payload.objective) <= MAX_AUDIT_OBJECTIVE_CHARS
+    assert private_root not in start_payload.objective
+    assert len(port.completions) == 1
+
+
+@pytest.mark.asyncio
+async def test_exact_maximum_objective_fits_audited_execution(
+    repository: Path, settings_factory: SettingsFactory
+) -> None:
+    question = "x" * MAX_AUDIT_OBJECTIVE_CHARS
+    port = FakeAuditPort()
+    runtime = FakeAgentRuntime(lambda _request: _result(VerificationStatus.RESOLVED))
+    service = ResolveCodebaseFactService(
+        settings_factory(allowed_roots=(repository,)),
+        runtime,
+        fake_audit_recorder(port),
+    )
+
+    result = await service.execute(_request(repository, question))
+
+    assert result.status is VerificationStatus.RESOLVED
+    assert runtime.requests[0].question == question
+    start_payload = port.starts[0].event.payload
+    assert isinstance(start_payload, ExecutionStartedV1)
+    assert start_payload.objective == question
     assert len(port.completions) == 1
 
 

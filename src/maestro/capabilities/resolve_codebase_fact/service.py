@@ -12,6 +12,9 @@ from collections.abc import Iterable
 from maestro import __version__
 from maestro.agents.runtime import AgentRuntime, InvestigationRequest
 from maestro.audit import AuditRecorder
+from maestro.capabilities.resolve_codebase_fact.audit_mapping import (
+    map_result_to_audit_completion,
+)
 from maestro.capabilities.resolve_codebase_fact.contracts import (
     Evidence,
     ResolveCodebaseFactRequest,
@@ -91,7 +94,7 @@ class ResolveCodebaseFactService:
                     await self._audit.record_investigation_completed(
                         audit_handle,
                         repository,
-                        result,
+                        map_result_to_audit_completion(result),
                     )
         except TimeoutError as exc:
             error = AgentTimeoutError()

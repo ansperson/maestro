@@ -5,8 +5,11 @@ from __future__ import annotations
 import json
 import re
 
+from maestro.capabilities.resolve_codebase_fact.contracts import MAX_QUESTION_CHARS
+
 POLICY_VERSION = "repository-verifier/v1"
 _NEUTRALIZED_PREFIX = "Determine whether "
+_BOUNDED_NEUTRALIZED_PREFIX = "Verify "
 
 _DECISION_PATTERNS = (
     re.compile(r"^\s*should\b", re.IGNORECASE),
@@ -39,11 +42,18 @@ def neutralize_question(question: str) -> str:
             match.group("claim"),
             flags=re.IGNORECASE,
         ).strip(" .!?")
-        return f"{_NEUTRALIZED_PREFIX}{claim}."
+        return _neutralized_claim(claim)
     if _CONFIRM.match(question):
         claim = _CONFIRM.sub("", question).strip(" .!?")
-        return f"{_NEUTRALIZED_PREFIX}{claim}."
+        return _neutralized_claim(claim)
     return question.strip()
+
+
+def _neutralized_claim(claim: str) -> str:
+    objective = f"{_NEUTRALIZED_PREFIX}{claim}."
+    if len(objective) <= MAX_QUESTION_CHARS:
+        return objective
+    return f"{_BOUNDED_NEUTRALIZED_PREFIX}{claim}"
 
 
 def build_verifier_prompt(question: str, context: str | None) -> str:

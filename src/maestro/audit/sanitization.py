@@ -15,29 +15,64 @@ _SECRET_PATTERNS = (
     ),
 )
 _CREDENTIAL_URI_USERINFO = re.compile(r"(?P<scheme>[A-Za-z][A-Za-z0-9+.-]{0,31}://)[^/@\s]+@")
-_ABSOLUTE_POSIX_PATH = re.compile(r"(?<![A-Za-z0-9._~/-])/(?!/)[^\s\x00-\x1f<>\"']+")
-_ABSOLUTE_WINDOWS_PATH = re.compile(r"(?<![A-Za-z0-9])(?:[A-Za-z]:[\\/]|\\\\)[^\s\x00-\x1f<>\"']+")
+_PATH_CHARACTER = r"[^\s\x00-\x1f<>\"'()\[\]{},;!?]"
+_PATH_SEGMENT_CHARACTER = r"[^\\/\s\x00-\x1f<>\"'()\[\]{},;!?]"
+_PRIVATE_POSIX_PATH = re.compile(
+    rf"(?<![A-Za-z0-9._~-])/(?:Users|home|private|tmp|var|opt|srv|etc|root)"
+    rf"(?![A-Za-z0-9._~-])(?:/{_PATH_CHARACTER}*)?"
+)
+_DRIVE_ABSOLUTE_PATH = re.compile(rf"(?<![A-Za-z0-9])(?:[A-Za-z]:[\\/]){_PATH_CHARACTER}*")
+_BACKSLASH_UNC_PATH = re.compile(
+    rf"(?<![\\A-Za-z0-9])\\\\{_PATH_SEGMENT_CHARACTER}+[\\/]"
+    rf"{_PATH_SEGMENT_CHARACTER}+(?:[\\/]{_PATH_SEGMENT_CHARACTER}+)*"
+)
+_FORWARD_SLASH_UNC_PATH = re.compile(
+    rf"(?<![:/A-Za-z0-9])//{_PATH_SEGMENT_CHARACTER}+/{_PATH_SEGMENT_CHARACTER}+"
+    rf"(?:/{_PATH_SEGMENT_CHARACTER}+)*"
+)
 _DISALLOWED_CONTROLS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
 def sanitize_audit_text(value: str, repository_root: Path) -> str:
     """Remove secrets, private absolute paths, and unsafe control characters."""
 
-    sanitized = value.replace(str(repository_root), "<repository>")
+    sanitized = _redact_repository_root(value, repository_root)
     sanitized = _CREDENTIAL_URI_USERINFO.sub(_replace_uri_userinfo, sanitized)
     for pattern in _SECRET_PATTERNS:
         sanitized = pattern.sub(_replace_secret, sanitized)
-    sanitized = _ABSOLUTE_WINDOWS_PATH.sub("<absolute-path>", sanitized)
-    sanitized = _ABSOLUTE_POSIX_PATH.sub("<absolute-path>", sanitized)
+    for pattern in (
+        _DRIVE_ABSOLUTE_PATH,
+        _BACKSLASH_UNC_PATH,
+        _FORWARD_SLASH_UNC_PATH,
+        _PRIVATE_POSIX_PATH,
+    ):
+        sanitized = pattern.sub(_replace_path, sanitized)
     sanitized = _DISALLOWED_CONTROLS.sub(" ", sanitized)
-    return sanitized.strip() or "[REDACTED]"
+    stripped = sanitized.strip()
+    return stripped or _bounded_token(value, "[REDACTED]")
 
 
 def _replace_secret(match: re.Match[str]) -> str:
     if match.lastindex:
-        return f"{match.group(1)}=[REDACTED]"
-    return "[REDACTED]"
+        return _bounded_token(match.group(0), f"{match.group(1)}=*")
+    return _bounded_token(match.group(0), "[REDACTED]")
 
 
 def _replace_uri_userinfo(match: re.Match[str]) -> str:
-    return f"{match.group('scheme')}[REDACTED]@"
+    return _bounded_token(match.group(0), f"{match.group('scheme')}*@")
+
+
+def _replace_path(match: re.Match[str]) -> str:
+    return _bounded_token(match.group(0), "<path>")
+
+
+def _redact_repository_root(value: str, repository_root: Path) -> str:
+    root = str(repository_root)
+    pattern = re.compile(rf"(?<![A-Za-z0-9._~-]){re.escape(root)}(?![A-Za-z0-9._~-])")
+    return pattern.sub(lambda match: _bounded_token(match.group(0), "<repository>"), value)
+
+
+def _bounded_token(matched: str, preferred: str) -> str:
+    """Return a visible replacement that never exceeds the matched text."""
+
+    return preferred if len(preferred) <= len(matched) else "*"

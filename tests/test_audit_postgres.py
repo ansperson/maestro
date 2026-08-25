@@ -12,21 +12,22 @@ from psycopg.conninfo import make_conninfo
 from pydantic import SecretStr
 
 from maestro.audit.contracts import (
+    AuditConfidence,
     AuditEventType,
     AuditEventV1,
     AuditExecutionStartV1,
     AuditExecutionV1,
     AuditInvestigationCompletionV1,
+    AuditResultStatus,
 )
 from maestro.audit.postgres import PostgresAuditPort
 from maestro.audit.postgres.migrations import packaged_migrations
-from maestro.audit.recorder import AuditRecorder, AuditRuntimeMetadata
-from maestro.audit.testing import FakeAuditPort
-from maestro.capabilities.resolve_codebase_fact.contracts import (
-    Confidence,
-    VerificationResult,
-    VerificationStatus,
+from maestro.audit.recorder import (
+    AuditInvestigationCompletionInput,
+    AuditRecorder,
+    AuditRuntimeMetadata,
 )
+from maestro.audit.testing import FakeAuditPort
 from maestro.repository.guard import AuthorizedRepository, RepositoryFingerprint
 
 _TEST_DSN_ENV = "MAESTRO_TEST_POSTGRES_DSN"
@@ -76,13 +77,13 @@ async def _records() -> tuple[
     await recorder.record_investigation_completed(
         handle,
         repository,
-        VerificationResult(
-            status=VerificationStatus.UNCERTAIN,
+        AuditInvestigationCompletionInput(
+            status=AuditResultStatus.UNCERTAIN,
             answer=None,
-            confidence=Confidence.LOW,
-            evidence=[],
-            conflicts=[],
-            reason="The repository does not establish this fact.",
+            confidence=AuditConfidence.LOW,
+            evidence=(),
+            conflicts=(),
+            rationale="The repository does not establish this fact.",
         ),
     )
     return fake.starts[0], fake.completions[0], repository

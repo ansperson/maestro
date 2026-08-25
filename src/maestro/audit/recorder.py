@@ -23,11 +23,6 @@ from maestro.audit.contracts import (
 )
 from maestro.audit.port import AuditPort
 from maestro.audit.sanitization import sanitize_audit_text
-from maestro.capabilities.resolve_codebase_fact.contracts import (
-    Conflict,
-    Evidence,
-    VerificationResult,
-)
 from maestro.repository.guard import AuthorizedRepository, RepositoryFingerprint
 
 
@@ -38,6 +33,37 @@ class AuditRuntimeMetadata:
     runtime_version: str
     model: str
     prompt_policy_version: str
+
+
+@dataclass(frozen=True, slots=True)
+class AuditEvidenceInput:
+    """Validated repository evidence supplied to the Audit boundary."""
+
+    path: str
+    line_start: int | None
+    line_end: int | None
+    symbol: str | None
+    finding: str
+
+
+@dataclass(frozen=True, slots=True)
+class AuditConflictInput:
+    """Validated semantic conflict supplied to the Audit boundary."""
+
+    description: str
+    evidence: tuple[AuditEvidenceInput, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class AuditInvestigationCompletionInput:
+    """Capability-neutral semantic input for a successful Audit completion."""
+
+    status: AuditResultStatus
+    answer: str | None
+    confidence: AuditConfidence
+    rationale: str
+    evidence: tuple[AuditEvidenceInput, ...]
+    conflicts: tuple[AuditConflictInput, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,15 +128,15 @@ class AuditRecorder:
         self,
         handle: AuditExecutionHandle,
         repository: AuthorizedRepository,
-        result: VerificationResult,
+        result: AuditInvestigationCompletionInput,
     ) -> None:
         """Persist one accepted semantic result as the sequence-two completion."""
 
         payload = InvestigationCompletedV1(
-            status=AuditResultStatus(result.status.value),
+            status=result.status,
             answer=self._sanitize_optional(result.answer, repository.root),
-            confidence=AuditConfidence(result.confidence.value),
-            rationale=sanitize_audit_text(result.reason, repository.root),
+            confidence=result.confidence,
+            rationale=sanitize_audit_text(result.rationale, repository.root),
             evidence=tuple(self._evidence(item, repository.root) for item in result.evidence),
             conflicts=tuple(self._conflict(item, repository.root) for item in result.conflicts),
             **self._metadata_fields(),
@@ -139,7 +165,7 @@ class AuditRecorder:
         return sanitize_audit_text(value, repository_root) if value is not None else None
 
     @staticmethod
-    def _evidence(value: Evidence, repository_root: Path) -> AuditEvidenceV1:
+    def _evidence(value: AuditEvidenceInput, repository_root: Path) -> AuditEvidenceV1:
         return AuditEvidenceV1(
             path=value.path,
             line_start=value.line_start,
@@ -153,7 +179,7 @@ class AuditRecorder:
         )
 
     @classmethod
-    def _conflict(cls, value: Conflict, repository_root: Path) -> AuditConflictV1:
+    def _conflict(cls, value: AuditConflictInput, repository_root: Path) -> AuditConflictV1:
         return AuditConflictV1(
             description=sanitize_audit_text(value.description, repository_root),
             evidence=tuple(cls._evidence(item, repository_root) for item in value.evidence),
