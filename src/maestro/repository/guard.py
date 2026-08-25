@@ -5,48 +5,37 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
-import stat
+import sys
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+
+from pydantic import ValidationError
 
 from maestro.capabilities.resolve_codebase_fact.contracts import Evidence
 from maestro.config import Settings
 from maestro.errors import (
     EvidenceValidationError,
     InvalidInputError,
+    RepositoryInspectionError,
     RepositoryNotAllowedError,
     RepositoryNotFoundError,
 )
-
-_SKIPPED_DIRECTORIES = frozenset(
-    {
-        ".git",
-        ".hg",
-        ".mypy_cache",
-        ".pytest_cache",
-        ".ruff_cache",
-        ".tox",
-        ".venv",
-        "__pycache__",
-        "build",
-        "coverage",
-        "dist",
-        "node_modules",
-        "target",
-        "vendor",
-    }
+from maestro.repository.fingerprint_protocol import (
+    FINGERPRINT_PROTOCOL_VERSION,
+    MAX_CANONICAL_PATH_RESULT_BYTES,
+    MAX_FINGERPRINT_RESULT_BYTES,
+    CanonicalPathRequestV1,
+    CanonicalPathResultV1,
+    FingerprintScanRequestV1,
+    FingerprintScanResultV1,
+    validate_canonical_path_result,
+    validate_fingerprint_result,
 )
+from maestro.repository.fingerprint_scan import FileState, file_state
+from maestro.repository.subprocess import ProcessOutputLimitError, run_owned_process
 
-
-@dataclass(frozen=True, slots=True)
-class FileState:
-    """Bounded immutable state for one discovered repository path."""
-
-    token: str
-    content_digest: str | None
-    line_count: int | None
-    size: int
+_GIT_OUTPUT_LIMIT_BYTES = 16_777_216
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,7 +94,7 @@ class RepositoryGuard:
     async def fingerprint(self, repository: AuthorizedRepository) -> RepositoryFingerprint:
         """Capture Git identity plus a bounded content-aware working-tree snapshot."""
 
-        files, truncated = await asyncio.to_thread(self._scan_files, repository.root)
+        files, truncated = await self._scan_files(repository.root)
         git_top_level, head, dirty = await _git_state(repository.root)
         top_level_id = _private_path_id(git_top_level) if git_top_level is not None else None
         digest = hashlib.sha256()
@@ -149,46 +138,42 @@ class RepositoryGuard:
                 evidence,
             )
 
-    def _scan_files(self, root: Path) -> tuple[dict[str, FileState], bool]:
-        files: dict[str, FileState] = {}
-        aggregate_bytes = 0
-        truncated = False
-        pending = [root]
-        while pending:
-            directory = pending.pop()
-            try:
-                entries = sorted(os.scandir(directory), key=lambda item: item.name, reverse=True)
-            except OSError:
-                continue
-            for entry in entries:
-                path = Path(entry.path)
-                relative = path.relative_to(root).as_posix()
-                try:
-                    if entry.is_symlink():
-                        files[relative] = _symlink_state(path, root)
-                    elif entry.is_dir(follow_symlinks=False):
-                        if entry.name not in _SKIPPED_DIRECTORIES:
-                            pending.append(path)
-                        continue
-                    elif entry.is_file(follow_symlinks=False):
-                        state, consumed = _file_state(
-                            path,
-                            max_file_bytes=self._settings.max_file_bytes,
-                            remaining_bytes=self._settings.max_repository_bytes - aggregate_bytes,
-                        )
-                        files[relative] = state
-                        aggregate_bytes += consumed
-                    else:
-                        continue
-                except OSError:
-                    continue
-                if len(files) >= self._settings.max_repository_files:
-                    truncated = bool(pending) or len(entries) > 1
-                    return files, truncated
-                if aggregate_bytes >= self._settings.max_repository_bytes:
-                    truncated = True
-                    return files, truncated
-        return files, truncated
+    async def _scan_files(self, root: Path) -> tuple[dict[str, FileState], bool]:
+        try:
+            request = FingerprintScanRequestV1(
+                protocol_version=FINGERPRINT_PROTOCOL_VERSION,
+                root=str(root),
+                max_repository_files=self._settings.max_repository_files,
+                max_repository_bytes=self._settings.max_repository_bytes,
+                max_file_bytes=self._settings.max_file_bytes,
+            )
+            completed = await run_owned_process(
+                _fingerprint_worker_command(),
+                cwd=_trusted_worker_cwd(root),
+                environment=_fingerprint_environment(),
+                input_data=request.model_dump_json().encode("utf-8"),
+                max_stdout_bytes=MAX_FINGERPRINT_RESULT_BYTES,
+            )
+            if completed.returncode != 0:
+                raise RepositoryInspectionError
+            result = FingerprintScanResultV1.model_validate_json(
+                completed.stdout,
+                strict=True,
+            )
+            validate_fingerprint_result(result, request)
+        except (OSError, ProcessOutputLimitError, ValidationError, ValueError):
+            raise RepositoryInspectionError from None
+
+        files = {
+            item.relative_path: FileState(
+                token=item.token,
+                content_digest=item.content_digest,
+                line_count=item.line_count,
+                size=item.size,
+            )
+            for item in result.files
+        }
+        return files, result.truncated
 
     def _validate_one_evidence(
         self,
@@ -209,7 +194,7 @@ class RepositoryGuard:
             raise EvidenceValidationError("An evidence file no longer exists.") from exc
         if not _is_within(canonical, root) or not canonical.is_file() or candidate.is_symlink():
             raise EvidenceValidationError("An evidence path escapes or is not a regular file.")
-        current, _ = _file_state(
+        current, _ = file_state(
             canonical,
             max_file_bytes=self._settings.max_file_bytes,
             remaining_bytes=self._settings.max_file_bytes,
@@ -241,69 +226,12 @@ def _is_filesystem_anchor(path: Path) -> bool:
     return bool(path.anchor) and path == Path(path.anchor)
 
 
-def _file_state(path: Path, *, max_file_bytes: int, remaining_bytes: int) -> tuple[FileState, int]:
-    limit = min(max_file_bytes, remaining_bytes)
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    try:
-        initial = os.fstat(descriptor)
-        if not stat.S_ISREG(initial.st_mode):
-            raise OSError("path is not a regular file")
-        metadata = _file_metadata(initial)
-        if initial.st_size > limit:
-            return FileState(metadata + ":skipped-size", None, None, initial.st_size), 0
-        chunks: list[bytes] = []
-        size = 0
-        while chunk := os.read(descriptor, min(65_536, limit + 1 - size)):
-            chunks.append(chunk)
-            size += len(chunk)
-            if size > limit:
-                break
-        final = os.fstat(descriptor)
-    finally:
-        os.close(descriptor)
-    if _file_identity(initial) != _file_identity(final) or size > limit:
-        return FileState(metadata + ":skipped-changing", None, None, final.st_size), 0
-    data = b"".join(chunks)
-    content_digest = hashlib.sha256(data).hexdigest()
-    token = f"{metadata}:{content_digest}"
-    if b"\x00" in data[:8_192]:
-        return FileState(token + ":binary", None, None, final.st_size), len(data)
-    try:
-        text = data.decode("utf-8", errors="strict")
-    except UnicodeDecodeError:
-        return FileState(token + ":non-utf8", None, None, final.st_size), len(data)
-    line_count = len(text.splitlines())
-    return FileState(token, content_digest, line_count, final.st_size), len(data)
-
-
-def _file_metadata(value: os.stat_result) -> str:
-    return f"file:{value.st_mode}:{value.st_dev}:{value.st_ino}:{value.st_size}:{value.st_mtime_ns}"
-
-
-def _file_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
-    return (value.st_mode, value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns)
-
-
-def _symlink_state(path: Path, root: Path) -> FileState:
-    try:
-        target = path.resolve(strict=True)
-        target_value = target.relative_to(root).as_posix()
-        state_token = f"symlink:inside:{target_value}"
-    except (OSError, RuntimeError, ValueError):
-        state_token = "symlink:unresolved-or-outside"  # noqa: S105 - not a credential
-    return FileState(token=state_token, content_digest=None, line_count=None, size=0)
-
-
 async def _git_state(root: Path) -> tuple[Path | None, str | None, str | None]:
     top_level_output = await _run_git(root, "rev-parse", "--show-toplevel")
     if top_level_output is None:
         return None, None, None
-    try:
-        top_level = await asyncio.to_thread(
-            Path(top_level_output.decode().strip()).resolve,
-            strict=True,
-        )
-    except (OSError, UnicodeDecodeError):
+    top_level = await _canonicalize_git_top_level(root, top_level_output)
+    if top_level is None:
         return None, None, None
     head_output, status_output = await asyncio.gather(
         _run_git(root, "rev-parse", "--verify", "HEAD"),
@@ -332,29 +260,83 @@ async def _run_git(root: Path, *arguments: str) -> bytes | None:
         "PATH": os.defpath,
     }
     try:
-        process = await asyncio.create_subprocess_exec(
-            "git",
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "core.untrackedCache=false",
-            "-c",
-            "core.pager=cat",
-            "-c",
-            "pager.status=false",
-            *arguments,
+        completed = await run_owned_process(
+            (
+                *_git_command(),
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.untrackedCache=false",
+                "-c",
+                "core.pager=cat",
+                "-c",
+                "pager.status=false",
+                *arguments,
+            ),
             cwd=root,
-            env=environment,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
+            environment=environment,
+            input_data=b"",
+            max_stdout_bytes=_GIT_OUTPUT_LIMIT_BYTES,
         )
-    except OSError:
+    except (OSError, ProcessOutputLimitError):
         return None
-    stdout, _ = await process.communicate()
-    return stdout if process.returncode == 0 else None
+    return completed.stdout if completed.returncode == 0 else None
+
+
+async def _canonicalize_git_top_level(root: Path, output: bytes) -> Path | None:
+    try:
+        decoded = output.decode("utf-8", errors="strict")
+        if not decoded.endswith("\n"):
+            return None
+        request = CanonicalPathRequestV1(
+            protocol_version=FINGERPRINT_PROTOCOL_VERSION,
+            path=decoded.removesuffix("\n"),
+        )
+        completed = await run_owned_process(
+            _canonical_path_worker_command(),
+            cwd=_trusted_worker_cwd(root),
+            environment=_fingerprint_environment(),
+            input_data=request.model_dump_json().encode("utf-8"),
+            max_stdout_bytes=MAX_CANONICAL_PATH_RESULT_BYTES,
+        )
+        if completed.returncode != 0:
+            return None
+        result = CanonicalPathResultV1.model_validate_json(completed.stdout, strict=True)
+        canonical = validate_canonical_path_result(result)
+    except (OSError, ProcessOutputLimitError, UnicodeDecodeError, ValidationError, ValueError):
+        return None
+    return canonical if _is_within(root, canonical) else None
+
+
+def _fingerprint_worker_command() -> tuple[str, ...]:
+    return (sys.executable, "-I", "-m", "maestro.repository.fingerprint_worker")
+
+
+def _canonical_path_worker_command() -> tuple[str, ...]:
+    return (sys.executable, "-I", "-m", "maestro.repository.canonical_path_worker")
+
+
+def _trusted_worker_cwd(root: Path) -> Path:
+    cwd = Path(root.anchor)
+    if not cwd.is_absolute() or _is_within(cwd, root):
+        raise RepositoryInspectionError
+    return cwd
+
+
+def _fingerprint_environment() -> dict[str, str]:
+    return {
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": os.defpath,
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUNBUFFERED": "1",
+    }
+
+
+def _git_command() -> tuple[str, ...]:
+    return ("git",)
 
 
 def _is_within(path: Path, root: Path) -> bool:

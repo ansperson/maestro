@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from datetime import UTC, datetime
 from pathlib import Path
+from types import TracebackType
 from typing import LiteralString, cast
 from uuid import UUID
 
@@ -11,6 +12,7 @@ from psycopg import AsyncConnection, errors, sql
 from psycopg.conninfo import make_conninfo
 from pydantic import SecretStr
 
+import maestro.audit.postgres.adapter as adapter_module
 from maestro.audit.contracts import (
     AuditConfidence,
     AuditEventType,
@@ -20,6 +22,7 @@ from maestro.audit.contracts import (
     AuditInvestigationCompletionV1,
     AuditResultStatus,
 )
+from maestro.audit.port import AuditWriteError, AuditWriteFailureKind
 from maestro.audit.postgres import PostgresAuditPort
 from maestro.audit.postgres.migrations import packaged_migrations
 from maestro.audit.recorder import (
@@ -33,6 +36,77 @@ from maestro.repository.guard import AuthorizedRepository, RepositoryFingerprint
 _TEST_DSN_ENV = "MAESTRO_TEST_POSTGRES_DSN"
 
 
+class _FakeTransaction:
+    def __init__(self, exit_error: Exception | None = None) -> None:
+        self._exit_error = exit_error
+
+    async def __aenter__(self) -> None:
+        return None
+
+    async def __aexit__(
+        self,
+        exception_type: type[BaseException] | None,
+        exception: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool:
+        del exception_type, traceback
+        if exception is None and self._exit_error is not None:
+            raise self._exit_error
+        return False
+
+
+class _FakeConnection:
+    def __init__(
+        self,
+        *,
+        transaction_exit_error: Exception | None = None,
+        close_error: Exception | None = None,
+        schema_version: int | None = 1,
+    ) -> None:
+        self._transaction_exit_error = transaction_exit_error
+        self._close_error = close_error
+        self._schema_version = schema_version
+        self.closed = False
+        self.statements: list[str] = []
+
+    def transaction(self) -> _FakeTransaction:
+        return _FakeTransaction(self._transaction_exit_error)
+
+    async def close(self) -> None:
+        self.closed = True
+        if self._close_error is not None:
+            raise self._close_error
+
+    async def execute(
+        self,
+        query: str,
+        params: tuple[object, ...] | None = None,
+    ) -> _FakeCursor:
+        del params
+        self.statements.append(query)
+        return _FakeCursor(self._schema_version)
+
+
+class _FakeCursor:
+    def __init__(self, schema_version: int | None) -> None:
+        self._schema_version = schema_version
+
+    async def fetchone(self) -> tuple[int] | None:
+        return (self._schema_version,) if self._schema_version is not None else None
+
+
+def _patch_connection(
+    monkeypatch: pytest.MonkeyPatch,
+    connection: _FakeConnection | Exception,
+) -> None:
+    async def connect(_database_url: str) -> _FakeConnection:
+        if isinstance(connection, Exception):
+            raise connection
+        return connection
+
+    monkeypatch.setattr(adapter_module.AsyncConnection, "connect", staticmethod(connect))
+
+
 def test_migration_is_an_ordered_packaged_explicit_resource() -> None:
     migrations = packaged_migrations()
     assert [(migration.version, migration.name) for migration in migrations] == [
@@ -42,6 +116,224 @@ def test_migration_is_an_ordered_packaged_explicit_resource() -> None:
     assert migrations[0].sql.rstrip().endswith("COMMIT;")
     assert "CREATE TABLE audit.executions" in migrations[0].sql
     assert "CREATE TABLE audit.events" in migrations[0].sql
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (
+            errors.OperationalError("connection unavailable"),
+            AuditWriteFailureKind.RETRYABLE_NOT_COMMITTED,
+        ),
+        (
+            errors.ConnectionFailure("connection lost"),
+            AuditWriteFailureKind.RETRYABLE_NOT_COMMITTED,
+        ),
+        (errors.AdminShutdown("shutdown"), AuditWriteFailureKind.RETRYABLE_NOT_COMMITTED),
+        (errors.TooManyConnections("exhausted"), AuditWriteFailureKind.RETRYABLE_NOT_COMMITTED),
+        (errors.InvalidPassword("private credential detail"), AuditWriteFailureKind.PERMANENT),
+        (ValueError("private malformed DSN detail"), AuditWriteFailureKind.PERMANENT),
+    ],
+)
+def test_postgres_connection_failure_classification_is_safe(
+    error: Exception, expected: AuditWriteFailureKind
+) -> None:
+    classified = adapter_module._classify_connection_failure(error)  # pyright: ignore[reportPrivateUsage]
+    assert classified.kind is expected
+    assert "private" not in str(classified)
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (TimeoutError("known pre-commit timeout"), AuditWriteFailureKind.RETRYABLE_NOT_COMMITTED),
+        (
+            errors.SerializationFailure("serialization"),
+            AuditWriteFailureKind.RETRYABLE_NOT_COMMITTED,
+        ),
+        (errors.DeadlockDetected("deadlock"), AuditWriteFailureKind.RETRYABLE_NOT_COMMITTED),
+        (errors.AdminShutdown("shutdown"), AuditWriteFailureKind.RETRYABLE_NOT_COMMITTED),
+        (errors.TooManyConnections("exhausted"), AuditWriteFailureKind.RETRYABLE_NOT_COMMITTED),
+        (errors.InvalidPassword("authentication"), AuditWriteFailureKind.PERMANENT),
+        (errors.InsufficientPrivilege("permission"), AuditWriteFailureKind.PERMANENT),
+        (errors.UndefinedTable("schema"), AuditWriteFailureKind.PERMANENT),
+        (errors.UniqueViolation("identity mismatch"), AuditWriteFailureKind.PERMANENT),
+    ],
+)
+def test_postgres_precommit_failure_classification(
+    error: Exception, expected: AuditWriteFailureKind
+) -> None:
+    classified = adapter_module._classify_precommit_failure(error)  # pyright: ignore[reportPrivateUsage]
+    assert classified.kind is expected
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (
+            errors.SerializationFailure("serialization"),
+            AuditWriteFailureKind.RETRYABLE_NOT_COMMITTED,
+        ),
+        (errors.DeadlockDetected("deadlock"), AuditWriteFailureKind.RETRYABLE_NOT_COMMITTED),
+        (errors.AdminShutdown("ambiguous shutdown"), AuditWriteFailureKind.AMBIGUOUS),
+        (errors.ConnectionFailure("ambiguous connection"), AuditWriteFailureKind.AMBIGUOUS),
+        (TimeoutError("ambiguous timeout"), AuditWriteFailureKind.AMBIGUOUS),
+        (errors.UniqueViolation("constraint"), AuditWriteFailureKind.AMBIGUOUS),
+    ],
+)
+def test_postgres_commit_failure_is_conservative(
+    error: Exception, expected: AuditWriteFailureKind
+) -> None:
+    classified = adapter_module._classify_commit_failure(error)  # pyright: ignore[reportPrivateUsage]
+    assert classified.kind is expected
+
+
+@pytest.mark.asyncio
+async def test_postgres_port_runs_both_short_transaction_shapes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = _FakeConnection()
+    _patch_connection(monkeypatch, connection)
+    start, completion, _repository = await _records()
+    port = PostgresAuditPort(SecretStr("postgresql:///synthetic"))
+
+    await port.start_execution(start)
+    await port.complete_investigation(completion)
+
+    assert len(connection.statements) == 5
+    assert sum("SELECT version" in statement for statement in connection.statements) == 2
+    assert (
+        sum("INSERT INTO audit.executions" in statement for statement in connection.statements) == 1
+    )
+    assert sum("INSERT INTO audit.events" in statement for statement in connection.statements) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schema_version", [None, 999])
+async def test_postgres_port_rejects_unsupported_schema_without_writing(
+    monkeypatch: pytest.MonkeyPatch,
+    schema_version: int | None,
+) -> None:
+    connection = _FakeConnection(schema_version=schema_version)
+    _patch_connection(monkeypatch, connection)
+    start, _completion, _repository = await _records()
+    port = PostgresAuditPort(SecretStr("postgresql:///synthetic"))
+
+    with pytest.raises(AuditWriteError) as failure:
+        await port.start_execution(start)
+
+    assert failure.value.kind is AuditWriteFailureKind.PERMANENT
+    assert len(connection.statements) == 1
+    assert "SELECT version" in connection.statements[0]
+
+
+@pytest.mark.asyncio
+async def test_transaction_runner_closes_after_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    connection = _FakeConnection()
+    _patch_connection(monkeypatch, connection)
+    calls = 0
+
+    async def operation(_connection: AsyncConnection[tuple[object, ...]]) -> None:
+        nonlocal calls
+        calls += 1
+
+    await adapter_module._run_transaction("postgresql:///synthetic", operation)  # pyright: ignore[reportPrivateUsage]
+
+    assert calls == 1
+    assert connection.closed is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (errors.OperationalError("unavailable"), AuditWriteFailureKind.RETRYABLE_NOT_COMMITTED),
+        (errors.InvalidPassword("private"), AuditWriteFailureKind.PERMANENT),
+    ],
+)
+async def test_transaction_runner_classifies_connect_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+    expected: AuditWriteFailureKind,
+) -> None:
+    _patch_connection(monkeypatch, error)
+
+    with pytest.raises(AuditWriteError) as failure:
+        await adapter_module._run_transaction(  # pyright: ignore[reportPrivateUsage]
+            "postgresql:///synthetic",
+            _successful_operation,
+        )
+
+    assert failure.value.kind is expected
+
+
+@pytest.mark.asyncio
+async def test_transaction_runner_classifies_precommit_and_closes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = _FakeConnection(close_error=RuntimeError("close detail"))
+    _patch_connection(monkeypatch, connection)
+
+    async def fail_before_commit(_connection: AsyncConnection[tuple[object, ...]]) -> None:
+        raise errors.UndefinedTable("schema detail")
+
+    with pytest.raises(AuditWriteError) as failure:
+        await adapter_module._run_transaction(  # pyright: ignore[reportPrivateUsage]
+            "postgresql:///synthetic",
+            fail_before_commit,
+        )
+
+    assert failure.value.kind is AuditWriteFailureKind.PERMANENT
+    assert connection.closed is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (
+            errors.SerializationFailure("serialization"),
+            AuditWriteFailureKind.RETRYABLE_NOT_COMMITTED,
+        ),
+        (errors.AdminShutdown("ambiguous"), AuditWriteFailureKind.AMBIGUOUS),
+    ],
+)
+async def test_transaction_runner_classifies_commit_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+    expected: AuditWriteFailureKind,
+) -> None:
+    connection = _FakeConnection(transaction_exit_error=error)
+    _patch_connection(monkeypatch, connection)
+
+    with pytest.raises(AuditWriteError) as failure:
+        await adapter_module._run_transaction(  # pyright: ignore[reportPrivateUsage]
+            "postgresql:///synthetic",
+            _successful_operation,
+        )
+
+    assert failure.value.kind is expected
+    assert connection.closed is True
+
+
+@pytest.mark.asyncio
+async def test_transaction_runner_treats_close_failure_as_ambiguous(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = _FakeConnection(close_error=RuntimeError("private close detail"))
+    _patch_connection(monkeypatch, connection)
+
+    with pytest.raises(AuditWriteError) as failure:
+        await adapter_module._run_transaction(  # pyright: ignore[reportPrivateUsage]
+            "postgresql:///synthetic",
+            _successful_operation,
+        )
+
+    assert failure.value.kind is AuditWriteFailureKind.AMBIGUOUS
+
+
+async def _successful_operation(_connection: AsyncConnection[tuple[object, ...]]) -> None:
+    return None
 
 
 async def _records() -> tuple[
@@ -125,8 +417,9 @@ async def test_postgres_atomic_start_terminal_uniqueness_and_connection_lifetime
     finally:
         await observer.close()
 
-    with pytest.raises(errors.UniqueViolation):
+    with pytest.raises(AuditWriteError) as duplicate:
         await port.complete_investigation(completion)
+    assert duplicate.value.kind is AuditWriteFailureKind.PERMANENT
 
     new_audit_id = UUID(int=10)
     rollback_event = AuditEventV1(
@@ -146,8 +439,9 @@ async def test_postgres_atomic_start_terminal_uniqueness_and_connection_lifetime
         ),
         event=rollback_event,
     )
-    with pytest.raises(errors.UniqueViolation):
+    with pytest.raises(AuditWriteError) as mismatch:
         await port.start_execution(rollback_start)
+    assert mismatch.value.kind is AuditWriteFailureKind.PERMANENT
 
     observer = await AsyncConnection.connect(raw_dsn)
     try:

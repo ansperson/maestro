@@ -3,7 +3,7 @@
 Maestro is an engineering execution platform for AI-assisted software development.
 
 > **Current implementation scope: `resolve_codebase_fact` only.** The Job, Checkpoint,
-> PR/Issue orchestration, durable persistence, external integration, remote transport, and
+> PR/Issue orchestration, external integration, remote transport, and
 > multi-agent concepts described later in this architectural README are future direction and
 > are not implemented in v1.
 
@@ -26,8 +26,9 @@ The v1 package mirrors the boundaries that already own behavior:
 ```text
 src/maestro/
 ├── mcp/                                  # stdio/MCP adapter
+├── audit/                                # contracts, recorder, PostgreSQL adapter/migrations
 ├── capabilities/resolve_codebase_fact/  # contracts, policy, sanitization, service
-├── repository/                           # authorization, fingerprint, evidence guard
+├── repository/                           # authorization, isolated fingerprint helper, evidence guard
 ├── agents/                               # runtime protocol and Codex adapter
 ├── execution/                            # admission and lifecycle control
 ├── observability/                        # structured stderr logging
@@ -49,6 +50,7 @@ cp .env.example .env  # copy values into your launcher; Maestro does not load th
 
 MAESTRO_ALLOWED_ROOTS=/absolute/repository/root \
 MAESTRO_CODEX_AUTH_FILE=/absolute/path/to/codex-auth.json \
+MAESTRO_AUDIT_DATABASE_URL=postgresql://audit-writer@localhost/maestro \
 uv run maestro
 ```
 
@@ -57,8 +59,10 @@ path separator (`:` on POSIX). Each root must be a directory below the filesyste
 the anchor itself (`/` on POSIX, or the platform equivalent) is rejected. Configure exactly
 one explicit Codex authentication source:
 `MAESTRO_CODEX_AUTH_FILE` or `MAESTRO_CODEX_API_KEY`. Neither is inherited by repository
-shell commands. stdout is reserved for newline-delimited MCP protocol messages; structured
-JSON application logs go to stderr.
+shell commands. `MAESTRO_AUDIT_DATABASE_URL` is also required. It is validated at startup;
+connectivity is checked lazily when an audited call starts, and normal startup never migrates the
+database. stdout is reserved for newline-delimited MCP protocol messages; structured JSON
+application logs go to stderr.
 
 An MCP client configuration can launch the server with `uv`:
 
@@ -68,7 +72,8 @@ An MCP client configuration can launch the server with `uv`:
   "args": ["--directory", "/absolute/path/to/maestro", "run", "maestro"],
   "env": {
     "MAESTRO_ALLOWED_ROOTS": "/absolute/repository/root",
-    "MAESTRO_CODEX_AUTH_FILE": "/absolute/path/to/codex-auth.json"
+    "MAESTRO_CODEX_AUTH_FILE": "/absolute/path/to/codex-auth.json",
+    "MAESTRO_AUDIT_DATABASE_URL": "postgresql://audit-writer@localhost/maestro"
   }
 }
 ```
@@ -143,7 +148,14 @@ questions and never includes an answer. Operational failures are typed tool erro
 `REPOSITORY_CHANGED_DURING_INVESTIGATION`, `SERVER_BUSY`, `AGENT_TIMEOUT`,
 `AGENT_CANCELLED`, `AGENT_RUNTIME_ERROR`, `INVALID_AGENT_OUTPUT`,
 `EVIDENCE_VALIDATION_ERROR`, `RECURSION_NOT_ALLOWED`, `OUTPUT_LIMIT_EXCEEDED`, and
-`INTERNAL_ERROR`.
+`AUDIT_UNAVAILABLE`, `AUDIT_PERSISTENCE_ERROR`, and `INTERNAL_ERROR`.
+
+Audit is fail-closed. Maestro attempts each start or completion write at most three times within
+one five-second budget, with fixed 100 ms and 250 ms backoffs. Only failures established as
+transient and not committed are retried. Exhausted availability failures return
+`AUDIT_UNAVAILABLE`; permanent or commit-ambiguous failures return `AUDIT_PERSISTENCE_ERROR`.
+Without a durable start, neither normative evaluation nor the AI worker runs. Without an
+established durable completion, Maestro withholds the semantic result.
 
 ### Configuration and bounds
 
@@ -219,12 +231,14 @@ the target with only the environment passed through its `-e` options:
 npx --yes @modelcontextprotocol/inspector@2.2.0 --cli \
   /absolute/path/to/maestro/.venv/bin/maestro \
   -e MAESTRO_ALLOWED_ROOTS=/absolute/repository/root -e MAESTRO_LOG_LEVEL=WARNING \
+  -e MAESTRO_AUDIT_DATABASE_URL=postgresql://audit-writer@127.0.0.1:1/maestro \
   --method tools/list --format json
 ```
 
 Use `--method tools/call --tool-name resolve_codebase_fact --tool-args-json '<json>'` for a
-call. A normative question is the credential-free smoke path. `CONTRIBUTING.md` contains the
-complete local, package, schema, and secret-baseline workflow.
+call. A normative question with the deliberately unavailable example database is the
+credential-free fail-closed smoke path and returns `AUDIT_UNAVAILABLE`. `CONTRIBUTING.md`
+contains the complete local, package, schema, and secret-baseline workflow.
 
 It coordinates AI agents, skills, engineering capabilities, external systems, and human decisions to carry engineering work from intent to a verified outcome.
 

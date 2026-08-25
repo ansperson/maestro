@@ -20,7 +20,11 @@ Maestro canonicalizes allowed roots, rejects filesystem anchors plus traversal/s
 performs bounded no-follow file discovery, isolates the Codex home and environment, disables
 inherited MCPs/skills/apps/web/subagents, selects deny-all/read-only at both SDK boundaries,
 validates structured output and evidence, sanitizes results, fingerprints the repository before
-and after investigation, bounds admission/deadlines/pipes/results, and owns worker cancellation.
+and after investigation through an isolated package-owned helper with a versioned bounded protocol,
+bounds admission/deadlines/pipes/results, owns helper/Git/worker termination and reaping after a
+child-process handle is acquired, and requires durable Audit start/completion records before AI
+work/result release. Audit connections
+are lazy and short-lived; no database connection or transaction remains open during AI work.
 Logs exclude request text, source, credentials, transcripts, model responses, and absolute
 paths. The recommended Level 2 deployment additionally encloses the unchanged application in a
 hardened Linux container with read-only repository mounts and root filesystem, ephemeral
@@ -56,11 +60,26 @@ does not persist prompts, transcripts, repository content, or model output.
 - Filesystem namespace races, a compromised Python/Codex/MCP dependency, kernel compromise,
   process inspection by the same user, and failed best-effort temporary cleanup remain outside
   the application boundary.
+- The fingerprint helper receives only a canonical root and numeric limits over stdin, runs with
+  isolated Python module discovery from a trusted directory outside the authorized repository,
+  closed inherited descriptors, and a minimal environment, and never intentionally opens a network
+  connection. It is not an OS network sandbox; a compromised interpreter or imported dependency
+  remains covered by the broader process-compromise risk.
+- Python's supported asynchronous subprocess API does not expose a child handle until process
+  creation finishes. Maestro awaits that trusted operation directly and uses the runtime's normal
+  cancellation behavior before handle acquisition; therefore it cannot claim an independent hard
+  application deadline or application-owned reaping during that narrow pre-handle interval. Once a
+  handle exists, cancellation and deadlines terminate, bounded-wait, kill if needed, and reap the
+  helper or Git process before returning.
 - Secret scanning and output redaction are heuristic. Audit redaction detects configured roots,
   selected private/drive/UNC paths, credential-bearing URI user information, common secret forms,
   and unsafe controls by collecting spans from the original input and applying bounded replacements
   once. Unrecognized path syntax, secret formats, encodings, or deliberate obfuscation may survive;
   neither control proves that a secret cannot be selected or encoded by the model.
+- Audit retries are limited to failures known not committed. An unverifiable or ambiguous write
+  returns `AUDIT_PERSISTENCE_ERROR` and may leave a start-only or complete-but-unacknowledged
+  trail; duplicate verification and recovery remain outside this release boundary. Adapter
+  details, SQL, SQLSTATE, hosts, users, and credentials are excluded from public errors and logs.
 - The Level 2 container permits provider networking and cannot technically distinguish it from
   arbitrary egress by a compromised process. Every configured allowed root is readable by the
   shared container. Higher assurance requires controlled egress and/or per-worker containers.

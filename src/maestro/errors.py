@@ -21,6 +21,8 @@ class ErrorCode(StrEnum):
     EVIDENCE_VALIDATION_ERROR = "EVIDENCE_VALIDATION_ERROR"
     RECURSION_NOT_ALLOWED = "RECURSION_NOT_ALLOWED"
     OUTPUT_LIMIT_EXCEEDED = "OUTPUT_LIMIT_EXCEEDED"
+    AUDIT_UNAVAILABLE = "AUDIT_UNAVAILABLE"
+    AUDIT_PERSISTENCE_ERROR = "AUDIT_PERSISTENCE_ERROR"
     INTERNAL_ERROR = "INTERNAL_ERROR"
 
 
@@ -57,6 +59,10 @@ class RepositoryNotAllowedError(MaestroError):
 class RepositoryNotFoundError(MaestroError):
     code = ErrorCode.REPOSITORY_NOT_FOUND
     default_message = "The repository path does not exist or is not a directory."
+
+
+class RepositoryInspectionError(MaestroError):
+    """A trusted repository-inspection helper failed its private protocol."""
 
 
 class RepositoryChangedError(MaestroError):
@@ -102,3 +108,13 @@ class RecursionNotAllowedError(MaestroError):
 class OutputLimitExceededError(MaestroError):
     code = ErrorCode.OUTPUT_LIMIT_EXCEEDED
     default_message = "The validated result exceeds the configured output limit."
+
+
+class AuditUnavailableError(MaestroError):
+    code = ErrorCode.AUDIT_UNAVAILABLE
+    default_message = "Audit persistence is temporarily unavailable."
+
+
+class AuditPersistenceError(MaestroError):
+    code = ErrorCode.AUDIT_PERSISTENCE_ERROR
+    default_message = "Audit persistence could not establish the required durable record."

@@ -151,3 +151,20 @@ def test_settings_requires_audit_database_url(
         Settings(  # pyright: ignore[reportCallIssue] - intentionally missing Audit URL
             allowed_roots=(tmp_path,)
         )
+
+
+def test_settings_rejects_malformed_audit_url_without_reflecting_credentials(
+    tmp_path: Path,
+) -> None:
+    private_value = "audit-private-" + "credential"
+    malformed = f"postgresql://audit-writer:{private_value}@["
+
+    with pytest.raises(ValidationError, match="MAESTRO_AUDIT_DATABASE_URL is invalid") as error:
+        Settings.model_validate(
+            {
+                "allowed_roots": (tmp_path,),
+                "audit_database_url": malformed,
+            }
+        )
+
+    assert private_value not in str(error.value)

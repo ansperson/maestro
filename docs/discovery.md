@@ -57,8 +57,12 @@ explicit authentication source is copied or forwarded.
 - Structured model output plus strict Pydantic validation.
 - Explicit read-only sandbox selection on the thread and turn.
 - Denial of permission escalation.
-- Application-owned timeout, cancellation, child-process termination, concurrency, and
-  admission bounds.
+- Application-owned investigation timeout, cancellation, concurrency, and admission bounds;
+  child-process termination and reaping after the supported runtime returns a process handle.
+- Repository fingerprint discovery in an isolated package-owned Python helper with strict
+  versioned stdin/stdout contracts, bounded output, minimal environment, closed descriptors,
+  a trusted working directory outside the repository, and post-handle terminate/kill/reap
+  cleanup shared by every Git inspection subprocess.
 - Isolated Codex configuration/home and an allowlisted process environment.
 - Web search, apps/connectors, multi-agent tools, goals, hooks, skill dependency installs,
   and project instruction loading disabled through isolated configuration.
@@ -66,6 +70,11 @@ explicit authentication source is copied or forwarded.
 - Post-investigation repository and evidence fingerprints before accepting a result.
 
 ## Unsupported controls and residual risk
+
+Python's supported asynchronous subprocess API does not expose a process handle until trusted
+process creation finishes. Normal runtime cancellation applies during that interval, but Maestro
+cannot independently enforce a hard application deadline or own reaping before handle acquisition.
+The package helper also does not provide an OS-level network sandbox.
 
 The public SDK does not provide a repository-read-only tool allowlist, a maximum tool-action
 count, or a complete repository-only confidentiality boundary. Codex's shell can technically
