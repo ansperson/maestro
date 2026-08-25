@@ -16,19 +16,22 @@ _SECRET_PATTERNS = (
 )
 _CREDENTIAL_URI_USERINFO = re.compile(r"(?P<scheme>[A-Za-z][A-Za-z0-9+.-]{0,31}://)[^/@\s]+@")
 _PATH_CHARACTER = r"[^\s\x00-\x1f<>\"'()\[\]{},;!?]"
-_PATH_SEGMENT_CHARACTER = r"[^\\/\s\x00-\x1f<>\"'()\[\]{},;!?]"
 _PRIVATE_POSIX_PATH = re.compile(
     rf"(?<![A-Za-z0-9._~-])/(?:Users|home|private|tmp|var|opt|srv|etc|root)"
     rf"(?![A-Za-z0-9._~-])(?:/{_PATH_CHARACTER}*)?"
 )
 _DRIVE_ABSOLUTE_PATH = re.compile(rf"(?<![A-Za-z0-9])(?:[A-Za-z]:[\\/]){_PATH_CHARACTER}*")
+_UNC_HOST = r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?"
+_UNC_SHARE = r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?\$?"
+_UNC_TAIL_SEGMENT = r"[A-Za-z0-9._$-]+"
+_UNC_TERMINATOR = r"(?=$|[\s.,;:!'\"<>])"
 _BACKSLASH_UNC_PATH = re.compile(
-    rf"(?<![\\A-Za-z0-9])\\\\{_PATH_SEGMENT_CHARACTER}+[\\/]"
-    rf"{_PATH_SEGMENT_CHARACTER}+(?:[\\/]{_PATH_SEGMENT_CHARACTER}+)*"
+    rf"(?<![\\A-Za-z0-9])\\\\{_UNC_HOST}\\{_UNC_SHARE}"
+    rf"(?:\\{_UNC_TAIL_SEGMENT})*{_UNC_TERMINATOR}"
 )
 _FORWARD_SLASH_UNC_PATH = re.compile(
-    rf"(?<![:/A-Za-z0-9])//{_PATH_SEGMENT_CHARACTER}+/{_PATH_SEGMENT_CHARACTER}+"
-    rf"(?:/{_PATH_SEGMENT_CHARACTER}+)*"
+    rf"(?<![:/A-Za-z0-9])//{_UNC_HOST}/{_UNC_SHARE}"
+    rf"(?:/{_UNC_TAIL_SEGMENT})*{_UNC_TERMINATOR}"
 )
 _DISALLOWED_CONTROLS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
@@ -68,8 +71,7 @@ def _replace_path(match: re.Match[str]) -> str:
 
 def _redact_repository_root(value: str, repository_root: Path) -> str:
     root = str(repository_root)
-    pattern = re.compile(rf"(?<![A-Za-z0-9._~-]){re.escape(root)}(?![A-Za-z0-9._~-])")
-    return pattern.sub(lambda match: _bounded_token(match.group(0), "<repository>"), value)
+    return value.replace(root, _bounded_token(root, "<repository>"))
 
 
 def _bounded_token(matched: str, preferred: str) -> str:

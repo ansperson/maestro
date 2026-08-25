@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 from uuid import UUID
 
 import pytest
@@ -29,6 +30,17 @@ from maestro.audit.testing import FakeAuditPort
 from maestro.repository.guard import AuthorizedRepository, RepositoryFingerprint
 
 _NOW = datetime(2026, 8, 25, 12, 0, tzinfo=UTC)
+
+type DurableTextField = Literal[
+    "objective",
+    "answer",
+    "rationale",
+    "evidence_symbol",
+    "evidence_finding",
+    "conflict_description",
+    "conflict_evidence_symbol",
+    "conflict_evidence_finding",
+]
 
 
 def _metadata() -> AuditRuntimeMetadata:
@@ -89,6 +101,107 @@ def _sensitive_completion() -> AuditInvestigationCompletionInput:
     )
 
 
+def _completion_with_field(
+    field: DurableTextField, value: str
+) -> AuditInvestigationCompletionInput:
+    primary_evidence = AuditEvidenceInput(
+        path="src/models.py",
+        line_start=None,
+        line_end=None,
+        symbol=value if field == "evidence_symbol" else "Order.payment_ids",
+        finding=value if field == "evidence_finding" else "Validated primary evidence.",
+    )
+    conflict_evidence = AuditEvidenceInput(
+        path="src/models.py",
+        line_start=None,
+        line_end=None,
+        symbol=(value if field == "conflict_evidence_symbol" else "Payment.order_id"),
+        finding=(value if field == "conflict_evidence_finding" else "Validated conflict evidence."),
+    )
+    return AuditInvestigationCompletionInput(
+        status=AuditResultStatus.RESOLVED,
+        answer=value if field == "answer" else "Safe answer.",
+        confidence=AuditConfidence.HIGH,
+        rationale=value if field == "rationale" else "Safe rationale.",
+        evidence=(primary_evidence,),
+        conflicts=(
+            AuditConflictInput(
+                description=(
+                    value if field == "conflict_description" else "Safe conflict description."
+                ),
+                evidence=(conflict_evidence,),
+            ),
+        ),
+    )
+
+
+def _stored_field(
+    port: FakeAuditPort,
+    field: DurableTextField,
+) -> str:
+    start_payload = port.starts[0].event.payload
+    completion_payload = port.completions[0].event.payload
+    assert isinstance(start_payload, ExecutionStartedV1)
+    assert isinstance(completion_payload, InvestigationCompletedV1)
+    if field == "objective":
+        stored = start_payload.objective
+    elif field == "answer":
+        assert completion_payload.answer is not None
+        stored = completion_payload.answer
+    elif field == "rationale":
+        stored = completion_payload.rationale
+    elif field == "evidence_symbol":
+        symbol = completion_payload.evidence[0].symbol
+        assert symbol is not None
+        stored = symbol
+    elif field == "evidence_finding":
+        stored = completion_payload.evidence[0].finding
+    elif field == "conflict_description":
+        stored = completion_payload.conflicts[0].description
+    elif field == "conflict_evidence_symbol":
+        conflict_evidence = completion_payload.conflicts[0].evidence[0]
+        assert conflict_evidence.symbol is not None
+        stored = conflict_evidence.symbol
+    else:
+        stored = completion_payload.conflicts[0].evidence[0].finding
+    return stored
+
+
+def _semantic_case(category: str, repository_root: Path) -> tuple[str, str, str]:
+    root = str(repository_root)
+    if category == "root_punctuation":
+        case = (f"Repository is {root}.", root, "Repository is")
+    elif category == "root_continuation":
+        regex = r"\\d+\s+"
+        case = (f"Regex {regex}; file {root}/src/models.py", root, regex)
+    elif category == "root_embedded_prose":
+        case = (
+            f"before({root}), symbol Order.payment_ids after",
+            root,
+            "Order.payment_ids",
+        )
+    elif category == "backslash_unc":
+        path = r"\\server.example\share_name-1$\private\settings.toml"
+        regex = r"\\w+\d+"
+        case = (f"Regex {regex}; host {path}.", path, regex)
+    elif category == "forward_unc":
+        path = "//server-name/share_name/private/settings.toml"
+        case = (f"Domain example.com; host {path}.", path, "example.com")
+    elif category == "credential_uri":
+        credential = "fixture-password"
+        value = "API /api/v1/items uses postgresql://reader:" + credential + "@db/maestro"
+        case = (value, credential, "/api/v1/items")
+    else:
+        path = "/opt/company/private/settings.toml"
+        code = (
+            r"\\server\share+ \\server\share* \\server\share? "
+            r"\\server\share[0] \\server\share{x} \\server\share(x) "
+            r"\\server\share^ \\server\share|"
+        )
+        case = (f"Code {code}; host {path}.", path, code)
+    return case
+
+
 @pytest.mark.parametrize(
     ("value", "forbidden"),
     [
@@ -108,7 +221,11 @@ def _sensitive_completion() -> AuditInvestigationCompletionInput:
         ("See (/Users/alice/.aws/credentials)", "/Users/alice"),
         (r"See [C:\Users\alice\private\settings.toml]", r"C:\Users\alice"),
         ("See D:/Users/alice/private/settings.toml", "D:/Users/alice"),
-        (r"See {\\server\share\private\settings.toml}", r"\\server\share"),
+        (r"See: \\server\share\private\settings.toml", r"\\server\share"),
+        (
+            r"See \\server.example\share_name-1$\private\settings.toml",
+            r"\\server.example\share_name-1$",
+        ),
         ("See //server/share/private/settings.toml", "//server/share"),
     ],
 )
@@ -127,6 +244,14 @@ def test_audit_sanitizer_redacts_sensitive_categories_independent_of_prefix(
     [
         "The endpoint is /api/v1/items.",
         r"The matcher is \\d+.",
+        r"The matcher is \\d+\s+.",
+        r"The matcher is \\w+\d+.",
+        r"Code \\name[0] and \\value+(next) stays useful.",
+        (
+            r"Code \\server\share+ \\server\share* \\server\share? "
+            r"\\server\share[0] \\server\share{x} \\server\share(x) "
+            r"\\server\share^ \\server\share| stays useful."
+        ),
         "Symbol Order.payment_ids remains useful.",
         "Compute total / item_count in example.com/domain.",
         "See https://example.com/api/v1/items.",
@@ -137,11 +262,87 @@ def test_audit_sanitizer_preserves_domain_and_code_text(tmp_path: Path, value: s
     assert sanitize_audit_text(value, tmp_path) == value
 
 
+@pytest.mark.parametrize(
+    "template",
+    [
+        "Repository is {root}.",
+        "Repository is {root}!",
+        "Repository is ({root}).",
+        "Read {root}/src/models.py next.",
+        "prefix={root}, suffix remains",
+        "embedded::{root}::prose",
+    ],
+)
+def test_audit_sanitizer_redacts_exact_repository_identity(tmp_path: Path, template: str) -> None:
+    value = template.format(root=tmp_path)
+    sanitized = sanitize_audit_text(value, tmp_path)
+    assert str(tmp_path) not in sanitized
+    assert len(sanitized) <= len(value)
+
+
 @given(value=st.text(min_size=1, max_size=2_000))
 def test_audit_sanitizer_is_nonempty_and_nonexpanding(value: str) -> None:
     sanitized = sanitize_audit_text(value, Path("/private/tmp/maestro/repository"))
     assert sanitized
     assert len(sanitized) <= len(value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field",
+    [
+        "objective",
+        "answer",
+        "rationale",
+        "evidence_symbol",
+        "evidence_finding",
+        "conflict_description",
+        "conflict_evidence_symbol",
+        "conflict_evidence_finding",
+    ],
+)
+@pytest.mark.parametrize(
+    "category",
+    [
+        "root_punctuation",
+        "root_continuation",
+        "root_embedded_prose",
+        "backslash_unc",
+        "forward_unc",
+        "credential_uri",
+        "private_host_path",
+    ],
+)
+async def test_recorder_redacts_governed_data_and_preserves_semantics_in_every_text_field(
+    tmp_path: Path,
+    field: DurableTextField,
+    category: str,
+) -> None:
+    value, governed, preserved = _semantic_case(category, tmp_path)
+    identifiers = iter(UUID(int=item) for item in range(1, 6))
+    port = FakeAuditPort()
+    recorder = AuditRecorder(
+        port,
+        _metadata(),
+        id_factory=lambda: next(identifiers),
+        clock=lambda: _NOW,
+    )
+    repository = _repository(tmp_path)
+    handle = await recorder.start_resolve_codebase_fact(
+        repository,
+        _fingerprint(),
+        value if field == "objective" else "Safe objective.",
+    )
+    await recorder.record_investigation_completed(
+        handle,
+        repository,
+        _completion_with_field(field, value),
+    )
+
+    stored = _stored_field(port, field)
+    assert governed not in stored
+    assert preserved in stored
+    assert len(stored) <= len(value)
 
 
 @pytest.mark.asyncio
