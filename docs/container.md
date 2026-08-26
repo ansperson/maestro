@@ -17,8 +17,15 @@ fingerprints, and evidence validation remain active inside it.
 
 Level 2 does not provide provider-only egress, per-worker containers, confidentiality between
 multiple configured allowed roots, protection from a compromised Docker daemon/host kernel, or
-byte-identical OCI builds. It adds no Jobs, persistence, integration, subagent, or remote MCP
-behavior.
+byte-identical OCI builds. It adds no Jobs, non-Audit durable state, integration, subagent, or
+remote MCP behavior.
+
+Audit v1 intentionally keeps the Maestro parent and disposable Codex worker co-resident in this
+container. The parent-only writer projection, explicit worker environment, closed descriptors,
+and closing short-lived PostgreSQL connections before worker creation reduce accidental
+credential forwarding. They do not isolate a compromised worker from a co-resident parent or the
+shared network namespace. Stronger isolation requires a different worker execution architecture
+and is outside the accepted Audit v1 topology.
 
 ## Requirements and tested platforms
 

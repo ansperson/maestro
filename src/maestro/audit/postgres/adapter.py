@@ -11,7 +11,6 @@ from uuid import UUID
 
 from psycopg import AsyncConnection, Error as PsycopgError, OperationalError
 from psycopg.types.json import Jsonb
-from pydantic import SecretStr
 
 from maestro.audit.contracts import (
     AuditEventV1,
@@ -20,6 +19,7 @@ from maestro.audit.contracts import (
     AuditInvestigationCompletionV1,
 )
 from maestro.audit.port import AuditWriteError, AuditWriteFailureKind
+from maestro.config import AuditWriterConfiguration, validate_audit_libpq_environment
 
 _SUPPORTED_SCHEMA_VERSION = 3
 _RETRYABLE_SQLSTATES = frozenset({"40001", "40P01", "53300", "57P01", "57P02", "57P03"})
@@ -57,8 +57,8 @@ class _ActiveFailureWrite:
 class PostgresAuditPort:
     """Persist Audit records without retaining a connection between operations."""
 
-    def __init__(self, database_url: SecretStr) -> None:
-        self._database_url = database_url
+    def __init__(self, configuration: AuditWriterConfiguration) -> None:
+        self._configuration = configuration
         self._active_failure_writes: dict[UUID, _ActiveFailureWrite] = {}
 
     async def start_execution(self, record: AuditExecutionStartV1) -> None:
@@ -76,7 +76,7 @@ class PostgresAuditPort:
             if not execution_inserted or not event_inserted:
                 await _verify_start_record(connection, record)
 
-        await _run_transaction(self._database_url.get_secret_value(), write)
+        await _run_transaction(self._configuration, write)
 
     async def complete_investigation(self, record: AuditInvestigationCompletionV1) -> None:
         """Insert the single sequence-two completion in its own short transaction."""
@@ -91,7 +91,7 @@ class PostgresAuditPort:
                     record.content_hash,
                 )
 
-        await _run_transaction(self._database_url.get_secret_value(), write)
+        await _run_transaction(self._configuration, write)
 
     async def fail_execution(self, record: AuditExecutionFailureV1) -> None:
         """Insert the single sequence-two operational failure in a short transaction."""
@@ -114,7 +114,7 @@ class PostgresAuditPort:
 
         try:
             await _run_transaction(
-                self._database_url.get_secret_value(),
+                self._configuration,
                 write,
                 connection_ready=active.attach,
             )
@@ -131,13 +131,21 @@ class PostgresAuditPort:
 
 
 async def _run_transaction(
-    database_url: str,
+    configuration: AuditWriterConfiguration,
     operation: _TransactionOperation,
     *,
     connection_ready: _ConnectionReady | None = None,
 ) -> None:
     try:
-        connection = await AsyncConnection.connect(database_url)
+        validate_audit_libpq_environment()
+        connection = await AsyncConnection.connect(
+            host=configuration.host,
+            port=configuration.port,
+            dbname=configuration.database,
+            user=configuration.user,
+            password=configuration.password.get_secret_value(),
+            application_name="maestro-audit-writer",
+        )
     except asyncio.CancelledError:
         raise
     except Exception as exc:

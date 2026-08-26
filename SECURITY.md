@@ -23,8 +23,11 @@ validates structured output and evidence, sanitizes results, fingerprints the re
 and after investigation through an isolated package-owned helper with a versioned bounded protocol,
 bounds admission/deadlines/pipes/results, owns helper/Git/worker termination and reaping after a
 child-process handle is acquired, and requires durable Audit start/completion records before AI
-work/result release. Audit connections
-are lazy and short-lived; no database connection or transaction remains open during AI work.
+work/result release. Central configuration gives the Codex adapter only a Codex-specific
+projection and gives the PostgreSQL adapter only the append-writer projection. Audit connections
+are lazy and short-lived; the start connection closes before worker creation, and no database
+connection or transaction remains open during AI work. Worker creation uses a fixed environment
+allowlist and closes non-standard descriptors.
 Logs exclude request text, source, credentials, transcripts, model responses, and absolute
 paths. The recommended Level 2 deployment additionally encloses the unchanged application in a
 hardened Linux container with read-only repository mounts and root filesystem, ephemeral
@@ -38,6 +41,19 @@ Configure exactly one of `MAESTRO_CODEX_AUTH_FILE` or `MAESTRO_CODEX_API_KEY`. T
 copied through a no-follow regular-file descriptor into a mode-0700 temporary Codex home; the
 latter exists only in the worker process and is omitted from its shell environment. Temporary
 state is removed on success, failure, timeout, and cancellation on a best-effort basis.
+
+The Audit writer password is loaded at startup only from a bounded UTF-8 regular, non-symlink file
+owned by the Maestro user with mode `0400` or `0600` on the supported POSIX boundary. Maestro
+opens it no-follow, close-on-exec, and nonblocking, then rechecks descriptor identity, type,
+ownership, mode, and size. Password-bearing DSNs, the removed legacy Audit URL, ambient
+driver-advertised libpq variables, `PGSERVICEFILE`, `PGSYSCONFDIR`, service/passfile indirection,
+and password command arguments are rejected. The environment check repeats immediately before
+every connection and never mutates process-global state. Bootstrap, migration-owner, writer, and
+reader settings and password files are distinct; normal Maestro runtime receives only the writer
+projection. Audit credentials and paths are excluded from the worker environment, argv, stdin
+request, temporary Codex configuration, prompt, and provider inputs. Audit settings/projections
+render no endpoint or identity fields; configuration, subprocess, and adapter errors expose only
+safe categories, not paths, endpoints, SQL, or driver diagnostics.
 
 In hardened container mode, mount only the dedicated authentication file read-only. Do not mount
 a complete home or `.codex` directory. File authentication is preferred because an API key passed
@@ -60,6 +76,12 @@ does not persist prompts, transcripts, repository content, or model output.
 - Filesystem namespace races, a compromised Python/Codex/MCP dependency, kernel compromise,
   process inspection by the same user, and failed best-effort temporary cleanup remain outside
   the application boundary.
+- The Maestro parent and disposable Codex worker remain co-resident in the hardened container and
+  share its OS and network namespace. Typed configuration projections, environment filtering,
+  closed descriptors, and closing the PostgreSQL start connection before worker creation reduce
+  accidental credential disclosure but are not complete isolation against a compromised worker.
+  Stronger isolation requires a different worker execution architecture; that residual is
+  explicitly accepted for Audit v1.
 - The fingerprint helper receives only a canonical root and numeric limits over stdin, runs with
   isolated Python module discovery from a trusted directory outside the authorized repository,
   closed inherited descriptors, and a minimal environment, and never intentionally opens a network

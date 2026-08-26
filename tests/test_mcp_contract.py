@@ -354,6 +354,7 @@ async def test_real_stdio_maps_both_audit_error_categories(
             failure.value,
         ],
         cwd=Path(__file__).parent.parent,
+        env=dict(os.environ),
     )
     async with Client(parameters, read_timeout_seconds=5) as client:
         tools = await client.list_tools()
@@ -382,6 +383,7 @@ async def test_real_stdio_maps_audit_payload_overflow_to_persistence_error(
             "payload_overflow",
         ],
         cwd=Path(__file__).parent.parent,
+        env=dict(os.environ),
     )
     async with Client(parameters, read_timeout_seconds=5) as client:
         tools = await client.list_tools()
@@ -402,13 +404,19 @@ async def test_real_stdio_maps_audit_payload_overflow_to_persistence_error(
 
 @pytest.mark.asyncio
 async def test_real_stdio_server_discovery_call_errors_and_clean_shutdown(repository: Path) -> None:
+    audit_password_file = repository.parent / "audit-writer-password"
+    audit_password_file.write_text("synthetic-password", encoding="utf-8")
+    audit_password_file.chmod(0o600)
     parameters = StdioServerParameters(
         command=sys.executable,
         args=["-m", "maestro.main"],
         cwd=Path(__file__).parent.parent,
         env={
             "MAESTRO_ALLOWED_ROOTS": str(repository),
-            "MAESTRO_AUDIT_DATABASE_URL": "postgresql://audit-writer@127.0.0.1:1/maestro",
+            "MAESTRO_AUDIT_WRITER_HOST": "127.0.0.1",
+            "MAESTRO_AUDIT_WRITER_PORT": "1",
+            "MAESTRO_AUDIT_WRITER_USER": "maestro_audit_writer",
+            "MAESTRO_AUDIT_WRITER_PASSWORD_FILE": str(audit_password_file),
             "MAESTRO_LOG_LEVEL": "INFO",
         },
     )

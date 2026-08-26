@@ -145,6 +145,8 @@ async def test_worker_uses_one_ephemeral_read_only_deny_all_turn(
     monkeypatch.setenv("TMPDIR", str(temporary))
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("MAESTRO_CODEX_API_KEY", "opaque-api-key")
+    monkeypatch.setenv("MAESTRO_AUDIT_WRITER_PASSWORD_FILE", "/private/audit-password")
+    monkeypatch.setenv("PGPASSWORD", "writer-only-value")
     fake = _FakeCodex(_FakeHandle())
     monkeypatch.setattr(worker, "AsyncCodex", fake.factory)
 
@@ -178,6 +180,19 @@ async def test_worker_uses_one_ephemeral_read_only_deny_all_turn(
     assert 'inherit = "none"' in config
     assert 'MAESTRO_VERIFIER_DEPTH = "1"' in config
     assert "mcp_servers" not in config
+    provider_boundary = json.dumps(
+        {
+            "config": repr(fake.config),
+            "thread": {key: repr(value) for key, value in fake.thread_options.items()},
+            "turn": {key: repr(value) for key, value in fake.thread.turn_options.items()},
+            "prompt": prompt,
+            "temporary_config": config,
+        },
+        sort_keys=True,
+    )
+    assert "/private/audit-password" not in provider_boundary
+    assert "writer-only-value" not in provider_boundary
+    assert "PGPASSWORD" not in provider_boundary
 
 
 @pytest.mark.asyncio

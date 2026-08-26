@@ -60,6 +60,10 @@ def test_runtime_image_metadata_is_minimal_and_non_root(container_image: str) ->
     serialized = json.dumps(config)
     assert "MAESTRO_CODEX_API_KEY" not in serialized
     assert "MAESTRO_CODEX_AUTH_FILE" not in serialized
+    assert "MAESTRO_AUDIT_WRITER_PASSWORD_FILE" not in serialized
+    assert "MAESTRO_AUDIT_MIGRATION_PASSWORD_FILE" not in serialized
+    assert "MAESTRO_AUDIT_READER_PASSWORD_FILE" not in serialized
+    assert "MAESTRO_AUDIT_BOOTSTRAP_PASSWORD_FILE" not in serialized
 
 
 def test_runtime_kernel_state_root_tmpfs_and_production_dependencies(

@@ -23,7 +23,7 @@ def _e2e_settings(repository: Path) -> Settings:
         pytest.skip(
             "set exactly one of MAESTRO_CODEX_AUTH_FILE or MAESTRO_CODEX_API_KEY for Codex E2E"
         )
-    return Settings(  # pyright: ignore[reportCallIssue] - Audit URL comes from BaseSettings
+    return Settings(  # pyright: ignore[reportCallIssue] - values come from BaseSettings
         allowed_roots=(repository,)
     )
 

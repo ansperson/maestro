@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 from hypothesis import HealthCheck, given, settings, strategies as st
 from pydantic import ValidationError
 
+import maestro.config as config_module
 from maestro.config import Settings
 
 
@@ -33,7 +36,6 @@ def test_settings_parse_and_canonicalize_allowed_roots(
 def test_settings_reject_invalid_values(tmp_path: Path, field: str, value: object) -> None:
     payload: dict[str, object] = {
         "allowed_roots": (tmp_path,),
-        "audit_database_url": "postgresql://audit-writer@localhost/maestro",
         field: value,
     }
     with pytest.raises(ValidationError):
@@ -42,7 +44,7 @@ def test_settings_reject_invalid_values(tmp_path: Path, field: str, value: objec
 
 def test_settings_reject_incoherent_file_limits(tmp_path: Path) -> None:
     with pytest.raises(ValidationError, match="cannot exceed"):
-        Settings(  # pyright: ignore[reportCallIssue] - Audit URL comes from BaseSettings
+        Settings(  # pyright: ignore[reportCallIssue] - values come from BaseSettings
             allowed_roots=(tmp_path,),
             max_file_bytes=2_048,
             max_repository_bytes=1_024,
@@ -51,15 +53,13 @@ def test_settings_reject_incoherent_file_limits(tmp_path: Path) -> None:
 
 def test_settings_reject_missing_root_and_auth_symlink(tmp_path: Path) -> None:
     with pytest.raises(ValidationError, match="does not exist"):
-        Settings(  # pyright: ignore[reportCallIssue] - Audit URL comes from BaseSettings
-            allowed_roots=(tmp_path / "missing",)
-        )
+        Settings(allowed_roots=(tmp_path / "missing",))  # pyright: ignore[reportCallIssue]
     auth = tmp_path / "auth.json"
     auth.write_text("{}", encoding="utf-8")
     link = tmp_path / "auth-link.json"
     link.symlink_to(auth)
     with pytest.raises(ValidationError, match="non-symlink"):
-        Settings(  # pyright: ignore[reportCallIssue] - Audit URL comes from BaseSettings
+        Settings(  # pyright: ignore[reportCallIssue] - values come from BaseSettings
             allowed_roots=(tmp_path,), codex_auth_file=link
         )
 
@@ -73,7 +73,6 @@ def test_settings_reject_two_auth_sources(tmp_path: Path) -> None:
                 "allowed_roots": (tmp_path,),
                 "codex_auth_file": auth,
                 "codex_api_key": "secret",
-                "audit_database_url": "postgresql://audit-writer@localhost/maestro",
             }
         )
 
@@ -88,17 +87,16 @@ def test_settings_reject_empty_roots_and_non_file_auth(
         Settings.model_validate(
             {
                 "allowed_roots": (),
-                "audit_database_url": "postgresql://audit-writer@localhost/maestro",
             }
         )
     with pytest.raises(ValidationError, match="regular"):
-        Settings(  # pyright: ignore[reportCallIssue] - Audit URL comes from BaseSettings
+        Settings(  # pyright: ignore[reportCallIssue] - values come from BaseSettings
             allowed_roots=(tmp_path,), codex_auth_file=tmp_path
         )
 
 
 def test_settings_deduplicates_roots(tmp_path: Path) -> None:
-    settings = Settings(  # pyright: ignore[reportCallIssue] - Audit URL comes from BaseSettings
+    settings = Settings(  # pyright: ignore[reportCallIssue] - values come from BaseSettings
         allowed_roots=(tmp_path, tmp_path)
     )
     assert settings.allowed_roots == (tmp_path,)
@@ -110,7 +108,6 @@ def test_settings_rejects_platform_filesystem_anchor() -> None:
         Settings.model_validate(
             {
                 "allowed_roots": (anchor,),
-                "audit_database_url": "postgresql://audit-writer@localhost/maestro",
             }
         )
 
@@ -124,7 +121,6 @@ def test_settings_rejects_every_canonical_anchor_alias(redundant_segments: int) 
         Settings.model_validate(
             {
                 "allowed_roots": (candidate,),
-                "audit_database_url": "postgresql://audit-writer@localhost/maestro",
             }
         )
 
@@ -137,37 +133,450 @@ def test_settings_accepts_canonical_non_anchor_roots(tmp_path: Path, parts: list
     configured = Settings.model_validate(
         {
             "allowed_roots": (root,),
-            "audit_database_url": "postgresql://audit-writer@localhost/maestro",
         }
     )
     assert configured.allowed_roots == (root.resolve(),)
 
 
-def test_settings_requires_audit_database_url(
+def test_settings_requires_writer_user_and_password_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.delenv("MAESTRO_AUDIT_DATABASE_URL")
-    with pytest.raises(ValidationError, match="audit_database_url"):
-        Settings(  # pyright: ignore[reportCallIssue] - intentionally missing Audit URL
+    monkeypatch.delenv("MAESTRO_AUDIT_WRITER_USER")
+    monkeypatch.delenv("MAESTRO_AUDIT_WRITER_PASSWORD_FILE")
+    with pytest.raises(ValidationError, match=r"user|password_file"):
+        Settings(  # pyright: ignore[reportCallIssue] - intentionally missing writer fields
             allowed_roots=(tmp_path,)
         )
 
 
-def test_settings_rejects_malformed_audit_url_without_reflecting_credentials(
+@pytest.mark.parametrize(
+    "legacy_value",
+    ["", "service=private-service password=private-value passfile=/private/password"],
+)
+def test_settings_rejects_legacy_audit_database_url_even_with_typed_writer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    legacy_value: str,
+) -> None:
+    allowed_root = tmp_path / "repository"
+    allowed_root.mkdir()
+    monkeypatch.setenv("MAESTRO_AUDIT_DATABASE_URL", legacy_value)
+    with pytest.raises(ValidationError, match="MAESTRO_AUDIT_DATABASE_URL") as error:
+        Settings.model_validate(
+            {
+                "allowed_roots": (allowed_root,),
+                "audit_writer": {
+                    "host": "audit-postgres",
+                    "database": "maestro_audit",
+                    "user": "audit_writer",
+                    "password_file": _password_file(tmp_path),
+                },
+            }
+        )
+    rendered = str(error.value)
+    assert "private-service" not in rendered
+    assert "private-value" not in rendered
+    assert "/private/password" not in rendered
+
+
+@pytest.mark.parametrize(
+    "unsafe_host",
+    [
+        "postgresql://audit_writer@database/maestro",
+        "service=private-service",
+        "host=database passfile=/private/password",
+        "/var/run/postgresql",
+        "database\npassword=private-value",
+    ],
+)
+def test_writer_projection_rejects_conninfo_and_service_indirection(
+    tmp_path: Path, unsafe_host: str
+) -> None:
+    with pytest.raises(ValidationError, match="host is invalid") as error:
+        config_module.AuditWriterSettings(
+            host=unsafe_host,
+            user="audit_writer",
+            password_file=_password_file(tmp_path),
+        )
+    assert unsafe_host not in str(error.value)
+
+
+@pytest.mark.parametrize("indirect_field", ["password", "passfile", "service", "dsn"])
+def test_role_settings_forbid_non_file_credential_inputs(
+    tmp_path: Path, indirect_field: str
+) -> None:
+    payload: dict[str, object] = {
+        "user": "audit_writer",
+        "password_file": _password_file(tmp_path),
+        indirect_field: "private-value",
+    }
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted") as error:
+        config_module.AuditWriterSettings.model_validate(payload)
+    assert "private-value" not in str(error.value)
+
+
+def test_libpq_environment_denylist_covers_every_driver_advertised_variable() -> None:
+    advertised = {
+        option.envvar.decode("ascii")
+        for option in config_module.pq.Conninfo.get_defaults()
+        if option.envvar is not None
+    }
+    configured = config_module._LIBPQ_ENVIRONMENT_NAMES  # pyright: ignore[reportPrivateUsage]
+
+    assert advertised <= configured
+    assert {"PGSERVICEFILE", "PGSYSCONFDIR"} <= configured
+
+
+@pytest.mark.parametrize(
+    ("variable", "private_value"),
+    [
+        ("PGSERVICE", "private-service"),
+        ("PGOPTIONS", "-c search_path=private_schema"),
+        ("PGPASSFILE", "/private/passfile"),
+        ("PGSSLMODE", "disable"),
+        ("PGSSLKEY", "/private/client-key"),
+        ("PGTARGETSESSIONATTRS", "read-write"),
+        ("PGSERVICEFILE", "/private/service-file"),
+        ("PGSYSCONFDIR", "/private/system-config"),
+        ("pgservice", "case-variant-private-service"),
+    ],
+)
+def test_role_settings_reject_ambient_libpq_families_without_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    variable: str,
+    private_value: str,
+) -> None:
+    monkeypatch.setenv(variable, private_value)
+
+    with pytest.raises(ValidationError, match="Ambient libpq configuration") as error:
+        config_module.AuditWriterSettings(
+            user="audit_writer",
+            password_file=_password_file(tmp_path),
+        )
+
+    rendered = str(error.value)
+    assert variable not in rendered
+    assert private_value not in rendered
+
+
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("missing", "unavailable"),
+        ("symlink", "non-symlink"),
+        ("directory", "regular"),
+        ("empty", "must not be empty"),
+        ("oversized", "oversized"),
+        ("insecure", "owner-only"),
+    ],
+)
+def test_writer_secret_file_rejects_unsafe_inputs(tmp_path: Path, case: str, message: str) -> None:
+    path = tmp_path / "writer-password"
+    if case == "symlink":
+        target = _password_file(tmp_path)
+        path.symlink_to(target)
+    elif case == "directory":
+        path.mkdir()
+    elif case == "missing":
+        pass
+    else:
+        path.write_text("" if case == "empty" else "x" * 4_097, encoding="utf-8")
+        path.chmod(0o644 if case == "insecure" else 0o600)
+
+    with pytest.raises(ValidationError, match=message) as error:
+        config_module.AuditWriterSettings(user="audit_writer", password_file=path)
+    assert str(path) not in str(error.value)
+
+
+def test_writer_secret_file_rejects_unreadable_input_without_path_or_secret(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _password_file(tmp_path, "private-writer-value")
+    original_open = config_module.os.open
+
+    def deny_open(candidate: Path, flags: int) -> int:
+        if Path(candidate) == path:
+            raise PermissionError("private driver detail")
+        return original_open(candidate, flags)
+
+    monkeypatch.setattr(config_module.os, "open", deny_open)
+    with pytest.raises(ValidationError, match="unavailable") as error:
+        config_module.AuditWriterSettings(user="audit_writer", password_file=path)
+    rendered = str(error.value)
+    assert str(path) not in rendered
+    assert "private-writer-value" not in rendered
+    assert "private driver detail" not in rendered
+
+
+def test_writer_secret_file_rejects_device_metadata_before_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = _password_file(tmp_path)
+    real_lstat = config_module.os.lstat
+    open_called = False
+
+    def device_lstat(candidate: Path) -> os.stat_result:
+        metadata = real_lstat(candidate)
+        values = list(metadata)
+        values[0] = config_module.stat.S_IFCHR | 0o600
+        return os.stat_result(values)
+
+    def track_open(_candidate: Path, _flags: int) -> int:
+        nonlocal open_called
+        open_called = True
+        raise AssertionError("non-regular password source reached open")
+
+    monkeypatch.setattr(config_module.os, "lstat", device_lstat)
+    monkeypatch.setattr(config_module.os, "open", track_open)
+
+    with pytest.raises(ValueError, match="regular"):
+        config_module._read_audit_password(path)  # pyright: ignore[reportPrivateUsage]
+
+    assert open_called is False
+
+
+def test_writer_secret_file_rejects_wrong_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if os.name != "posix":
+        pytest.skip("ownership is a POSIX credential control")
+    path = _password_file(tmp_path)
+    real_fstat = config_module.os.fstat
+
+    def wrong_owner(descriptor: int) -> os.stat_result:
+        metadata = real_fstat(descriptor)
+        values = list(metadata)
+        values[4] = os.geteuid() + 1
+        return os.stat_result(values)
+
+    monkeypatch.setattr(config_module.os, "fstat", wrong_owner)
+    with pytest.raises(ValidationError, match="owned by"):
+        config_module.AuditWriterSettings(user="audit_writer", password_file=path)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO security probe requires POSIX")
+@pytest.mark.parametrize("mode", ["fixed-fifo", "replacement-fifo"])
+def test_writer_secret_file_fifo_cases_fail_fast_and_child_is_reaped(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    path = tmp_path / "writer-password-source"
+    if mode == "fixed-fifo":
+        os.mkfifo(path, mode=0o600)
+    else:
+        path.write_text("synthetic-password", encoding="utf-8")
+        path.chmod(0o600)
+    helper = Path(__file__).parent / "helpers" / "audit_password_probe.py"
+    process = subprocess.Popen(
+        [sys.executable, str(helper), mode, str(path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        close_fds=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=2)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.communicate()
+        pytest.fail("Audit password-file validation blocked on a non-regular source")
+
+    assert process.returncode == 0
+    assert process.poll() is not None
+    assert stdout == ""
+    assert stderr == ""
+
+
+def test_writer_projection_revalidates_secret_file_after_settings_construction(
     tmp_path: Path,
 ) -> None:
-    private_value = "audit-private-" + "credential"
-    malformed = f"postgresql://audit-writer:{private_value}@["
+    path = _password_file(tmp_path)
+    settings = config_module.AuditWriterSettings(user="audit_writer", password_file=path)
+    replacement = tmp_path / "replacement-password"
+    replacement.write_text("replacement-value", encoding="utf-8")
+    replacement.chmod(0o600)
+    path.unlink()
+    path.symlink_to(replacement)
 
-    with pytest.raises(ValidationError, match="MAESTRO_AUDIT_DATABASE_URL is invalid") as error:
+    with pytest.raises(ValueError, match="non-symlink"):
+        settings.connection_configuration()
+
+
+def test_writer_projection_suppresses_secret_decoder_diagnostics(tmp_path: Path) -> None:
+    path = _password_file(tmp_path)
+    settings = config_module.AuditWriterSettings(user="audit_writer", password_file=path)
+    path.write_bytes(b"\xffprivate-writer-value")
+
+    with pytest.raises(ValueError, match="UTF-8") as error:
+        settings.connection_configuration()
+
+    rendered = str(error.value)
+    assert "private-writer-value" not in rendered
+    assert str(path) not in rendered
+    assert error.value.__suppress_context__ is True
+
+
+@pytest.mark.parametrize("mode", [0o400, 0o600])
+def test_writer_secret_file_accepts_owner_only_modes_and_one_trailing_newline(
+    tmp_path: Path, mode: int
+) -> None:
+    path = _password_file(tmp_path, "synthetic-password\n")
+    path.chmod(mode)
+    configuration = config_module.AuditWriterSettings(
+        host="audit-postgres",
+        database="maestro_audit",
+        user="audit_writer",
+        password_file=path,
+    ).connection_configuration()
+    assert configuration.password.get_secret_value() == "synthetic-password"
+    assert str(path) not in repr(configuration)
+
+
+def test_audit_role_and_projection_repr_hide_all_connection_inputs(tmp_path: Path) -> None:
+    private_host = "private-audit.internal"
+    private_port = 6543
+    private_database = "maestro_private"
+    private_user = "audit_writer_private"
+    private_password = "private-writer-value"  # noqa: S105  # pragma: allowlist secret
+    private_values: tuple[str | int, ...] = (
+        private_host,
+        private_port,
+        private_database,
+        private_user,
+        private_password,
+    )
+    password_path = _password_file(tmp_path, private_password)
+    settings = config_module.AuditWriterSettings(
+        host=private_host,
+        port=private_port,
+        database=private_database,
+        user=private_user,
+        password_file=password_path,
+    )
+    projection = settings.connection_configuration()
+    rendered = f"{settings!r} {projection!r}"
+
+    for value in (*private_values, str(password_path)):
+        assert str(value) not in rendered
+
+
+def test_direct_audit_projection_validation_hides_uri_and_all_other_inputs() -> None:
+    private_uri = (
+        "postgresql://private-user:"
+        "private-password@private-audit/maestro"  # pragma: allowlist secret
+    )
+    private_values: dict[str, object] = {
+        "host": private_uri,
+        "port": 6543,
+        "database": "maestro_private",
+        "user": "audit_writer_private",
+        "password": "private-writer-value",  # pragma: allowlist secret
+    }
+
+    with pytest.raises(ValidationError, match="host is invalid") as error:
+        config_module.AuditWriterConfiguration.model_validate(private_values)
+
+    rendered = str(error.value)
+    for value in private_values.values():
+        assert str(value) not in rendered
+
+
+def test_role_settings_validation_hides_uri_endpoint_identity_and_password_path(
+    tmp_path: Path,
+) -> None:
+    password_path = _password_file(tmp_path, "private-writer-value")
+    private_uri = (
+        "postgresql://private-user:"
+        "private-password@private-audit/maestro"  # pragma: allowlist secret
+    )
+    private_values: dict[str, object] = {
+        "host": private_uri,
+        "port": 6543,
+        "database": "maestro_private",
+        "user": "audit_writer_private",
+        "password_file": password_path,
+    }
+
+    with pytest.raises(ValidationError, match="host is invalid") as error:
+        config_module.AuditWriterSettings.model_validate(private_values)
+
+    rendered = str(error.value)
+    for value in private_values.values():
+        assert str(value) not in rendered
+
+
+@pytest.mark.parametrize(
+    ("settings_type", "configuration_type"),
+    [
+        (config_module.AuditBootstrapSettings, config_module.AuditBootstrapConfiguration),
+        (config_module.AuditMigrationSettings, config_module.AuditMigrationConfiguration),
+        (config_module.AuditWriterSettings, config_module.AuditWriterConfiguration),
+        (config_module.AuditReaderSettings, config_module.AuditReaderConfiguration),
+    ],
+)
+def test_database_roles_have_distinct_typed_credential_projections(
+    tmp_path: Path,
+    settings_type: type[
+        config_module.AuditBootstrapSettings
+        | config_module.AuditMigrationSettings
+        | config_module.AuditWriterSettings
+        | config_module.AuditReaderSettings
+    ],
+    configuration_type: type[
+        config_module.AuditBootstrapConfiguration
+        | config_module.AuditMigrationConfiguration
+        | config_module.AuditWriterConfiguration
+        | config_module.AuditReaderConfiguration
+    ],
+) -> None:
+    role = settings_type(user="role_user", password_file=_password_file(tmp_path))
+    assert isinstance(role.connection_configuration(), configuration_type)
+
+
+def test_application_projections_separate_codex_and_audit_values(tmp_path: Path) -> None:
+    password_path = _password_file(tmp_path, "writer-only-value")
+    allowed_root = tmp_path / "repository"
+    allowed_root.mkdir()
+    settings = Settings.model_validate(
+        {
+            "allowed_roots": (allowed_root,),
+            "codex_api_key": "codex-only-value",  # pragma: allowlist secret
+            "audit_writer": {
+                "host": "audit-postgres",
+                "database": "maestro_audit",
+                "user": "audit_writer",
+                "password_file": password_path,
+            },
+        }
+    )
+
+    codex = settings.codex_runtime_configuration()
+    writer = settings.audit_writer_configuration()
+    assert isinstance(codex, config_module.CodexRuntimeConfiguration)
+    assert codex.api_key is not None
+    assert codex.api_key.get_secret_value() == "codex-only-value"
+    assert not hasattr(codex, "password")
+    assert writer.password.get_secret_value() == "writer-only-value"
+    assert not hasattr(writer, "api_key")
+    assert str(password_path) not in repr(settings)
+    assert "audit_writer" not in settings.model_dump()
+
+
+def test_settings_rejects_writer_password_below_an_allowed_root(tmp_path: Path) -> None:
+    password_path = _password_file(tmp_path)
+    with pytest.raises(ValidationError, match="outside every allowed root") as error:
         Settings.model_validate(
             {
                 "allowed_roots": (tmp_path,),
-                "audit_database_url": malformed,
+                "audit_writer": {
+                    "user": "audit_writer",
+                    "password_file": password_path,
+                },
             }
         )
-
-    assert private_value not in str(error.value)
+    assert str(password_path) not in str(error.value)
 
 
 _UNSAFE_MODEL_IDENTIFIERS = (
@@ -191,7 +600,6 @@ def test_settings_rejects_unsafe_model_identifier_families_before_startup(
         Settings.model_validate(
             {
                 "allowed_roots": (tmp_path,),
-                "audit_database_url": "postgresql://audit-writer@localhost/maestro",
                 "codex_model": model,
             }
         )
@@ -212,7 +620,6 @@ def test_settings_retains_supported_safe_model_identifiers(tmp_path: Path, model
     settings = Settings.model_validate(
         {
             "allowed_roots": (tmp_path,),
-            "audit_database_url": "postgresql://audit-writer@localhost/maestro",
             "codex_model": model,
         }
     )
@@ -225,7 +632,13 @@ def test_settings_rejects_overlong_model_identifier(tmp_path: Path) -> None:
         Settings.model_validate(
             {
                 "allowed_roots": (tmp_path,),
-                "audit_database_url": "postgresql://audit-writer@localhost/maestro",
                 "codex_model": "m" * 129,
             }
         )
+
+
+def _password_file(tmp_path: Path, value: str = "synthetic-password") -> Path:
+    path = tmp_path / "audit-password"
+    path.write_text(value, encoding="utf-8")
+    path.chmod(0o600)
+    return path

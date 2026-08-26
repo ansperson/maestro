@@ -6,16 +6,22 @@ from pathlib import Path
 
 import pytest
 
-from maestro.config import Settings
+from maestro.config import AuditWriterSettings, Settings
 
-_TEST_AUDIT_DATABASE_URL = "postgresql://audit-writer@localhost/maestro"
+_TEST_AUDIT_WRITER_HOST = "127.0.0.1"
+_TEST_AUDIT_WRITER_USER = "audit_writer"
 
 
 @pytest.fixture(autouse=True)
-def configured_test_audit_url(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Supply non-secret typed Audit configuration to deterministic tests."""
+def configured_test_audit_writer(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Supply a synthetic owner-only writer secret file to deterministic tests."""
 
-    monkeypatch.setenv("MAESTRO_AUDIT_DATABASE_URL", _TEST_AUDIT_DATABASE_URL)
+    password_file = tmp_path.parent / f".{tmp_path.name}-audit-writer-password"
+    password_file.write_text("synthetic-audit-password", encoding="utf-8")
+    password_file.chmod(0o600)
+    monkeypatch.setenv("MAESTRO_AUDIT_WRITER_HOST", _TEST_AUDIT_WRITER_HOST)
+    monkeypatch.setenv("MAESTRO_AUDIT_WRITER_USER", _TEST_AUDIT_WRITER_USER)
+    monkeypatch.setenv("MAESTRO_AUDIT_WRITER_PASSWORD_FILE", str(password_file))
 
 
 @pytest.fixture
@@ -34,7 +40,7 @@ def settings_factory() -> Callable[..., Settings]:
     def factory(**overrides: object) -> Settings:
         values: dict[str, object] = {
             "allowed_roots": (Path.cwd(),),
-            "audit_database_url": _TEST_AUDIT_DATABASE_URL,
+            "audit_writer": AuditWriterSettings(),  # pyright: ignore[reportCallIssue]
             "max_file_bytes": 1_024,
             "max_repository_bytes": 1_048_576,
         }

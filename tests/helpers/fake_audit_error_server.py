@@ -29,7 +29,6 @@ def main() -> None:
     settings = Settings.model_validate(
         {
             "allowed_roots": (repository,),
-            "audit_database_url": "postgresql://audit-writer@127.0.0.1:1/maestro",
         }
     )
     if mode == "payload_overflow":
