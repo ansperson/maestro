@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import secrets
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -12,11 +13,12 @@ from uuid import UUID
 
 import pytest
 from psycopg import AsyncConnection, errors, sql
-from psycopg.conninfo import make_conninfo
+from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from psycopg.types.json import Jsonb
 from pydantic import SecretStr
 
 import maestro.audit.postgres.adapter as adapter_module
+from maestro.agents import FakeAgentRuntime
 from maestro.audit.contracts import (
     AuditConfidence,
     AuditEventType,
@@ -39,6 +41,15 @@ from maestro.audit.recorder import (
     AuditRuntimeMetadata,
 )
 from maestro.audit.testing import FakeAuditPort
+from maestro.capabilities.resolve_codebase_fact.contracts import (
+    Confidence,
+    Evidence,
+    ResolveCodebaseFactRequest,
+    VerificationResult,
+    VerificationStatus,
+)
+from maestro.capabilities.resolve_codebase_fact.service import ResolveCodebaseFactService
+from maestro.config import AuditWriterConfiguration, Settings
 from maestro.errors import ErrorCode
 from maestro.model_identity import ModelIdentifier
 from maestro.repository.guard import AuthorizedRepository, RepositoryFingerprint
@@ -48,6 +59,32 @@ _MIGRATOR_ROLE = "maestro_audit_migrator"
 _WRITER_ROLE = "maestro_audit_writer"
 _READER_ROLE = "maestro_audit_reader"
 _OUTSIDER_ROLE = "maestro_audit_outsider_test"
+
+
+def _writer_configuration() -> AuditWriterConfiguration:
+    return AuditWriterConfiguration(
+        host="127.0.0.1",
+        port=5432,
+        database="maestro",
+        user="audit_writer",
+        password=SecretStr("synthetic-password"),
+    )
+
+
+def _writer_configuration_from_dsn(raw_dsn: str) -> AuditWriterConfiguration:
+    values = conninfo_to_dict(raw_dsn)
+    host = values.get("host")
+    port = values.get("port")
+    database = values.get("dbname") or values.get("database")
+    user = values.get("user")
+    password = values.get("password")
+    return AuditWriterConfiguration(
+        host=host if isinstance(host, str) else "localhost",
+        port=int(port) if isinstance(port, str | int) else 5432,
+        database=database if isinstance(database, str) else "maestro",
+        user=user if isinstance(user, str) else "audit_writer",
+        password=SecretStr(password if isinstance(password, str) else "integration-placeholder"),
+    )
 
 
 class _FakeTransaction:
@@ -252,7 +289,7 @@ def _patch_connection(
     monkeypatch: pytest.MonkeyPatch,
     connection: _FakeConnection | Exception,
 ) -> None:
-    async def connect(_database_url: str) -> _FakeConnection:
+    async def connect(**_connection_values: object) -> _FakeConnection:
         if isinstance(connection, Exception):
             raise connection
         return connection
@@ -318,6 +355,55 @@ def test_postgres_connection_failure_classification_is_safe(
     assert "private" not in str(classified)
 
 
+@pytest.mark.asyncio
+async def test_adapter_passes_only_typed_fields_and_ephemeral_password_to_driver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = _FakeConnection()
+    captured: dict[str, object] = {}
+
+    async def connect(**connection_values: object) -> _FakeConnection:
+        captured.update(connection_values)
+        return connection
+
+    monkeypatch.setattr(adapter_module.AsyncConnection, "connect", staticmethod(connect))
+    start, _completion, _repository = await _records()
+    await PostgresAuditPort(_writer_configuration()).start_execution(start)
+
+    assert captured == {
+        "host": "127.0.0.1",
+        "port": 5432,
+        "dbname": "maestro",
+        "user": "audit_writer",
+        "password": "synthetic-password",  # pragma: allowlist secret
+        "application_name": "maestro-audit-writer",
+    }
+    assert "conninfo" not in captured
+    assert "password_file" not in captured
+
+
+@pytest.mark.asyncio
+async def test_driver_failure_does_not_log_or_expose_connection_details(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    private_detail = (
+        "postgresql://audit_writer:" + "synthetic-password@private-db/maestro SELECT private_table"
+    )
+
+    async def connect(**_connection_values: object) -> _FakeConnection:
+        raise errors.InvalidPassword(private_detail)
+
+    monkeypatch.setattr(adapter_module.AsyncConnection, "connect", staticmethod(connect))
+    start, _completion, _repository = await _records()
+    with pytest.raises(AuditWriteError) as failure:
+        await PostgresAuditPort(_writer_configuration()).start_execution(start)
+
+    assert failure.value.kind is AuditWriteFailureKind.PERMANENT
+    assert private_detail not in str(failure.value)
+    assert private_detail not in caplog.text
+
+
 @pytest.mark.parametrize(
     ("error", "expected"),
     [
@@ -371,7 +457,7 @@ async def test_postgres_port_runs_all_short_transaction_shapes(
     _patch_connection(monkeypatch, connection)
     start, completion, _repository = await _records()
     failure = await _failure_record()
-    port = PostgresAuditPort(SecretStr("postgresql:///synthetic"))
+    port = PostgresAuditPort(_writer_configuration())
 
     await port.start_execution(start)
     await port.complete_investigation(completion)
@@ -394,7 +480,7 @@ async def test_identical_start_and_terminal_retries_require_exact_verification(
     connection = _FakeConnection()
     _patch_connection(monkeypatch, connection)
     start, completion, _repository = await _records()
-    port = PostgresAuditPort(SecretStr("postgresql:///synthetic"))
+    port = PostgresAuditPort(_writer_configuration())
 
     await port.start_execution(start)
     await port.start_execution(start)
@@ -419,7 +505,7 @@ async def test_identical_failure_retry_verifies_exact_terminal_record(
     connection = _FakeConnection()
     _patch_connection(monkeypatch, connection)
     start, failure = await _failure_records()
-    port = PostgresAuditPort(SecretStr("postgresql:///synthetic"))
+    port = PostgresAuditPort(_writer_configuration())
 
     await port.start_execution(start)
     await port.fail_execution(failure)
@@ -443,12 +529,12 @@ async def test_ambiguous_start_retry_uses_a_fresh_connection_and_exact_prior_com
     second.events = first.events
     connections = iter((first, second))
 
-    async def connect(_database_url: str) -> _FakeConnection:
+    async def connect(**_connection_values: object) -> _FakeConnection:
         return next(connections)
 
     monkeypatch.setattr(adapter_module.AsyncConnection, "connect", staticmethod(connect))
     start, _completion, _repository = await _records()
-    port = PostgresAuditPort(SecretStr("postgresql:///synthetic"))
+    port = PostgresAuditPort(_writer_configuration())
 
     with pytest.raises(AuditWriteError) as ambiguous:
         await port.start_execution(start)
@@ -472,7 +558,7 @@ async def test_start_identity_reuse_with_different_content_is_rejected_atomicall
     connection = _FakeConnection()
     _patch_connection(monkeypatch, connection)
     start, _completion, _repository = await _records()
-    port = PostgresAuditPort(SecretStr("postgresql:///synthetic"))
+    port = PostgresAuditPort(_writer_configuration())
     await port.start_execution(start)
     changed_execution = start.execution.model_copy(
         update={
@@ -519,7 +605,7 @@ async def test_terminal_conflict_verifies_every_immutable_field(
     connection = _FakeConnection()
     _patch_connection(monkeypatch, connection)
     start, completion, _repository = await _records()
-    port = PostgresAuditPort(SecretStr("postgresql:///synthetic"))
+    port = PostgresAuditPort(_writer_configuration())
     await port.start_execution(start)
     await port.complete_investigation(completion)
     candidate = completion
@@ -585,7 +671,7 @@ async def test_unsafe_or_unsupported_durability_fails_before_start_write(
     connection = _FakeConnection(durability=durability)
     _patch_connection(monkeypatch, connection)
     start, _completion, _repository = await _records()
-    port = PostgresAuditPort(SecretStr("postgresql:///synthetic"))
+    port = PostgresAuditPort(_writer_configuration())
 
     with pytest.raises(AuditWriteError) as failure:
         await port.start_execution(start)
@@ -615,7 +701,7 @@ async def test_supported_durability_is_accepted(
     _patch_connection(monkeypatch, connection)
     start, _completion, _repository = await _records()
 
-    await PostgresAuditPort(SecretStr("postgresql:///synthetic")).start_execution(start)
+    await PostgresAuditPort(_writer_configuration()).start_execution(start)
 
     assert len(connection.executions) == 1
     assert connection.closed is True
@@ -629,14 +715,14 @@ async def test_failure_abort_before_connection_marks_and_finishes_late_connectio
     release_connect = asyncio.Event()
     connection = _FakeConnection()
 
-    async def connect(_database_url: str) -> _FakeConnection:
+    async def connect(**_connection_values: object) -> _FakeConnection:
         connect_entered.set()
         await release_connect.wait()
         return connection
 
     monkeypatch.setattr(adapter_module.AsyncConnection, "connect", staticmethod(connect))
     failure = await _failure_record()
-    port = PostgresAuditPort(SecretStr("postgresql:///synthetic"))
+    port = PostgresAuditPort(_writer_configuration())
     task = asyncio.create_task(port.fail_execution(failure))
     await connect_entered.wait()
 
@@ -658,7 +744,7 @@ async def test_failure_abort_then_cancellation_reaps_pending_connection_attempt(
     connect_entered = asyncio.Event()
     connect_cleaned = asyncio.Event()
 
-    async def connect(_database_url: str) -> _FakeConnection:
+    async def connect(**_connection_values: object) -> _FakeConnection:
         connect_entered.set()
         try:
             await asyncio.Event().wait()
@@ -668,7 +754,7 @@ async def test_failure_abort_then_cancellation_reaps_pending_connection_attempt(
 
     monkeypatch.setattr(adapter_module.AsyncConnection, "connect", staticmethod(connect))
     failure = await _failure_record()
-    port = PostgresAuditPort(SecretStr("postgresql:///synthetic"))
+    port = PostgresAuditPort(_writer_configuration())
     task = asyncio.create_task(port.fail_execution(failure))
     await connect_entered.wait()
 
@@ -688,7 +774,7 @@ async def test_failure_abort_finishes_active_query_and_unregisters(
     connection = _BlockingFailureConnection()
     _patch_connection(monkeypatch, connection)
     failure = await _failure_record()
-    port = PostgresAuditPort(SecretStr("postgresql:///synthetic"))
+    port = PostgresAuditPort(_writer_configuration())
     task = asyncio.create_task(port.fail_execution(failure))
     await connection.failure_query_entered.wait()
 
@@ -711,13 +797,13 @@ async def test_failure_abort_isolated_across_concurrent_event_identities(
     second_connection = _BlockingFailureConnection()
     connections = iter((first_connection, second_connection))
 
-    async def connect(_database_url: str) -> _BlockingFailureConnection:
+    async def connect(**_connection_values: object) -> _BlockingFailureConnection:
         return next(connections)
 
     monkeypatch.setattr(adapter_module.AsyncConnection, "connect", staticmethod(connect))
     first = await _failure_record(101)
     second = await _failure_record(201)
-    port = PostgresAuditPort(SecretStr("postgresql:///synthetic"))
+    port = PostgresAuditPort(_writer_configuration())
     first_task = asyncio.create_task(port.fail_execution(first))
     second_task = asyncio.create_task(port.fail_execution(second))
     await first_connection.failure_query_entered.wait()
@@ -746,7 +832,7 @@ async def test_failure_abort_finish_error_still_allows_cancellation_to_reap(
     connection = _BlockingFailureConnection(pgconn=pgconn)
     _patch_connection(monkeypatch, connection)
     failure = await _failure_record()
-    port = PostgresAuditPort(SecretStr("postgresql:///synthetic"))
+    port = PostgresAuditPort(_writer_configuration())
     task = asyncio.create_task(port.fail_execution(failure))
     await connection.failure_query_entered.wait()
 
@@ -769,7 +855,7 @@ async def test_postgres_port_rejects_unsupported_schema_without_writing(
     connection = _FakeConnection(schema_version=schema_version)
     _patch_connection(monkeypatch, connection)
     start, _completion, _repository = await _records()
-    port = PostgresAuditPort(SecretStr("postgresql:///synthetic"))
+    port = PostgresAuditPort(_writer_configuration())
 
     with pytest.raises(AuditWriteError) as failure:
         await port.start_execution(start)
@@ -789,10 +875,70 @@ async def test_transaction_runner_closes_after_success(monkeypatch: pytest.Monke
         nonlocal calls
         calls += 1
 
-    await adapter_module._run_transaction("postgresql:///synthetic", operation)  # pyright: ignore[reportPrivateUsage]
+    await adapter_module._run_transaction(  # pyright: ignore[reportPrivateUsage]
+        _writer_configuration(), operation
+    )
 
     assert calls == 1
     assert connection.closed is True
+
+
+@pytest.mark.asyncio
+async def test_start_connection_is_closed_before_agent_runtime_begins(
+    repository: Path,
+    settings_factory: Callable[..., Settings],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    start_connection = _FakeConnection()
+    terminal_connection = _FakeConnection()
+    connections = iter((start_connection, terminal_connection))
+
+    async def connect(**_connection_values: object) -> _FakeConnection:
+        return next(connections)
+
+    monkeypatch.setattr(adapter_module.AsyncConnection, "connect", staticmethod(connect))
+
+    def investigate(_request: object) -> VerificationResult:
+        assert start_connection.closed is True
+        return VerificationResult(
+            status=VerificationStatus.RESOLVED,
+            answer="The model stores a list of payments.",
+            confidence=Confidence.HIGH,
+            evidence=[
+                Evidence(
+                    path="src/models.py",
+                    line_start=1,
+                    finding="The field is a list.",
+                )
+            ],
+            conflicts=[],
+            reason="The repository evidence establishes the representation.",
+        )
+
+    settings = settings_factory(allowed_roots=(repository,))
+    recorder = AuditRecorder(
+        PostgresAuditPort(settings.audit_writer_configuration()),
+        AuditRuntimeMetadata(
+            server_version="1.0.0",
+            runtime_name="codex",
+            runtime_version="0.147.0",
+            model=ModelIdentifier("gpt-5.4"),
+            prompt_policy_version="repository-verifier/v1",
+        ),
+    )
+    service = ResolveCodebaseFactService(settings, FakeAgentRuntime(investigate), recorder)
+    try:
+        result = await service.execute(
+            ResolveCodebaseFactRequest(
+                repository_path=str(repository),
+                question="Does Order store a list of payments?",
+            )
+        )
+    finally:
+        await service.shutdown()
+
+    assert result.status is VerificationStatus.RESOLVED
+    assert terminal_connection.closed is True
 
 
 @pytest.mark.asyncio
@@ -812,7 +958,7 @@ async def test_transaction_runner_classifies_connect_failure(
 
     with pytest.raises(AuditWriteError) as failure:
         await adapter_module._run_transaction(  # pyright: ignore[reportPrivateUsage]
-            "postgresql:///synthetic",
+            _writer_configuration(),
             _successful_operation,
         )
 
@@ -831,7 +977,7 @@ async def test_transaction_runner_classifies_precommit_and_closes(
 
     with pytest.raises(AuditWriteError) as failure:
         await adapter_module._run_transaction(  # pyright: ignore[reportPrivateUsage]
-            "postgresql:///synthetic",
+            _writer_configuration(),
             fail_before_commit,
         )
 
@@ -860,7 +1006,7 @@ async def test_transaction_runner_classifies_commit_failure(
 
     with pytest.raises(AuditWriteError) as failure:
         await adapter_module._run_transaction(  # pyright: ignore[reportPrivateUsage]
-            "postgresql:///synthetic",
+            _writer_configuration(),
             _successful_operation,
         )
 
@@ -877,7 +1023,7 @@ async def test_transaction_runner_treats_close_failure_as_ambiguous(
 
     with pytest.raises(AuditWriteError) as failure:
         await adapter_module._run_transaction(  # pyright: ignore[reportPrivateUsage]
-            "postgresql:///synthetic",
+            _writer_configuration(),
             _successful_operation,
         )
 
@@ -1102,22 +1248,23 @@ async def _assert_native_unsafe_durability_rejected(
     raw_dsn: str,
     start: AuditExecutionStartV1,
 ) -> UUID:
-    unsafe_execution = start.execution.model_copy(
-        update={"audit_id": UUID(int=20), "execution_id": UUID(int=21)}
-    )
-    unsafe_event = start.event.model_copy(
-        update={"audit_id": unsafe_execution.audit_id, "event_id": UUID(int=22)}
-    )
-    unsafe_start = start.model_copy(update={"execution": unsafe_execution, "event": unsafe_event})
+    del start
+    unsafe_audit_id = UUID(int=20)
     unsafe_dsn = make_conninfo(
         raw_dsn,
         application_name="maestro-audit-unsafe-durability",
         options="-c synchronous_commit=off",
     )
-    with pytest.raises(AuditWriteError) as unsafe_durability:
-        await PostgresAuditPort(SecretStr(unsafe_dsn)).start_execution(unsafe_start)
-    assert unsafe_durability.value.kind is AuditWriteFailureKind.PERMANENT
-    return unsafe_execution.audit_id
+    unsafe_connection = await AsyncConnection.connect(unsafe_dsn)
+    try:
+        with pytest.raises(AuditWriteError) as unsafe_durability:
+            await adapter_module._verify_database_durability(  # pyright: ignore[reportPrivateUsage]
+                unsafe_connection
+            )
+        assert unsafe_durability.value.kind is AuditWriteFailureKind.PERMANENT
+    finally:
+        await unsafe_connection.close()
+    return unsafe_audit_id
 
 
 def _role_dsn(raw_dsn: str, role: str, password: str, application_name: str) -> str:
@@ -1746,7 +1893,7 @@ async def test_postgres_roles_views_and_forward_migration() -> None:
     migrator_dsn = await _apply_roles_and_views(raw_dsn, migrator_password)
     writer_dsn = _role_dsn(raw_dsn, _WRITER_ROLE, writer_password, "maestro-audit-issue11")
     reader_dsn = _role_dsn(raw_dsn, _READER_ROLE, reader_password, "maestro-audit-reader")
-    port = PostgresAuditPort(SecretStr(writer_dsn))
+    port = PostgresAuditPort(_writer_configuration_from_dsn(writer_dsn))
     start, completion, _repository = await _records()
     identities = await _write_view_scenarios(port)
     new_audit_id = await _assert_native_mismatches_rollback(port, start, completion)

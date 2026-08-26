@@ -5,7 +5,6 @@ import logging
 from pathlib import Path
 
 import pytest
-from pydantic import SecretStr
 
 import maestro.main as main_module
 import maestro.versions as versions_module
@@ -137,9 +136,8 @@ def test_main_builds_verified_stdio_server(tmp_path: Path, monkeypatch: pytest.M
 async def test_production_composition_does_not_connect_or_migrate_at_build_time(
     tmp_path: Path,
 ) -> None:
-    settings = Settings(
-        allowed_roots=(tmp_path,),
-        audit_database_url=SecretStr("postgresql://audit-writer@127.0.0.1:1/maestro"),
+    settings = Settings(  # pyright: ignore[reportCallIssue] - values come from BaseSettings
+        allowed_roots=(tmp_path,)
     )
     service = main_module.build_service(settings)
     await service.shutdown()

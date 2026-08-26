@@ -22,7 +22,7 @@ def build_service(settings: Settings) -> ResolveCodebaseFactService:
     """Build production dependencies without leaking transport types inward."""
 
     audit = AuditRecorder(
-        PostgresAuditPort(settings.audit_database_url),
+        PostgresAuditPort(settings.audit_writer_configuration()),
         AuditRuntimeMetadata(
             server_version=__version__,
             runtime_name="codex",
@@ -31,7 +31,11 @@ def build_service(settings: Settings) -> ResolveCodebaseFactService:
             prompt_policy_version=POLICY_VERSION,
         ),
     )
-    return ResolveCodebaseFactService(settings, CodexAgentRuntime(settings), audit)
+    return ResolveCodebaseFactService(
+        settings,
+        CodexAgentRuntime(settings.codex_runtime_configuration()),
+        audit,
+    )
 
 
 def main() -> None:

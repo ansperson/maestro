@@ -21,7 +21,7 @@ from maestro.agents.codex.protocol import (
 )
 from maestro.agents.runtime import InvestigationRequest
 from maestro.capabilities.resolve_codebase_fact.contracts import VerificationResult
-from maestro.config import Settings
+from maestro.config import CodexRuntimeConfiguration
 from maestro.errors import AgentRuntimeError, InvalidAgentOutputError
 
 _WORKER_RESPONSE: TypeAdapter[CodexWorkerSuccess | CodexWorkerFailure] = TypeAdapter(
@@ -32,8 +32,12 @@ _WORKER_RESPONSE: TypeAdapter[CodexWorkerSuccess | CodexWorkerFailure] = TypeAda
 class CodexAgentRuntime:
     """Run each official-SDK investigation in a minimal isolated process."""
 
-    def __init__(self, settings: Settings, worker_command: tuple[str, ...] | None = None) -> None:
-        self._settings = settings
+    def __init__(
+        self,
+        configuration: CodexRuntimeConfiguration,
+        worker_command: tuple[str, ...] | None = None,
+    ) -> None:
+        self._configuration = configuration
         self._worker_command = worker_command or (
             sys.executable,
             "-m",
@@ -63,6 +67,7 @@ class CodexAgentRuntime:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     start_new_session=os.name == "posix",
+                    close_fds=True,
                 )
             except OSError as exc:
                 raise AgentRuntimeError("The configured Codex worker could not start.") from exc
@@ -100,8 +105,8 @@ class CodexAgentRuntime:
         worker_tmp = temporary_root / "tmp"
         for directory in (codex_home, worker_home, worker_tmp):
             directory.mkdir(mode=0o700)
-        if self._settings.codex_auth_file is not None:
-            _copy_auth_file(self._settings.codex_auth_file, codex_home / "auth.json")
+        if self._configuration.auth_file is not None:
+            _copy_auth_file(self._configuration.auth_file, codex_home / "auth.json")
         environment = {
             "CODEX_HOME": str(codex_home),
             "HOME": str(worker_home),
@@ -115,8 +120,8 @@ class CodexAgentRuntime:
             "RUST_LOG": "warn",
             "TMPDIR": str(worker_tmp),
         }
-        if self._settings.codex_api_key is not None:
-            environment["MAESTRO_CODEX_API_KEY"] = self._settings.codex_api_key.get_secret_value()
+        if self._configuration.api_key is not None:
+            environment["MAESTRO_CODEX_API_KEY"] = self._configuration.api_key.get_secret_value()
         return environment
 
 
