@@ -16,13 +16,15 @@ class AuditMigration:
 def packaged_migrations() -> tuple[AuditMigration, ...]:
     """Load ordered SQL resources; normal application startup never calls this."""
 
-    resource = files(__package__).joinpath("0001_audit_tracer.sql")
-    return (
+    resources = (
+        (1, files(__package__).joinpath("0001_audit_tracer.sql")),
+        (2, files(__package__).joinpath("0002_execution_failed.sql")),
+    )
+    return tuple(
         AuditMigration(
-            version=1,
-            name=resource.name,
-            sql=resource.read_text(encoding="utf-8"),
-        ),
+            version=version, name=resource.name, sql=resource.read_text(encoding="utf-8")
+        )
+        for version, resource in resources
     )
 
 

@@ -81,7 +81,7 @@ def test_public_question_composes_into_bounded_audit_objective(question: str) ->
         server_version="1.0.0",
         runtime_name="codex",
         runtime_version="0.147.0",
-        model="gpt-5.4",
+        model="gpt-5.4",  # pyright: ignore[reportArgumentType]
         prompt_policy_version=POLICY_VERSION,
     )
 

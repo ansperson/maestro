@@ -386,6 +386,7 @@ async def test_invalid_or_oversized_result_is_not_persisted_as_completion(
         await service.execute(_request(repository))
     assert len(port.starts) == 1
     assert port.completions == []
+    assert len(port.failures) == 1
 
 
 @pytest.mark.asyncio
@@ -409,6 +410,7 @@ async def test_valid_public_result_with_oversized_audit_payload_is_withheld(
     assert len(runtime.requests) == 1
     assert len(port.starts) == 1
     assert port.completion_attempts == []
+    assert port.failure_attempts == []
 
 
 @pytest.mark.asyncio
@@ -430,6 +432,7 @@ async def test_repository_stability_and_sanitization_precede_completion(
         await service.execute(_request(repository))
     assert len(port.starts) == 1
     assert port.completions == []
+    assert len(port.failures) == 1
 
     (repository / "changed-after-start.txt").unlink()
     clean_port = FakeAuditPort()

@@ -4,8 +4,13 @@ from __future__ import annotations
 
 from enum import StrEnum
 from typing import Protocol
+from uuid import UUID
 
-from maestro.audit.contracts import AuditExecutionStartV1, AuditInvestigationCompletionV1
+from maestro.audit.contracts import (
+    AuditExecutionFailureV1,
+    AuditExecutionStartV1,
+    AuditInvestigationCompletionV1,
+)
 
 
 class AuditWriteFailureKind(StrEnum):
@@ -25,7 +30,7 @@ class AuditWriteError(Exception):
 
 
 class AuditPort(Protocol):
-    """Persist the two successful-tracer transitions; this is not a generic append API."""
+    """Persist the concrete v1 execution lifecycle; this is not a generic append API."""
 
     async def start_execution(self, record: AuditExecutionStartV1) -> None:
         """Atomically persist an execution and its sequence-one start event."""
@@ -33,4 +38,17 @@ class AuditPort(Protocol):
 
     async def complete_investigation(self, record: AuditInvestigationCompletionV1) -> None:
         """Persist the single sequence-two semantic completion event."""
+        ...
+
+    async def fail_execution(self, record: AuditExecutionFailureV1) -> None:
+        """Persist the single sequence-two safe operational failure event."""
+        ...
+
+    def abort_execution_failure(self, event_id: UUID) -> None:
+        """Synchronously abort the active write for one stable failure-event identity.
+
+        Implementations must make the matching operation quiesce when it is subsequently
+        cancelled. Calls for an operation that is not active, including repeated calls, are
+        harmless.
+        """
         ...

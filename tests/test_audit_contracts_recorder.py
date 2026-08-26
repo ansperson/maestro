@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 from uuid import UUID
 
 import pytest
@@ -16,13 +16,17 @@ from maestro.audit.contracts import (
     AuditEventType,
     AuditEventV1,
     AuditEvidenceV1,
+    AuditExecutionFailureV1,
+    AuditFailureStage,
     AuditResultStatus,
+    ExecutionFailedV1,
     ExecutionStartedV1,
     InvestigationCompletedV1,
 )
 from maestro.audit.recorder import (
     AuditConflictInput,
     AuditEvidenceInput,
+    AuditExecutionHandle,
     AuditInvestigationCompletionInput,
     AuditRecorder,
     AuditRuntimeMetadata,
@@ -32,7 +36,8 @@ from maestro.audit.testing import FakeAuditPort, fake_audit_recorder
 from maestro.capabilities.resolve_codebase_fact.audit_mapping import (
     map_result_to_audit_completion,
 )
-from maestro.errors import AuditPersistenceError
+from maestro.errors import AuditPersistenceError, ErrorCode
+from maestro.model_identity import ModelIdentifier
 from maestro.repository.guard import AuthorizedRepository, RepositoryFingerprint
 
 _NOW = datetime(2026, 8, 25, 12, 0, tzinfo=UTC)
@@ -48,13 +53,24 @@ type DurableTextField = Literal[
     "conflict_evidence_finding",
 ]
 
+_UNSAFE_MODEL_IDENTIFIERS = (
+    "postgresql://reader:fixture-password@db/maestro",  # pragma: allowlist secret
+    "/Users/alice/.config/model",
+    r"C:\Users\alice\model",
+    r"\\server\share\model",
+    "gpt-5.4\nAPI_KEY=fixture-secret",
+    "gpt-5.4\u200b",
+    "API_KEY=fixture-secret",
+    "the current production model",
+)
+
 
 def _metadata() -> AuditRuntimeMetadata:
     return AuditRuntimeMetadata(
         server_version="1.0.0",
         runtime_name="codex",
         runtime_version="0.147.0",
-        model="gpt-5.4",
+        model=ModelIdentifier("gpt-5.4"),
         prompt_policy_version="repository-verifier/v1",
     )
 
@@ -467,7 +483,7 @@ async def test_recorder_builds_immutable_strict_versioned_records(tmp_path: Path
     assert completion.event.sequence == 2
     assert completion.event.event_version == 1
     assert completion.event.event_type is AuditEventType.INVESTIGATION_COMPLETED
-    assert completion.event.event_id == handle.completion_event_id
+    assert completion.event.event_id == handle.terminal_event_id
     assert completion.event.audit_id == handle.audit_id
     encoded = start.model_dump_json() + completion.model_dump_json()
     assert "fixture-secret-value" not in encoded
@@ -541,7 +557,7 @@ async def test_recorder_maps_start_contract_construction_failure_before_port_cal
             server_version=metadata.server_version,
             runtime_name=metadata.runtime_name,
             runtime_version=metadata.runtime_version,
-            model="m" * 129,
+            model=cast(ModelIdentifier, "m" * 129),
             prompt_policy_version=metadata.prompt_policy_version,
         ),
     )
@@ -581,7 +597,7 @@ def test_event_contract_rejects_extra_fields_and_mismatched_sequence() -> None:
         server_version="1.0.0",
         runtime_name="codex",
         runtime_version="0.147.0",
-        model="gpt-5.4",
+        model=ModelIdentifier("gpt-5.4"),
         prompt_policy_version="repository-verifier/v1",
     )
     with pytest.raises(ValidationError, match="extra_forbidden"):
@@ -608,6 +624,45 @@ def test_event_contract_rejects_extra_fields_and_mismatched_sequence() -> None:
         )
 
 
+@pytest.mark.parametrize("model", _UNSAFE_MODEL_IDENTIFIERS)
+def test_every_audit_event_payload_rejects_unsafe_model_identifiers(model: str) -> None:
+    metadata = {
+        "server_version": "1.0.0",
+        "runtime_name": "codex",
+        "runtime_version": "0.147.0",
+        "model": model,
+        "prompt_policy_version": "repository-verifier/v1",
+    }
+    payloads = (
+        {
+            "objective": "Determine whether the fact is true.",
+            **metadata,
+        },
+        {
+            "status": "uncertain",
+            "answer": None,
+            "confidence": "low",
+            "rationale": "The repository does not establish the fact.",
+            "evidence": (),
+            "conflicts": (),
+            **metadata,
+        },
+        {
+            "error_code": "INTERNAL_ERROR",
+            "failure_stage": "validation",
+            **metadata,
+        },
+    )
+
+    for contract, payload in zip(
+        (ExecutionStartedV1, InvestigationCompletedV1, ExecutionFailedV1),
+        payloads,
+        strict=True,
+    ):
+        with pytest.raises(ValidationError, match="Audit-safe"):
+            contract.model_validate(payload, strict=True)
+
+
 def test_completed_contract_preserves_all_semantic_statuses() -> None:
     for status in AuditResultStatus:
         payload = InvestigationCompletedV1(
@@ -624,7 +679,131 @@ def test_completed_contract_preserves_all_semantic_statuses() -> None:
             server_version="1.0.0",
             runtime_name="codex",
             runtime_version="0.147.0",
-            model="gpt-5.4",
+            model=ModelIdentifier("gpt-5.4"),
             prompt_policy_version="repository-verifier/v1",
         )
         assert payload.status is status
+
+
+@pytest.mark.asyncio
+async def test_recorder_builds_strict_safe_operational_failure(tmp_path: Path) -> None:
+    identifiers = iter(UUID(int=value) for value in range(20, 25))
+    port = FakeAuditPort()
+    recorder = AuditRecorder(
+        port,
+        _metadata(),
+        id_factory=lambda: next(identifiers),
+        clock=lambda: _NOW,
+    )
+    handle = await recorder.start_resolve_codebase_fact(
+        _repository(tmp_path),
+        _fingerprint(),
+        "Is the fact established?",
+    )
+
+    await recorder.record_execution_failed(
+        handle,
+        ErrorCode.AGENT_RUNTIME_ERROR,
+        AuditFailureStage.INVESTIGATION,
+    )
+
+    assert len(port.failures) == 1
+    failure = port.failures[0].event
+    assert failure.event_id == handle.terminal_event_id
+    assert failure.audit_id == handle.audit_id
+    assert failure.sequence == 2
+    assert failure.event_type is AuditEventType.EXECUTION_FAILED
+    assert isinstance(failure.payload, ExecutionFailedV1)
+    assert failure.payload.model_dump(mode="json") == {
+        "error_code": "AGENT_RUNTIME_ERROR",
+        "failure_stage": "investigation",
+        "server_version": "1.0.0",
+        "runtime_name": "codex",
+        "runtime_version": "0.147.0",
+        "model": "gpt-5.4",
+        "prompt_policy_version": "repository-verifier/v1",
+    }
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        ExecutionFailedV1.model_validate(
+            {**failure.payload.model_dump(), "exception": "private traceback"},
+            strict=True,
+        )
+
+
+def test_failure_contract_rejects_non_terminal_shape() -> None:
+    payload = ExecutionFailedV1(
+        error_code=ErrorCode.INTERNAL_ERROR,
+        failure_stage=AuditFailureStage.VALIDATION,
+        server_version="1.0.0",
+        runtime_name="codex",
+        runtime_version="0.147.0",
+        model=ModelIdentifier("gpt-5.4"),
+        prompt_policy_version="repository-verifier/v1",
+    )
+
+    with pytest.raises(ValidationError, match="do not agree"):
+        AuditEventV1(
+            event_id=UUID(int=1),
+            audit_id=UUID(int=2),
+            sequence=1,
+            event_type=AuditEventType.EXECUTION_FAILED,
+            occurred_at=_NOW,
+            payload=payload,
+        )
+
+
+def test_failure_record_rejects_a_semantic_completion_event() -> None:
+    completion = InvestigationCompletedV1(
+        status=AuditResultStatus.UNCERTAIN,
+        answer=None,
+        confidence=AuditConfidence.LOW,
+        rationale="The repository does not establish the fact.",
+        evidence=(),
+        conflicts=(),
+        server_version="1.0.0",
+        runtime_name="codex",
+        runtime_version="0.147.0",
+        model=ModelIdentifier("gpt-5.4"),
+        prompt_policy_version="repository-verifier/v1",
+    )
+    event = AuditEventV1(
+        event_id=UUID(int=1),
+        audit_id=UUID(int=2),
+        sequence=2,
+        event_type=AuditEventType.INVESTIGATION_COMPLETED,
+        occurred_at=_NOW,
+        payload=completion,
+    )
+
+    with pytest.raises(ValidationError, match=r"execution\.failed"):
+        AuditExecutionFailureV1(event=event)
+
+
+@pytest.mark.asyncio
+async def test_failure_contract_construction_error_precedes_port_call() -> None:
+    metadata = _metadata()
+    port = FakeAuditPort()
+    recorder = AuditRecorder(
+        port,
+        AuditRuntimeMetadata(
+            server_version=metadata.server_version,
+            runtime_name=metadata.runtime_name,
+            runtime_version=metadata.runtime_version,
+            model=cast(ModelIdentifier, "m" * 129),
+            prompt_policy_version=metadata.prompt_policy_version,
+        ),
+        clock=lambda: _NOW,
+    )
+
+    with pytest.raises(AuditPersistenceError):
+        await recorder.record_execution_failed(
+            AuditExecutionHandle(
+                audit_id=UUID(int=1),
+                execution_id=UUID(int=2),
+                terminal_event_id=UUID(int=3),
+            ),
+            ErrorCode.INTERNAL_ERROR,
+            AuditFailureStage.VALIDATION,
+        )
+
+    assert port.failure_attempts == []

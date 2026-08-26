@@ -8,6 +8,7 @@ from typing import Annotated, Literal
 from pydantic import Field
 
 from maestro.capabilities.resolve_codebase_fact.contracts import StrictModel, VerificationResult
+from maestro.model_identity import ModelIdentifier
 
 
 class CodexWorkerRequest(StrictModel):
@@ -16,7 +17,7 @@ class CodexWorkerRequest(StrictModel):
     repository_root: Path
     question: str
     context: str | None
-    model: str
+    model: ModelIdentifier
     max_output_bytes: Annotated[int, Field(ge=1_024, le=1_048_576)]
 
 

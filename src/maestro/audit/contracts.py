@@ -12,6 +12,9 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
+from maestro.errors import ErrorCode
+from maestro.model_identity import ModelIdentifier
+
 MAX_AUDIT_OBJECTIVE_CHARS = 4_000
 MAX_AUDIT_ANSWER_CHARS = 8_000
 MAX_AUDIT_RATIONALE_CHARS = 4_000
@@ -21,7 +24,7 @@ MAX_AUDIT_EVIDENCE_ITEMS = 20
 MAX_AUDIT_CONFLICTS = 10
 MAX_AUDIT_CONFLICT_EVIDENCE_ITEMS = 10
 MAX_AUDIT_PAYLOAD_BYTES = 65_536
-_COMPLETION_SEQUENCE = 2
+_TERMINAL_SEQUENCE = 2
 
 _Digest = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 _VersionText = Annotated[
@@ -35,10 +38,19 @@ class _StrictFrozenModel(BaseModel):
 
 
 class AuditEventType(StrEnum):
-    """Event types implemented by the successful Audit tracer."""
+    """Semantic event types implemented by the v1 Audit tracer."""
 
     EXECUTION_STARTED = "execution.started"
     INVESTIGATION_COMPLETED = "investigation.completed"
+    EXECUTION_FAILED = "execution.failed"
+
+
+class AuditFailureStage(StrEnum):
+    """Bounded lifecycle stages safe to persist for operational failures."""
+
+    INVESTIGATION = "investigation"
+    VALIDATION = "validation"
+    TERMINAL_PERSISTENCE = "terminal_persistence"
 
 
 class AuditResultStatus(StrEnum):
@@ -108,7 +120,7 @@ class ExecutionStartedV1(_StrictFrozenModel):
     server_version: _VersionText
     runtime_name: _VersionText
     runtime_version: _VersionText
-    model: _VersionText
+    model: ModelIdentifier
     prompt_policy_version: _VersionText
 
 
@@ -132,7 +144,7 @@ class InvestigationCompletedV1(_StrictFrozenModel):
     server_version: _VersionText
     runtime_name: _VersionText
     runtime_version: _VersionText
-    model: _VersionText
+    model: ModelIdentifier
     prompt_policy_version: _VersionText
 
     @model_validator(mode="after")
@@ -144,7 +156,17 @@ class InvestigationCompletedV1(_StrictFrozenModel):
         return self
 
 
-type AuditPayloadV1 = ExecutionStartedV1 | InvestigationCompletedV1
+class ExecutionFailedV1(_StrictFrozenModel):
+    error_code: ErrorCode
+    failure_stage: AuditFailureStage
+    server_version: _VersionText
+    runtime_name: _VersionText
+    runtime_version: _VersionText
+    model: ModelIdentifier
+    prompt_policy_version: _VersionText
+
+
+type AuditPayloadV1 = ExecutionStartedV1 | InvestigationCompletedV1 | ExecutionFailedV1
 
 
 class AuditEventV1(_StrictFrozenModel):
@@ -164,10 +186,13 @@ class AuditEventV1(_StrictFrozenModel):
             self.sequence != 1 or not isinstance(self.payload, ExecutionStartedV1)
         )
         invalid_completion = self.event_type is AuditEventType.INVESTIGATION_COMPLETED and (
-            self.sequence != _COMPLETION_SEQUENCE
+            self.sequence != _TERMINAL_SEQUENCE
             or not isinstance(self.payload, InvestigationCompletedV1)
         )
-        if invalid_start or invalid_completion:
+        invalid_failure = self.event_type is AuditEventType.EXECUTION_FAILED and (
+            self.sequence != _TERMINAL_SEQUENCE or not isinstance(self.payload, ExecutionFailedV1)
+        )
+        if invalid_start or invalid_completion or invalid_failure:
             raise ValueError("Audit event type, sequence, and payload do not agree")
         if self.occurred_at.tzinfo is None or self.occurred_at.utcoffset() is None:
             raise ValueError("Audit event timestamps must be timezone-aware")
@@ -215,4 +240,14 @@ class AuditInvestigationCompletionV1(_StrictFrozenModel):
     def validate_type(self) -> Self:
         if self.event.event_type is not AuditEventType.INVESTIGATION_COMPLETED:
             raise ValueError("completion record requires investigation.completed")
+        return self
+
+
+class AuditExecutionFailureV1(_StrictFrozenModel):
+    event: AuditEventV1
+
+    @model_validator(mode="after")
+    def validate_type(self) -> Self:
+        if self.event.event_type is not AuditEventType.EXECUTION_FAILED:
+            raise ValueError("failure record requires execution.failed")
         return self

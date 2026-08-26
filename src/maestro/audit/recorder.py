@@ -9,7 +9,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import NoReturn
+from typing import NoReturn, TypedDict
 from uuid import UUID, uuid4
 
 from pydantic import ValidationError
@@ -20,16 +20,20 @@ from maestro.audit.contracts import (
     AuditEventType,
     AuditEventV1,
     AuditEvidenceV1,
+    AuditExecutionFailureV1,
     AuditExecutionStartV1,
     AuditExecutionV1,
+    AuditFailureStage,
     AuditInvestigationCompletionV1,
     AuditResultStatus,
+    ExecutionFailedV1,
     ExecutionStartedV1,
     InvestigationCompletedV1,
 )
 from maestro.audit.port import AuditPort, AuditWriteError, AuditWriteFailureKind
 from maestro.audit.sanitization import sanitize_audit_text
-from maestro.errors import AuditPersistenceError, AuditUnavailableError, MaestroError
+from maestro.errors import AuditPersistenceError, AuditUnavailableError, ErrorCode, MaestroError
+from maestro.model_identity import ModelIdentifier
 from maestro.repository.guard import AuthorizedRepository, RepositoryFingerprint
 
 _LOGGER = logging.getLogger("maestro.audit")
@@ -65,7 +69,15 @@ class AuditRuntimeMetadata:
     server_version: str
     runtime_name: str
     runtime_version: str
-    model: str
+    model: ModelIdentifier
+    prompt_policy_version: str
+
+
+class _MetadataFields(TypedDict):
+    server_version: str
+    runtime_name: str
+    runtime_version: str
+    model: ModelIdentifier
     prompt_policy_version: str
 
 
@@ -102,11 +114,11 @@ class AuditInvestigationCompletionInput:
 
 @dataclass(frozen=True, slots=True)
 class AuditExecutionHandle:
-    """Stable identities generated once for one successful-tracer lifecycle."""
+    """Stable identities generated once for one audited execution lifecycle."""
 
     audit_id: UUID
     execution_id: UUID
-    completion_event_id: UUID
+    terminal_event_id: UUID
 
 
 class AuditRecorder:
@@ -138,7 +150,7 @@ class AuditRecorder:
         handle = AuditExecutionHandle(
             audit_id=self._id_factory(),
             execution_id=self._id_factory(),
-            completion_event_id=self._id_factory(),
+            terminal_event_id=self._id_factory(),
         )
         sanitized_objective = sanitize_audit_text(objective, repository.root)
         try:
@@ -186,7 +198,7 @@ class AuditRecorder:
                 **self._metadata_fields(),
             )
             event = AuditEventV1(
-                event_id=handle.completion_event_id,
+                event_id=handle.terminal_event_id,
                 audit_id=handle.audit_id,
                 sequence=2,
                 event_type=AuditEventType.INVESTIGATION_COMPLETED,
@@ -197,6 +209,37 @@ class AuditRecorder:
         except ValidationError:
             self._raise_public(AuditPersistenceError(), "completion", 0)
         await self._persist("completion", lambda: self._port.complete_investigation(record))
+
+    async def record_execution_failed(
+        self,
+        handle: AuditExecutionHandle,
+        error_code: ErrorCode,
+        failure_stage: AuditFailureStage,
+    ) -> None:
+        """Persist one safe typed operational failure as the sequence-two terminal event."""
+
+        try:
+            event = AuditEventV1(
+                event_id=handle.terminal_event_id,
+                audit_id=handle.audit_id,
+                sequence=2,
+                event_type=AuditEventType.EXECUTION_FAILED,
+                occurred_at=self._clock(),
+                payload=ExecutionFailedV1(
+                    error_code=error_code,
+                    failure_stage=failure_stage,
+                    **self._metadata_fields(),
+                ),
+            )
+            record = AuditExecutionFailureV1(event=event)
+        except ValidationError:
+            self._raise_public(AuditPersistenceError(), "failure", 0)
+        await self._persist("failure", lambda: self._port.fail_execution(record))
+
+    def abort_execution_failure(self, handle: AuditExecutionHandle) -> None:
+        """Abort only this execution's active failure write without awaiting adapter I/O."""
+
+        self._port.abort_execution_failure(handle.terminal_event_id)
 
     async def _persist(self, operation_name: str, operation: _PersistenceOperation) -> None:
         policy = _AUDIT_RETRY_POLICY
@@ -275,7 +318,7 @@ class AuditRecorder:
         )
         raise error from None
 
-    def _metadata_fields(self) -> dict[str, str]:
+    def _metadata_fields(self) -> _MetadataFields:
         return {
             "server_version": self._metadata.server_version,
             "runtime_name": self._metadata.runtime_name,

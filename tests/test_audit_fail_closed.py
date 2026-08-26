@@ -144,6 +144,7 @@ async def test_completion_failure_withholds_result_without_failure_event(
     assert len(port.starts) == 1
     assert len(port.completion_attempts) == attempts
     assert port.completions == []
+    assert port.failure_attempts == []
 
 
 @pytest.mark.asyncio

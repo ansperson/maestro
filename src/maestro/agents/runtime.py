@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Protocol
 
 from maestro.capabilities.resolve_codebase_fact.contracts import VerificationResult
+from maestro.model_identity import ModelIdentifier
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,7 +19,7 @@ class InvestigationRequest:
     question: str
     context: str | None
     repository_fingerprint: str
-    model: str
+    model: ModelIdentifier
     max_output_bytes: int
 
 

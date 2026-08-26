@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
+from dataclasses import dataclass
+from uuid import UUID
 
 from psycopg import AsyncConnection, Error as PsycopgError, OperationalError
 from psycopg.types.json import Jsonb
@@ -11,16 +14,42 @@ from pydantic import SecretStr
 
 from maestro.audit.contracts import (
     AuditEventV1,
+    AuditExecutionFailureV1,
     AuditExecutionStartV1,
     AuditInvestigationCompletionV1,
 )
 from maestro.audit.port import AuditWriteError, AuditWriteFailureKind
 
-_SUPPORTED_SCHEMA_VERSION = 1
+_SUPPORTED_SCHEMA_VERSION = 2
 _RETRYABLE_SQLSTATES = frozenset({"40001", "40P01", "53300", "57P01", "57P02", "57P03"})
 _TRANSACTION_ABORT_SQLSTATES = frozenset({"40001", "40P01"})
 
 type _TransactionOperation = Callable[[AsyncConnection[tuple[object, ...]]], Awaitable[None]]
+type _ConnectionReady = Callable[[AsyncConnection[tuple[object, ...]]], None]
+
+
+@dataclass(slots=True)
+class _ActiveFailureWrite:
+    """Event-loop-owned state for synchronously aborting one failure write."""
+
+    connection: AsyncConnection[tuple[object, ...]] | None = None
+    abort_requested: bool = False
+
+    def attach(self, connection: AsyncConnection[tuple[object, ...]]) -> None:
+        self.connection = connection
+        if self.abort_requested:
+            self._finish_connection()
+            raise AuditWriteError(AuditWriteFailureKind.RETRYABLE_NOT_COMMITTED)
+
+    def abort(self) -> None:
+        self.abort_requested = True
+        self._finish_connection()
+
+    def _finish_connection(self) -> None:
+        if self.connection is None:
+            return
+        with suppress(Exception):
+            self.connection.pgconn.finish()
 
 
 class PostgresAuditPort:
@@ -28,6 +57,7 @@ class PostgresAuditPort:
 
     def __init__(self, database_url: SecretStr) -> None:
         self._database_url = database_url
+        self._active_failure_writes: dict[UUID, _ActiveFailureWrite] = {}
 
     async def start_execution(self, record: AuditExecutionStartV1) -> None:
         """Atomically insert the execution row and sequence-one start event."""
@@ -65,8 +95,43 @@ class PostgresAuditPort:
 
         await _run_transaction(self._database_url.get_secret_value(), write)
 
+    async def fail_execution(self, record: AuditExecutionFailureV1) -> None:
+        """Insert the single sequence-two operational failure in a short transaction."""
 
-async def _run_transaction(database_url: str, operation: _TransactionOperation) -> None:
+        event_id = record.event.event_id
+        if event_id in self._active_failure_writes:
+            raise AuditWriteError(AuditWriteFailureKind.PERMANENT)
+        active = _ActiveFailureWrite()
+        self._active_failure_writes[event_id] = active
+
+        async def write(connection: AsyncConnection[tuple[object, ...]]) -> None:
+            await _verify_schema(connection)
+            await _insert_event(connection, record.event)
+
+        try:
+            await _run_transaction(
+                self._database_url.get_secret_value(),
+                write,
+                connection_ready=active.attach,
+            )
+        finally:
+            if self._active_failure_writes.get(event_id) is active:
+                del self._active_failure_writes[event_id]
+
+    def abort_execution_failure(self, event_id: UUID) -> None:
+        """Synchronously finish the active libpq connection for one failure write."""
+
+        active = self._active_failure_writes.get(event_id)
+        if active is not None:
+            active.abort()
+
+
+async def _run_transaction(
+    database_url: str,
+    operation: _TransactionOperation,
+    *,
+    connection_ready: _ConnectionReady | None = None,
+) -> None:
     try:
         connection = await AsyncConnection.connect(database_url)
     except asyncio.CancelledError:
@@ -78,6 +143,8 @@ async def _run_transaction(database_url: str, operation: _TransactionOperation) 
     body_completed = False
     try:
         try:
+            if connection_ready is not None:
+                connection_ready(connection)
             async with connection.transaction():
                 await operation(connection)
                 body_completed = True
