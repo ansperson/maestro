@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -51,9 +53,7 @@ def test_settings_reject_incoherent_file_limits(tmp_path: Path) -> None:
 
 def test_settings_reject_missing_root_and_auth_symlink(tmp_path: Path) -> None:
     with pytest.raises(ValidationError, match="does not exist"):
-        Settings(  # pyright: ignore[reportCallIssue] - values come from BaseSettings
-            allowed_roots=(tmp_path / "missing",)
-        )
+        Settings(allowed_roots=(tmp_path / "missing",))  # pyright: ignore[reportCallIssue]
     auth = tmp_path / "auth.json"
     auth.write_text("{}", encoding="utf-8")
     link = tmp_path / "auth-link.json"
@@ -149,16 +149,30 @@ def test_settings_requires_writer_user_and_password_file(
         )
 
 
-def test_legacy_or_indirect_conninfo_cannot_bypass_writer_password_file(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "legacy_value",
+    ["", "service=private-service password=private-value passfile=/private/password"],
+)
+def test_settings_rejects_legacy_audit_database_url_even_with_typed_writer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    legacy_value: str,
 ) -> None:
-    monkeypatch.delenv("MAESTRO_AUDIT_WRITER_PASSWORD_FILE")
-    monkeypatch.setenv(
-        "MAESTRO_AUDIT_DATABASE_URL",
-        "service=private-service password=private-value passfile=/private/password",
-    )
-    with pytest.raises(ValidationError, match="password_file") as error:
-        Settings(allowed_roots=(tmp_path,))  # pyright: ignore[reportCallIssue]
+    allowed_root = tmp_path / "repository"
+    allowed_root.mkdir()
+    monkeypatch.setenv("MAESTRO_AUDIT_DATABASE_URL", legacy_value)
+    with pytest.raises(ValidationError, match="MAESTRO_AUDIT_DATABASE_URL") as error:
+        Settings.model_validate(
+            {
+                "allowed_roots": (allowed_root,),
+                "audit_writer": {
+                    "host": "audit-postgres",
+                    "database": "maestro_audit",
+                    "user": "audit_writer",
+                    "password_file": _password_file(tmp_path),
+                },
+            }
+        )
     rendered = str(error.value)
     assert "private-service" not in rendered
     assert "private-value" not in rendered
@@ -199,6 +213,51 @@ def test_role_settings_forbid_non_file_credential_inputs(
     with pytest.raises(ValidationError, match="Extra inputs are not permitted") as error:
         config_module.AuditWriterSettings.model_validate(payload)
     assert "private-value" not in str(error.value)
+
+
+def test_libpq_environment_denylist_covers_every_driver_advertised_variable() -> None:
+    advertised = {
+        option.envvar.decode("ascii")
+        for option in config_module.pq.Conninfo.get_defaults()
+        if option.envvar is not None
+    }
+    configured = config_module._LIBPQ_ENVIRONMENT_NAMES  # pyright: ignore[reportPrivateUsage]
+
+    assert advertised <= configured
+    assert {"PGSERVICEFILE", "PGSYSCONFDIR"} <= configured
+
+
+@pytest.mark.parametrize(
+    ("variable", "private_value"),
+    [
+        ("PGSERVICE", "private-service"),
+        ("PGOPTIONS", "-c search_path=private_schema"),
+        ("PGPASSFILE", "/private/passfile"),
+        ("PGSSLMODE", "disable"),
+        ("PGSSLKEY", "/private/client-key"),
+        ("PGTARGETSESSIONATTRS", "read-write"),
+        ("PGSERVICEFILE", "/private/service-file"),
+        ("PGSYSCONFDIR", "/private/system-config"),
+        ("pgservice", "case-variant-private-service"),
+    ],
+)
+def test_role_settings_reject_ambient_libpq_families_without_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    variable: str,
+    private_value: str,
+) -> None:
+    monkeypatch.setenv(variable, private_value)
+
+    with pytest.raises(ValidationError, match="Ambient libpq configuration") as error:
+        config_module.AuditWriterSettings(
+            user="audit_writer",
+            password_file=_password_file(tmp_path),
+        )
+
+    rendered = str(error.value)
+    assert variable not in rendered
+    assert private_value not in rendered
 
 
 @pytest.mark.parametrize(
@@ -250,6 +309,34 @@ def test_writer_secret_file_rejects_unreadable_input_without_path_or_secret(
     assert "private driver detail" not in rendered
 
 
+def test_writer_secret_file_rejects_device_metadata_before_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = _password_file(tmp_path)
+    real_lstat = config_module.os.lstat
+    open_called = False
+
+    def device_lstat(candidate: Path) -> os.stat_result:
+        metadata = real_lstat(candidate)
+        values = list(metadata)
+        values[0] = config_module.stat.S_IFCHR | 0o600
+        return os.stat_result(values)
+
+    def track_open(_candidate: Path, _flags: int) -> int:
+        nonlocal open_called
+        open_called = True
+        raise AssertionError("non-regular password source reached open")
+
+    monkeypatch.setattr(config_module.os, "lstat", device_lstat)
+    monkeypatch.setattr(config_module.os, "open", track_open)
+
+    with pytest.raises(ValueError, match="regular"):
+        config_module._read_audit_password(path)  # pyright: ignore[reportPrivateUsage]
+
+    assert open_called is False
+
+
 def test_writer_secret_file_rejects_wrong_owner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -267,6 +354,39 @@ def test_writer_secret_file_rejects_wrong_owner(
     monkeypatch.setattr(config_module.os, "fstat", wrong_owner)
     with pytest.raises(ValidationError, match="owned by"):
         config_module.AuditWriterSettings(user="audit_writer", password_file=path)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO security probe requires POSIX")
+@pytest.mark.parametrize("mode", ["fixed-fifo", "replacement-fifo"])
+def test_writer_secret_file_fifo_cases_fail_fast_and_child_is_reaped(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    path = tmp_path / "writer-password-source"
+    if mode == "fixed-fifo":
+        os.mkfifo(path, mode=0o600)
+    else:
+        path.write_text("synthetic-password", encoding="utf-8")
+        path.chmod(0o600)
+    helper = Path(__file__).parent / "helpers" / "audit_password_probe.py"
+    process = subprocess.Popen(
+        [sys.executable, str(helper), mode, str(path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        close_fds=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=2)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.communicate()
+        pytest.fail("Audit password-file validation blocked on a non-regular source")
+
+    assert process.returncode == 0
+    assert process.poll() is not None
+    assert stdout == ""
+    assert stderr == ""
 
 
 def test_writer_projection_revalidates_secret_file_after_settings_construction(
@@ -312,6 +432,79 @@ def test_writer_secret_file_accepts_owner_only_modes_and_one_trailing_newline(
     ).connection_configuration()
     assert configuration.password.get_secret_value() == "synthetic-password"
     assert str(path) not in repr(configuration)
+
+
+def test_audit_role_and_projection_repr_hide_all_connection_inputs(tmp_path: Path) -> None:
+    private_host = "private-audit.internal"
+    private_port = 6543
+    private_database = "maestro_private"
+    private_user = "audit_writer_private"
+    private_password = "private-writer-value"  # noqa: S105  # pragma: allowlist secret
+    private_values: tuple[str | int, ...] = (
+        private_host,
+        private_port,
+        private_database,
+        private_user,
+        private_password,
+    )
+    password_path = _password_file(tmp_path, private_password)
+    settings = config_module.AuditWriterSettings(
+        host=private_host,
+        port=private_port,
+        database=private_database,
+        user=private_user,
+        password_file=password_path,
+    )
+    projection = settings.connection_configuration()
+    rendered = f"{settings!r} {projection!r}"
+
+    for value in (*private_values, str(password_path)):
+        assert str(value) not in rendered
+
+
+def test_direct_audit_projection_validation_hides_uri_and_all_other_inputs() -> None:
+    private_uri = (
+        "postgresql://private-user:"
+        "private-password@private-audit/maestro"  # pragma: allowlist secret
+    )
+    private_values: dict[str, object] = {
+        "host": private_uri,
+        "port": 6543,
+        "database": "maestro_private",
+        "user": "audit_writer_private",
+        "password": "private-writer-value",  # pragma: allowlist secret
+    }
+
+    with pytest.raises(ValidationError, match="host is invalid") as error:
+        config_module.AuditWriterConfiguration.model_validate(private_values)
+
+    rendered = str(error.value)
+    for value in private_values.values():
+        assert str(value) not in rendered
+
+
+def test_role_settings_validation_hides_uri_endpoint_identity_and_password_path(
+    tmp_path: Path,
+) -> None:
+    password_path = _password_file(tmp_path, "private-writer-value")
+    private_uri = (
+        "postgresql://private-user:"
+        "private-password@private-audit/maestro"  # pragma: allowlist secret
+    )
+    private_values: dict[str, object] = {
+        "host": private_uri,
+        "port": 6543,
+        "database": "maestro_private",
+        "user": "audit_writer_private",
+        "password_file": password_path,
+    }
+
+    with pytest.raises(ValidationError, match="host is invalid") as error:
+        config_module.AuditWriterSettings.model_validate(private_values)
+
+    rendered = str(error.value)
+    for value in private_values.values():
+        assert str(value) not in rendered
 
 
 @pytest.mark.parametrize(

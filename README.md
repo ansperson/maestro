@@ -51,7 +51,7 @@ cp .env.example .env  # copy values into your launcher; Maestro does not load th
 MAESTRO_ALLOWED_ROOTS=/absolute/repository/root \
 MAESTRO_CODEX_AUTH_FILE=/absolute/path/to/codex-auth.json \
 MAESTRO_AUDIT_WRITER_HOST=localhost \
-MAESTRO_AUDIT_WRITER_USER=audit_writer \
+MAESTRO_AUDIT_WRITER_USER=maestro_audit_writer \
 MAESTRO_AUDIT_WRITER_PASSWORD_FILE=/absolute/path/to/audit-writer-password \
 uv run maestro
 ```
@@ -62,15 +62,20 @@ the anchor itself (`/` on POSIX, or the platform equivalent) is rejected. Config
 one explicit Codex authentication source:
 `MAESTRO_CODEX_AUTH_FILE` or `MAESTRO_CODEX_API_KEY`. Neither is inherited by repository
 shell commands. Audit writer host, port, database, user, and password-file settings are also
-required. The password file must be an owner-owned, regular, non-symlink file with mode `0400` or
-`0600`, contain 1–4096 bytes of UTF-8 password data, and remain outside every configured allowed
-root. Maestro
-does not accept a password-bearing DSN, `service`, or passfile indirection. It validates and
-reads the password at startup, checks connectivity lazily when an audited call starts, and never
-applies migrations automatically. Bootstrap, migration-owner, writer, and SELECT-only reader
-settings use distinct `MAESTRO_AUDIT_<ROLE>_*` namespaces; the normal runtime loads only the
-writer projection. stdout is reserved for newline-delimited MCP protocol messages; structured
-JSON application logs go to stderr.
+required. On the supported POSIX native/container boundary, the password file must be an
+owner-owned, regular, non-symlink file with mode `0400` or `0600`, contain 1–4096 bytes of UTF-8
+password data, and remain outside every configured allowed root. Its no-follow open is
+nonblocking, then identity, type, owner, mode, and size are checked again through the descriptor.
+Maestro rejects the removed `MAESTRO_AUDIT_DATABASE_URL`, password-bearing DSNs, and every
+ambient libpq connection variable advertised by the installed driver, plus `PGSERVICEFILE` and
+`PGSYSCONFDIR`. Connection service, passfile, options, TLS/GSS, target-session, and other behavior
+therefore cannot supplement the typed projection. These checks run at startup, projection, and
+immediately before each connection. Maestro reads the password at startup, checks connectivity
+lazily when an audited call starts, and never applies migrations automatically. Bootstrap,
+migration-owner, writer, and SELECT-only reader settings use distinct
+`MAESTRO_AUDIT_<ROLE>_*` namespaces; the normal runtime loads only the writer projection. stdout
+is reserved for newline-delimited MCP protocol messages; structured JSON application logs go to
+stderr.
 
 Audit PostgreSQL bootstrap, forward-only migrations, least-privilege role boundaries, and curated
 reader queries are documented in [`docs/audit-postgresql.md`](docs/audit-postgresql.md). Keep the
@@ -87,7 +92,7 @@ An MCP client configuration can launch the server with `uv`:
     "MAESTRO_ALLOWED_ROOTS": "/absolute/repository/root",
     "MAESTRO_CODEX_AUTH_FILE": "/absolute/path/to/codex-auth.json",
     "MAESTRO_AUDIT_WRITER_HOST": "localhost",
-    "MAESTRO_AUDIT_WRITER_USER": "audit_writer",
+    "MAESTRO_AUDIT_WRITER_USER": "maestro_audit_writer",
     "MAESTRO_AUDIT_WRITER_PASSWORD_FILE": "/absolute/path/to/audit-writer-password"
   }
 }
@@ -295,7 +300,7 @@ npx --yes @modelcontextprotocol/inspector@2.2.0 --cli \
   /absolute/path/to/maestro/.venv/bin/maestro \
   -e MAESTRO_ALLOWED_ROOTS=/absolute/repository/root -e MAESTRO_LOG_LEVEL=WARNING \
   -e MAESTRO_AUDIT_WRITER_HOST=127.0.0.1 -e MAESTRO_AUDIT_WRITER_PORT=1 \
-  -e MAESTRO_AUDIT_WRITER_USER=audit_writer \
+  -e MAESTRO_AUDIT_WRITER_USER=maestro_audit_writer \
   -e MAESTRO_AUDIT_WRITER_PASSWORD_FILE=/absolute/path/to/owner-only-test-password \
   --method tools/list --format json
 ```

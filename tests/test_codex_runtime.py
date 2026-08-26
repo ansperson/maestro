@@ -107,10 +107,10 @@ async def test_runtime_excludes_audit_values_and_inheritable_descriptors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     report_path = tmp_path / "audit-boundary-report.json"
-    monkeypatch.setenv("PGPASSWORD", "must-not-cross-boundary")
-    monkeypatch.setenv("PGPASSFILE", "/must/not/cross")
     settings = settings_factory(allowed_roots=(repository,))
     writer = settings.audit_writer_configuration()
+    monkeypatch.setenv("PGPASSWORD", "must-not-cross-boundary")
+    monkeypatch.setenv("PGPASSFILE", "/must/not/cross")
     inherited_descriptor, peer_descriptor = os.pipe()
     os.set_inheritable(inherited_descriptor, True)
     runtime = CodexAgentRuntime(

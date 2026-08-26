@@ -19,7 +19,7 @@ from maestro.audit.contracts import (
     AuditInvestigationCompletionV1,
 )
 from maestro.audit.port import AuditWriteError, AuditWriteFailureKind
-from maestro.config import AuditWriterConfiguration
+from maestro.config import AuditWriterConfiguration, validate_audit_libpq_environment
 
 _SUPPORTED_SCHEMA_VERSION = 3
 _RETRYABLE_SQLSTATES = frozenset({"40001", "40P01", "53300", "57P01", "57P02", "57P03"})
@@ -137,6 +137,7 @@ async def _run_transaction(
     connection_ready: _ConnectionReady | None = None,
 ) -> None:
     try:
+        validate_audit_libpq_environment()
         connection = await AsyncConnection.connect(
             host=configuration.host,
             port=configuration.port,

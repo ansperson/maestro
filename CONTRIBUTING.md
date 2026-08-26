@@ -94,14 +94,14 @@ AUDIT_PASSWORD_FILE=/absolute/path/to/owner-only-test-password
 npx --yes @modelcontextprotocol/inspector@2.2.0 --cli "$SERVER" \
   -e MAESTRO_ALLOWED_ROOTS="$REPOSITORY" -e MAESTRO_LOG_LEVEL=WARNING \
   -e MAESTRO_AUDIT_WRITER_HOST=127.0.0.1 -e MAESTRO_AUDIT_WRITER_PORT=1 \
-  -e MAESTRO_AUDIT_WRITER_USER=audit_writer \
+  -e MAESTRO_AUDIT_WRITER_USER=maestro_audit_writer \
   -e MAESTRO_AUDIT_WRITER_PASSWORD_FILE="$AUDIT_PASSWORD_FILE" \
   --method tools/list --format json
 
 npx --yes @modelcontextprotocol/inspector@2.2.0 --cli "$SERVER" \
   -e MAESTRO_ALLOWED_ROOTS="$REPOSITORY" -e MAESTRO_LOG_LEVEL=WARNING \
   -e MAESTRO_AUDIT_WRITER_HOST=127.0.0.1 -e MAESTRO_AUDIT_WRITER_PORT=1 \
-  -e MAESTRO_AUDIT_WRITER_USER=audit_writer \
+  -e MAESTRO_AUDIT_WRITER_USER=maestro_audit_writer \
   -e MAESTRO_AUDIT_WRITER_PASSWORD_FILE="$AUDIT_PASSWORD_FILE" \
   --method tools/call --tool-name resolve_codebase_fact \
   --tool-args-json "{\"repository_path\":\"$REPOSITORY\",\"question\":\"Should an Order support multiple Payments?\"}" \
@@ -110,7 +110,7 @@ npx --yes @modelcontextprotocol/inspector@2.2.0 --cli "$SERVER" \
 npx --yes @modelcontextprotocol/inspector@2.2.0 --cli "$SERVER" \
   -e MAESTRO_ALLOWED_ROOTS="$REPOSITORY" -e MAESTRO_LOG_LEVEL=WARNING \
   -e MAESTRO_AUDIT_WRITER_HOST=127.0.0.1 -e MAESTRO_AUDIT_WRITER_PORT=1 \
-  -e MAESTRO_AUDIT_WRITER_USER=audit_writer \
+  -e MAESTRO_AUDIT_WRITER_USER=maestro_audit_writer \
   -e MAESTRO_AUDIT_WRITER_PASSWORD_FILE="$AUDIT_PASSWORD_FILE" \
   --method tools/call --tool-name resolve_codebase_fact --tool-args-json '{}' --format json
 ```

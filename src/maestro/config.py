@@ -9,6 +9,7 @@ from ipaddress import ip_address
 from pathlib import Path
 from typing import Annotated, Self
 
+from psycopg import pq
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -23,6 +24,19 @@ _MAX_AUDIT_PASSWORD_BYTES = 4_096
 _MAX_POSTGRES_HOST_CHARS = 253
 _POSTGRES_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,62}\Z")
 _DNS_LABEL_PATTERN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z")
+_LEGACY_AUDIT_DATABASE_URL = "MAESTRO_AUDIT_DATABASE_URL"
+
+
+def _libpq_environment_names() -> frozenset[str]:
+    advertised = {
+        option.envvar.decode("ascii")
+        for option in pq.Conninfo.get_defaults()
+        if option.envvar is not None
+    }
+    return frozenset((*advertised, "PGSERVICEFILE", "PGSYSCONFDIR"))
+
+
+_LIBPQ_ENVIRONMENT_NAMES = _libpq_environment_names()
 
 
 class CodexRuntimeConfiguration(BaseModel):
@@ -37,12 +51,17 @@ class CodexRuntimeConfiguration(BaseModel):
 class _AuditConnectionConfiguration(BaseModel):
     """Validated connection values for one explicitly scoped PostgreSQL role."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        strict=True,
+        hide_input_in_errors=True,
+    )
 
-    host: str
-    port: Annotated[int, Field(ge=1, le=65_535)]
-    database: str
-    user: str
+    host: str = Field(repr=False)
+    port: Annotated[int, Field(ge=1, le=65_535, repr=False)]
+    database: str = Field(repr=False)
+    user: str = Field(repr=False)
     password: SecretStr = Field(repr=False)
 
     @field_validator("host")
@@ -54,6 +73,11 @@ class _AuditConnectionConfiguration(BaseModel):
     @classmethod
     def validate_identifier(_cls, value: str) -> str:  # noqa: N804
         return _validate_audit_postgres_identifier(value)
+
+    @model_validator(mode="after")
+    def reject_ambient_libpq_configuration(self) -> Self:
+        validate_audit_libpq_environment()
+        return self
 
 
 class AuditBootstrapConfiguration(_AuditConnectionConfiguration):
@@ -81,10 +105,10 @@ class _AuditRoleSettings(BaseSettings):
         case_sensitive=False,
     )
 
-    host: Annotated[str, Field(min_length=1, max_length=253)] = "localhost"
-    port: Annotated[int, Field(ge=1, le=65_535)] = 5432
-    database: Annotated[str, Field(min_length=1, max_length=63)] = "maestro"
-    user: Annotated[str, Field(min_length=1, max_length=63)]
+    host: Annotated[str, Field(min_length=1, max_length=253, repr=False)] = "localhost"
+    port: Annotated[int, Field(ge=1, le=65_535, repr=False)] = 5432
+    database: Annotated[str, Field(min_length=1, max_length=63, repr=False)] = "maestro"
+    user: Annotated[str, Field(min_length=1, max_length=63, repr=False)]
     password_file: Path = Field(exclude=True, repr=False)
 
     @field_validator("host")
@@ -109,6 +133,11 @@ class _AuditRoleSettings(BaseSettings):
         canonical = _canonical_secret_file(value)
         _read_audit_password(canonical)
         return canonical
+
+    @model_validator(mode="after")
+    def reject_ambient_libpq_configuration(self) -> Self:
+        validate_audit_libpq_environment()
+        return self
 
     def _connection_values(self) -> dict[str, object]:
         return {
@@ -211,6 +240,12 @@ class Settings(BaseSettings):
     audit_writer: AuditWriterSettings = Field(
         default_factory=_load_audit_writer_settings, exclude=True, repr=False
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_legacy_audit_database_url(_cls, value: object) -> object:  # noqa: N804
+        _reject_legacy_audit_database_url()
+        return value
 
     @field_validator("allowed_roots", mode="before")
     @classmethod
@@ -333,7 +368,21 @@ def _validate_audit_postgres_identifier(value: str) -> str:
     return value
 
 
+def validate_audit_libpq_environment() -> None:
+    """Reject ambient libpq inputs so typed Audit projections are connection-complete."""
+
+    if any(name.upper() in _LIBPQ_ENVIRONMENT_NAMES for name in os.environ):
+        raise ValueError("Ambient libpq configuration is not permitted for Audit")
+
+
+def _reject_legacy_audit_database_url() -> None:
+    if any(name.upper() == _LEGACY_AUDIT_DATABASE_URL for name in os.environ):
+        raise ValueError(f"{_LEGACY_AUDIT_DATABASE_URL} is no longer supported")
+
+
 def _canonical_secret_file(path: Path) -> Path:
+    if os.name != "posix":
+        raise ValueError("Audit password file controls require a POSIX platform")
     try:
         candidate = path.parent.resolve(strict=True) / path.name
         metadata = os.lstat(candidate)
@@ -341,17 +390,26 @@ def _canonical_secret_file(path: Path) -> Path:
         raise ValueError("Audit password file is unavailable") from None
     if stat.S_ISLNK(metadata.st_mode):
         raise ValueError("Audit password file must be a regular non-symlink file")
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ValueError("Audit password file must be regular")
     return candidate
 
 
 def _read_audit_password(path: Path) -> SecretStr:
     """Read one bounded owner-only password without following symlinks or leaking details."""
 
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     try:
         expected = os.lstat(path)
         if stat.S_ISLNK(expected.st_mode):
             raise ValueError("Audit password file must be a regular non-symlink file")
+        if not stat.S_ISREG(expected.st_mode):
+            raise ValueError("Audit password file must be regular")
         descriptor = os.open(path, flags)
     except OSError:
         raise ValueError("Audit password file is unavailable") from None
@@ -371,11 +429,10 @@ def _read_audit_password(path: Path) -> SecretStr:
 def _validate_audit_password_metadata(metadata: os.stat_result) -> None:
     if not stat.S_ISREG(metadata.st_mode):
         raise ValueError("Audit password file must be regular")
-    if os.name == "posix":
-        if metadata.st_uid != os.geteuid():
-            raise ValueError("Audit password file must be owned by the Maestro user")
-        if stat.S_IMODE(metadata.st_mode) not in {0o400, 0o600}:
-            raise ValueError("Audit password file permissions must be owner-only")
+    if metadata.st_uid != os.geteuid():
+        raise ValueError("Audit password file must be owned by the Maestro user")
+    if stat.S_IMODE(metadata.st_mode) not in {0o400, 0o600}:
+        raise ValueError("Audit password file permissions must be owner-only")
     if metadata.st_size > _MAX_AUDIT_PASSWORD_BYTES:
         raise ValueError("Audit password file is oversized")
 

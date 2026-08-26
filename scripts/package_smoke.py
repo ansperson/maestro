@@ -27,7 +27,7 @@ async def run(executable: Path, repository: Path) -> None:
                 "MAESTRO_ALLOWED_ROOTS": str(repository),
                 "MAESTRO_AUDIT_WRITER_HOST": "127.0.0.1",
                 "MAESTRO_AUDIT_WRITER_PORT": "1",
-                "MAESTRO_AUDIT_WRITER_USER": "audit_writer",
+                "MAESTRO_AUDIT_WRITER_USER": "maestro_audit_writer",
                 "MAESTRO_AUDIT_WRITER_PASSWORD_FILE": str(password_file),
                 "MAESTRO_LOG_LEVEL": "WARNING",
             },

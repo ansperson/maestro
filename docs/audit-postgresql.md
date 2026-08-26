@@ -41,8 +41,11 @@ Consequently, writer and reader sessions cannot create schemas or temporary tabl
 migration owns all Audit objects as the migrator, grants no role memberships, installs restrictive
 default privileges, and grants each runtime privilege explicitly.
 
-Normal Maestro startup must use only the writer DSN and never applies bootstrap or migration SQL.
-Keep the administrator, migrator, writer, and reader connection material separate.
+Normal Maestro startup accepts only the writer's typed host, port, database, user, and owner-only
+password-file settings; it rejects DSNs and ambient libpq connection variables and never applies
+bootstrap or migration SQL. Keep administrator, migrator, writer, and reader connection material
+separate. The `ADMIN_DSN` and `MIGRATOR_DSN` examples above are operator-only `psql` inputs, not
+Maestro application configuration.
 
 ## Forward upgrade from schema v2
 

@@ -43,13 +43,17 @@ latter exists only in the worker process and is omitted from its shell environme
 state is removed on success, failure, timeout, and cancellation on a best-effort basis.
 
 The Audit writer password is loaded at startup only from a bounded UTF-8 regular, non-symlink file
-owned by the Maestro user with mode `0400` or `0600`. Password-bearing DSNs, libpq service/passfile
-indirection, and password command arguments are not accepted. Bootstrap, migration-owner, writer,
-and reader settings and password files are distinct; normal Maestro runtime receives only the
-writer projection. Audit credentials and paths are excluded from the worker environment, argv,
-stdin request, temporary Codex configuration, prompt, and provider inputs. Configuration,
-subprocess, and adapter errors expose only safe categories, not paths, endpoints, SQL, or driver
-diagnostics.
+owned by the Maestro user with mode `0400` or `0600` on the supported POSIX boundary. Maestro
+opens it no-follow, close-on-exec, and nonblocking, then rechecks descriptor identity, type,
+ownership, mode, and size. Password-bearing DSNs, the removed legacy Audit URL, ambient
+driver-advertised libpq variables, `PGSERVICEFILE`, `PGSYSCONFDIR`, service/passfile indirection,
+and password command arguments are rejected. The environment check repeats immediately before
+every connection and never mutates process-global state. Bootstrap, migration-owner, writer, and
+reader settings and password files are distinct; normal Maestro runtime receives only the writer
+projection. Audit credentials and paths are excluded from the worker environment, argv, stdin
+request, temporary Codex configuration, prompt, and provider inputs. Audit settings/projections
+render no endpoint or identity fields; configuration, subprocess, and adapter errors expose only
+safe categories, not paths, endpoints, SQL, or driver diagnostics.
 
 In hardened container mode, mount only the dedicated authentication file read-only. Do not mount
 a complete home or `.codex` directory. File authentication is preferred because an API key passed

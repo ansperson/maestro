@@ -383,6 +383,73 @@ async def test_adapter_passes_only_typed_fields_and_ephemeral_password_to_driver
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("variable", "private_value"),
+    [
+        ("PGSERVICE", "private-service"),
+        ("PGOPTIONS", "-c search_path=private_schema"),
+        ("PGPASSFILE", "/private/passfile"),
+        ("PGSSLMODE", "disable"),
+        ("PGSERVICEFILE", "/private/service-file"),
+        ("PGSYSCONFDIR", "/private/system-config"),
+        ("pgservice", "case-variant-private-service"),
+    ],
+)
+async def test_adapter_rejects_libpq_environment_added_after_projection_before_connect(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    variable: str,
+    private_value: str,
+) -> None:
+    configuration = _writer_configuration()
+    connect_called = False
+
+    async def connect(**_connection_values: object) -> _FakeConnection:
+        nonlocal connect_called
+        connect_called = True
+        return _FakeConnection()
+
+    monkeypatch.setattr(adapter_module.AsyncConnection, "connect", staticmethod(connect))
+    monkeypatch.setenv(variable, private_value)
+    start, _completion, _repository = await _records()
+
+    with pytest.raises(AuditWriteError) as failure:
+        await PostgresAuditPort(configuration).start_execution(start)
+
+    assert failure.value.kind is AuditWriteFailureKind.PERMANENT
+    assert connect_called is False
+    assert variable not in str(failure.value)
+    assert private_value not in str(failure.value)
+    assert private_value not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_adapter_rechecks_libpq_environment_before_second_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configuration = _writer_configuration()
+    connection = _FakeConnection()
+    connect_calls = 0
+
+    async def connect(**_connection_values: object) -> _FakeConnection:
+        nonlocal connect_calls
+        connect_calls += 1
+        return connection
+
+    monkeypatch.setattr(adapter_module.AsyncConnection, "connect", staticmethod(connect))
+    start, completion, _repository = await _records()
+    port = PostgresAuditPort(configuration)
+    await port.start_execution(start)
+    monkeypatch.setenv("PGOPTIONS", "-c search_path=private_schema")
+
+    with pytest.raises(AuditWriteError) as failure:
+        await port.complete_investigation(completion)
+
+    assert failure.value.kind is AuditWriteFailureKind.PERMANENT
+    assert connect_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_driver_failure_does_not_log_or_expose_connection_details(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -1915,7 +1982,7 @@ async def test_postgres_roles_views_and_forward_migration() -> None:
                 (SELECT count(*) FROM audit.events),
                 (SELECT count(*) FROM pg_stat_activity WHERE application_name = %s)
             """,
-            ("maestro-audit-issue11",),
+            ("maestro-audit-writer",),
         )
         assert await cursor.fetchone() == (5, 9, 0)
     finally:
