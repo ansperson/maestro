@@ -6,10 +6,12 @@ from collections.abc import Awaitable, Callable
 from uuid import UUID
 
 from maestro.audit.contracts import (
+    AuditEventV1,
     AuditExecutionFailureV1,
     AuditExecutionStartV1,
     AuditInvestigationCompletionV1,
 )
+from maestro.audit.port import AuditWriteError, AuditWriteFailureKind
 from maestro.audit.recorder import AuditRecorder, AuditRetryTiming, AuditRuntimeMetadata
 from maestro.model_identity import ModelIdentifier
 
@@ -48,7 +50,7 @@ class FakeAuditPort:
             outcome = self._on_start(record)
             if isinstance(outcome, Awaitable):
                 await outcome
-        self.starts.append(record)
+        self._store_start(record)
 
     async def complete_investigation(self, record: AuditInvestigationCompletionV1) -> None:
         self.completion_attempts.append(record)
@@ -56,7 +58,7 @@ class FakeAuditPort:
             outcome = self._on_completion(record)
             if isinstance(outcome, Awaitable):
                 await outcome
-        self.completions.append(record)
+        self._store_terminal(record)
 
     async def fail_execution(self, record: AuditExecutionFailureV1) -> None:
         self.failure_attempts.append(record)
@@ -64,7 +66,7 @@ class FakeAuditPort:
             outcome = self._on_failure(record)
             if isinstance(outcome, Awaitable):
                 await outcome
-        self.failures.append(record)
+        self._store_terminal(record)
 
     def abort_execution_failure(self, event_id: UUID) -> None:
         """Record and synchronously signal cancellation of one active fake write."""
@@ -72,6 +74,48 @@ class FakeAuditPort:
         self.failure_aborts.append(event_id)
         if self._on_failure_abort is not None:
             self._on_failure_abort(event_id)
+
+    def _store_start(self, record: AuditExecutionStartV1) -> None:
+        execution_conflicts = [
+            existing
+            for existing in self.starts
+            if existing.execution.audit_id == record.execution.audit_id
+            or existing.execution.execution_id == record.execution.execution_id
+        ]
+        event_conflicts = self._event_conflicts(record.event)
+        if not execution_conflicts and not event_conflicts:
+            self.starts.append(record)
+            return
+        if execution_conflicts == [record] and event_conflicts == [record.event]:
+            return
+        raise AuditWriteError(AuditWriteFailureKind.PERMANENT)
+
+    def _store_terminal(
+        self,
+        record: AuditInvestigationCompletionV1 | AuditExecutionFailureV1,
+    ) -> None:
+        event_conflicts = self._event_conflicts(record.event)
+        if not event_conflicts:
+            if isinstance(record, AuditInvestigationCompletionV1):
+                self.completions.append(record)
+            else:
+                self.failures.append(record)
+            return
+        existing_records = (*self.completions, *self.failures)
+        if event_conflicts == [record.event] and record in existing_records:
+            return
+        raise AuditWriteError(AuditWriteFailureKind.PERMANENT)
+
+    def _event_conflicts(self, event: AuditEventV1) -> list[AuditEventV1]:
+        events = [record.event for record in self.starts]
+        events.extend(record.event for record in self.completions)
+        events.extend(record.event for record in self.failures)
+        return [
+            existing
+            for existing in events
+            if existing.event_id == event.event_id
+            or (existing.audit_id == event.audit_id and existing.sequence == event.sequence)
+        ]
 
 
 def fake_audit_recorder(

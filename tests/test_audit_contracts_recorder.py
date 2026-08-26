@@ -485,6 +485,8 @@ async def test_recorder_builds_immutable_strict_versioned_records(tmp_path: Path
     assert completion.event.event_type is AuditEventType.INVESTIGATION_COMPLETED
     assert completion.event.event_id == handle.terminal_event_id
     assert completion.event.audit_id == handle.audit_id
+    assert start.content_hash == start.event.content_hash()
+    assert completion.content_hash == completion.event.content_hash()
     encoded = start.model_dump_json() + completion.model_dump_json()
     assert "fixture-secret-value" not in encoded
     assert "fixture-password" not in encoded
@@ -500,6 +502,18 @@ async def test_recorder_builds_immutable_strict_versioned_records(tmp_path: Path
     assert len(completion.event.content_hash()) == 64
     with pytest.raises(ValidationError, match="frozen"):
         start.event.sequence = 2  # type: ignore[misc]
+    with pytest.raises(ValidationError, match="content hash"):
+        type(start)(
+            execution=start.execution,
+            event=start.event,
+            content_hash="0" * 64,
+        )
+    with pytest.raises(ValidationError, match="content hash"):
+        type(completion)(
+            execution_id=completion.execution_id,
+            event=completion.event,
+            content_hash="0" * 64,
+        )
 
 
 @pytest.mark.asyncio
@@ -624,6 +638,48 @@ def test_event_contract_rejects_extra_fields_and_mismatched_sequence() -> None:
         )
 
 
+def test_event_content_hash_is_canonical_stable_and_application_owned() -> None:
+    payload: dict[str, object] = {
+        "objective": "Determine whether the fact is true.",
+        "server_version": "1.0.0",
+        "runtime_name": "codex",
+        "runtime_version": "0.147.0",
+        "model": "gpt-5.4",
+        "prompt_policy_version": "repository-verifier/v1",
+    }
+    first_document: dict[str, object] = {
+        "event_id": UUID(int=1),
+        "audit_id": UUID(int=2),
+        "sequence": 1,
+        "event_type": AuditEventType.EXECUTION_STARTED,
+        "event_version": 1,
+        "occurred_at": _NOW,
+        "payload": payload,
+    }
+    second_document: dict[str, object] = {
+        "payload": dict(reversed(tuple(payload.items()))),
+        "occurred_at": first_document["occurred_at"],
+        "event_version": first_document["event_version"],
+        "event_type": first_document["event_type"],
+        "sequence": first_document["sequence"],
+        "audit_id": first_document["audit_id"],
+        "event_id": first_document["event_id"],
+    }
+
+    first = AuditEventV1.model_validate(first_document)
+    second = AuditEventV1.model_validate(second_document)
+
+    assert first == second
+    assert first.content_hash() == second.content_hash()
+    assert first.content_hash() == first.content_hash()
+    expected_hash = "3c056f94ed59e928806b03496f6de3bccd77896b433e10b63661b74140e97b7b"  # pragma: allowlist secret  # noqa: E501
+    assert first.content_hash() == expected_hash
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        AuditEventV1.model_validate(
+            {**first_document, "persisted_at": first_document["occurred_at"]}
+        )
+
+
 @pytest.mark.parametrize("model", _UNSAFE_MODEL_IDENTIFIERS)
 def test_every_audit_event_payload_rejects_unsafe_model_identifiers(model: str) -> None:
     metadata = {
@@ -723,6 +779,13 @@ async def test_recorder_builds_strict_safe_operational_failure(tmp_path: Path) -
         "model": "gpt-5.4",
         "prompt_policy_version": "repository-verifier/v1",
     }
+    record = port.failures[0]
+    with pytest.raises(ValidationError, match="content hash"):
+        type(record)(
+            execution_id=record.execution_id,
+            event=record.event,
+            content_hash="0" * 64,
+        )
     with pytest.raises(ValidationError, match="extra_forbidden"):
         ExecutionFailedV1.model_validate(
             {**failure.payload.model_dump(), "exception": "private traceback"},
@@ -776,7 +839,11 @@ def test_failure_record_rejects_a_semantic_completion_event() -> None:
     )
 
     with pytest.raises(ValidationError, match=r"execution\.failed"):
-        AuditExecutionFailureV1(event=event)
+        AuditExecutionFailureV1(
+            execution_id=UUID(int=3),
+            event=event,
+            content_hash=event.content_hash(),
+        )
 
 
 @pytest.mark.asyncio

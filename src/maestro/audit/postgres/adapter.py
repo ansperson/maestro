@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
+from typing import LiteralString
 from uuid import UUID
 
 from psycopg import AsyncConnection, Error as PsycopgError, OperationalError
@@ -23,6 +24,7 @@ from maestro.audit.port import AuditWriteError, AuditWriteFailureKind
 _SUPPORTED_SCHEMA_VERSION = 2
 _RETRYABLE_SQLSTATES = frozenset({"40001", "40P01", "53300", "57P01", "57P02", "57P03"})
 _TRANSACTION_ABORT_SQLSTATES = frozenset({"40001", "40P01"})
+_SAFE_SYNCHRONOUS_COMMIT_VALUES = frozenset({"on", "remote_apply"})
 
 type _TransactionOperation = Callable[[AsyncConnection[tuple[object, ...]]], Awaitable[None]]
 type _ConnectionReady = Callable[[AsyncConnection[tuple[object, ...]]], None]
@@ -64,25 +66,15 @@ class PostgresAuditPort:
 
         async def write(connection: AsyncConnection[tuple[object, ...]]) -> None:
             await _verify_schema(connection)
-            await connection.execute(
-                """
-                INSERT INTO audit.executions (
-                    audit_id,
-                    execution_id,
-                    capability,
-                    repository_id,
-                    repository_fingerprint
-                ) VALUES (%s, %s, %s, %s, %s)
-                """,
-                (
-                    record.execution.audit_id,
-                    record.execution.execution_id,
-                    record.execution.capability,
-                    record.execution.repository_id,
-                    record.execution.repository_fingerprint,
-                ),
+            await _verify_database_durability(connection)
+            execution_inserted = await _insert_execution(connection, record)
+            event_inserted = await _insert_event(
+                connection,
+                record.event,
+                record.content_hash,
             )
-            await _insert_event(connection, record.event)
+            if not execution_inserted or not event_inserted:
+                await _verify_start_record(connection, record)
 
         await _run_transaction(self._database_url.get_secret_value(), write)
 
@@ -91,7 +83,13 @@ class PostgresAuditPort:
 
         async def write(connection: AsyncConnection[tuple[object, ...]]) -> None:
             await _verify_schema(connection)
-            await _insert_event(connection, record.event)
+            if not await _insert_event(connection, record.event, record.content_hash):
+                await _verify_event_record(
+                    connection,
+                    record.execution_id,
+                    record.event,
+                    record.content_hash,
+                )
 
         await _run_transaction(self._database_url.get_secret_value(), write)
 
@@ -106,7 +104,13 @@ class PostgresAuditPort:
 
         async def write(connection: AsyncConnection[tuple[object, ...]]) -> None:
             await _verify_schema(connection)
-            await _insert_event(connection, record.event)
+            if not await _insert_event(connection, record.event, record.content_hash):
+                await _verify_event_record(
+                    connection,
+                    record.execution_id,
+                    record.event,
+                    record.content_hash,
+                )
 
         try:
             await _run_transaction(
@@ -211,11 +215,60 @@ async def _verify_schema(connection: AsyncConnection[tuple[object, ...]]) -> Non
         raise AuditWriteError(AuditWriteFailureKind.PERMANENT)
 
 
+async def _verify_database_durability(
+    connection: AsyncConnection[tuple[object, ...]],
+) -> None:
+    checks: tuple[tuple[LiteralString, frozenset[str]], ...] = (
+        ("SHOW fsync", frozenset({"on"})),
+        ("SHOW full_page_writes", frozenset({"on"})),
+        ("SHOW synchronous_commit", _SAFE_SYNCHRONOUS_COMMIT_VALUES),
+    )
+    for statement, accepted_values in checks:
+        cursor = await connection.execute(statement)
+        row = await cursor.fetchone()
+        if (
+            row is None
+            or len(row) != 1
+            or not isinstance(row[0], str)
+            or row[0].lower() not in accepted_values
+        ):
+            raise AuditWriteError(AuditWriteFailureKind.PERMANENT)
+
+
+async def _insert_execution(
+    connection: AsyncConnection[tuple[object, ...]],
+    record: AuditExecutionStartV1,
+) -> bool:
+    cursor = await connection.execute(
+        """
+        INSERT INTO audit.executions (
+            audit_id,
+            execution_id,
+            capability,
+            repository_id,
+            repository_fingerprint
+        ) VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT DO NOTHING
+        RETURNING audit_id
+        """,
+        (
+            record.execution.audit_id,
+            record.execution.execution_id,
+            record.execution.capability,
+            record.execution.repository_id,
+            record.execution.repository_fingerprint,
+        ),
+    )
+    row = await cursor.fetchone()
+    return row == (record.execution.audit_id,)
+
+
 async def _insert_event(
     connection: AsyncConnection[tuple[object, ...]],
     event: AuditEventV1,
-) -> None:
-    await connection.execute(
+    content_hash: str,
+) -> bool:
+    cursor = await connection.execute(
         """
         INSERT INTO audit.events (
             event_id,
@@ -227,6 +280,8 @@ async def _insert_event(
             content_hash,
             payload
         ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT DO NOTHING
+        RETURNING event_id
         """,
         (
             event.event_id,
@@ -235,7 +290,84 @@ async def _insert_event(
             event.event_type.value,
             event.event_version,
             event.occurred_at,
-            event.content_hash(),
+            content_hash,
             Jsonb(event.payload.model_dump(mode="json")),
         ),
     )
+    row = await cursor.fetchone()
+    return row == (event.event_id,)
+
+
+async def _verify_start_record(
+    connection: AsyncConnection[tuple[object, ...]],
+    record: AuditExecutionStartV1,
+) -> None:
+    cursor = await connection.execute(
+        """
+        SELECT
+            audit_id,
+            execution_id,
+            capability,
+            repository_id,
+            repository_fingerprint
+        FROM audit.executions
+        WHERE audit_id = %s OR execution_id = %s
+        """,
+        (record.execution.audit_id, record.execution.execution_id),
+    )
+    execution_rows = await cursor.fetchall()
+    expected_execution = (
+        record.execution.audit_id,
+        record.execution.execution_id,
+        record.execution.capability,
+        record.execution.repository_id,
+        record.execution.repository_fingerprint,
+    )
+    if execution_rows != [expected_execution]:
+        raise AuditWriteError(AuditWriteFailureKind.PERMANENT)
+    await _verify_event_record(
+        connection,
+        record.execution.execution_id,
+        record.event,
+        record.content_hash,
+    )
+
+
+async def _verify_event_record(
+    connection: AsyncConnection[tuple[object, ...]],
+    execution_id: UUID,
+    event: AuditEventV1,
+    content_hash: str,
+) -> None:
+    cursor = await connection.execute(
+        """
+        SELECT
+            event.event_id,
+            event.audit_id,
+            execution.execution_id,
+            event.sequence,
+            event.event_type,
+            event.event_version,
+            event.occurred_at,
+            event.content_hash,
+            event.payload
+        FROM audit.events AS event
+        JOIN audit.executions AS execution ON execution.audit_id = event.audit_id
+        WHERE event.event_id = %s OR (event.audit_id = %s AND event.sequence = %s)
+        """,
+        (event.event_id, event.audit_id, event.sequence),
+    )
+    rows = await cursor.fetchall()
+    expected = (
+        event.event_id,
+        event.audit_id,
+        execution_id,
+        event.sequence,
+        event.event_type.value,
+        event.event_version,
+        event.occurred_at,
+        content_hash,
+        event.payload.model_dump(mode="json"),
+    )
+    if rows != [expected]:
+        raise AuditWriteError(AuditWriteFailureKind.PERMANENT)

@@ -76,10 +76,15 @@ does not persist prompts, transcripts, repository content, or model output.
   and unsafe controls by collecting spans from the original input and applying bounded replacements
   once. Unrecognized path syntax, secret formats, encodings, or deliberate obfuscation may survive;
   neither control proves that a secret cannot be selected or encoded by the model.
-- Audit retries are limited to failures known not committed. An unverifiable or ambiguous write
-  returns `AUDIT_PERSISTENCE_ERROR` and may leave a start-only or complete-but-unacknowledged
-  trail; duplicate verification and recovery remain outside this release boundary. Adapter
-  details, SQL, SQLSTATE, hosts, users, and credentials are excluded from public errors and logs.
+- Audit retries failures known not committed and ambiguous acknowledgement/commit outcomes using
+  one immutable record and stable identities. An identity conflict is accepted only after exact
+  execution/event envelope, correlation, canonical content-hash, and typed-payload verification;
+  mismatches and ambiguity unresolved after the bounded budget return
+  `AUDIT_PERSISTENCE_ERROR`. Before accepting a start, the adapter requires the supported schema,
+  `fsync=on`, `full_page_writes=on`, and `synchronous_commit=on` or `remote_apply`. Adapter
+  details, SQL, SQLSTATE, hosts, users, settings values, and credentials are excluded from public
+  errors and logs. Abrupt process/host loss can still leave a start-only Trail, and an unresolved
+  infrastructure failure may leave a complete-but-unacknowledged Trail.
 - Operational failures after a durable start persist only their safe error code, bounded lifecycle
   stage, and approved version metadata. The configured model value crosses one typed safe-identifier
   boundary before startup: only a bounded ASCII alphanumeric/dot/underscore/hyphen grammar is
