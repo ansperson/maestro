@@ -20,7 +20,7 @@ async def run(executable: Path, repository: Path) -> None:
         command=str(executable),
         env={
             "MAESTRO_ALLOWED_ROOTS": str(repository),
-            "MAESTRO_AUDIT_DATABASE_URL": "postgresql://audit-writer@127.0.0.1:1/maestro",
+            "MAESTRO_AUDIT_DATABASE_URL": ("postgresql://maestro_audit_writer@127.0.0.1:1/maestro"),
             "MAESTRO_LOG_LEVEL": "WARNING",
         },
     )

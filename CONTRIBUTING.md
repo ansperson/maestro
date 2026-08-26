@@ -92,19 +92,19 @@ REPOSITORY=/absolute/allowed/repository
 
 npx --yes @modelcontextprotocol/inspector@2.2.0 --cli "$SERVER" \
   -e MAESTRO_ALLOWED_ROOTS="$REPOSITORY" -e MAESTRO_LOG_LEVEL=WARNING \
-  -e MAESTRO_AUDIT_DATABASE_URL=postgresql://audit-writer@127.0.0.1:1/maestro \
+  -e MAESTRO_AUDIT_DATABASE_URL=postgresql://maestro_audit_writer@127.0.0.1:1/maestro \
   --method tools/list --format json
 
 npx --yes @modelcontextprotocol/inspector@2.2.0 --cli "$SERVER" \
   -e MAESTRO_ALLOWED_ROOTS="$REPOSITORY" -e MAESTRO_LOG_LEVEL=WARNING \
-  -e MAESTRO_AUDIT_DATABASE_URL=postgresql://audit-writer@127.0.0.1:1/maestro \
+  -e MAESTRO_AUDIT_DATABASE_URL=postgresql://maestro_audit_writer@127.0.0.1:1/maestro \
   --method tools/call --tool-name resolve_codebase_fact \
   --tool-args-json "{\"repository_path\":\"$REPOSITORY\",\"question\":\"Should an Order support multiple Payments?\"}" \
   --format json
 
 npx --yes @modelcontextprotocol/inspector@2.2.0 --cli "$SERVER" \
   -e MAESTRO_ALLOWED_ROOTS="$REPOSITORY" -e MAESTRO_LOG_LEVEL=WARNING \
-  -e MAESTRO_AUDIT_DATABASE_URL=postgresql://audit-writer@127.0.0.1:1/maestro \
+  -e MAESTRO_AUDIT_DATABASE_URL=postgresql://maestro_audit_writer@127.0.0.1:1/maestro \
   --method tools/call --tool-name resolve_codebase_fact --tool-args-json '{}' --format json
 ```
 

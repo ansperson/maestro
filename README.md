@@ -50,7 +50,7 @@ cp .env.example .env  # copy values into your launcher; Maestro does not load th
 
 MAESTRO_ALLOWED_ROOTS=/absolute/repository/root \
 MAESTRO_CODEX_AUTH_FILE=/absolute/path/to/codex-auth.json \
-MAESTRO_AUDIT_DATABASE_URL=postgresql://audit-writer@localhost/maestro \
+MAESTRO_AUDIT_DATABASE_URL=postgresql://maestro_audit_writer@localhost/maestro \
 uv run maestro
 ```
 
@@ -64,6 +64,11 @@ connectivity is checked lazily when an audited call starts, and normal startup n
 database. stdout is reserved for newline-delimited MCP protocol messages; structured JSON
 application logs go to stderr.
 
+Audit PostgreSQL bootstrap, forward-only migrations, least-privilege role boundaries, and curated
+reader queries are documented in [`docs/audit-postgresql.md`](docs/audit-postgresql.md). Keep the
+migration-owner, runtime-writer, and query-reader credentials separate; Maestro receives only the
+writer connection string.
+
 An MCP client configuration can launch the server with `uv`:
 
 ```json
@@ -73,7 +78,7 @@ An MCP client configuration can launch the server with `uv`:
   "env": {
     "MAESTRO_ALLOWED_ROOTS": "/absolute/repository/root",
     "MAESTRO_CODEX_AUTH_FILE": "/absolute/path/to/codex-auth.json",
-    "MAESTRO_AUDIT_DATABASE_URL": "postgresql://audit-writer@localhost/maestro"
+    "MAESTRO_AUDIT_DATABASE_URL": "postgresql://maestro_audit_writer@localhost/maestro"
   }
 }
 ```
@@ -263,7 +268,7 @@ the target with only the environment passed through its `-e` options:
 npx --yes @modelcontextprotocol/inspector@2.2.0 --cli \
   /absolute/path/to/maestro/.venv/bin/maestro \
   -e MAESTRO_ALLOWED_ROOTS=/absolute/repository/root -e MAESTRO_LOG_LEVEL=WARNING \
-  -e MAESTRO_AUDIT_DATABASE_URL=postgresql://audit-writer@127.0.0.1:1/maestro \
+  -e MAESTRO_AUDIT_DATABASE_URL=postgresql://maestro_audit_writer@127.0.0.1:1/maestro \
   --method tools/list --format json
 ```
 
