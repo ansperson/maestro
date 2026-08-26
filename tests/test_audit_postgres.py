@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import secrets
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -29,8 +30,10 @@ from maestro.audit.contracts import (
 )
 from maestro.audit.port import AuditWriteError, AuditWriteFailureKind
 from maestro.audit.postgres import PostgresAuditPort
-from maestro.audit.postgres.migrations import packaged_migrations
+from maestro.audit.postgres.migrations import packaged_migrations, packaged_role_bootstrap
 from maestro.audit.recorder import (
+    AuditConflictInput,
+    AuditEvidenceInput,
     AuditInvestigationCompletionInput,
     AuditRecorder,
     AuditRuntimeMetadata,
@@ -41,6 +44,10 @@ from maestro.model_identity import ModelIdentifier
 from maestro.repository.guard import AuthorizedRepository, RepositoryFingerprint
 
 _TEST_DSN_ENV = "MAESTRO_TEST_POSTGRES_DSN"
+_MIGRATOR_ROLE = "maestro_audit_migrator"
+_WRITER_ROLE = "maestro_audit_writer"
+_READER_ROLE = "maestro_audit_reader"
+_OUTSIDER_ROLE = "maestro_audit_outsider_test"
 
 
 class _FakeTransaction:
@@ -95,7 +102,7 @@ class _FakeConnection:
         *,
         transaction_exit_error: Exception | None = None,
         close_error: Exception | None = None,
-        schema_version: int | None = 2,
+        schema_version: int | None = 3,
         durability: _FakeDurability | None = None,
     ) -> None:
         self._transaction_exit_error = transaction_exit_error
@@ -131,6 +138,7 @@ class _FakeConnection:
         self.statement_params.append(params)
         fixed_rows = self._fixed_rows(query)
         rows: list[tuple[object, ...]]
+        rowcount = -1
         if fixed_rows is not None:
             rows = fixed_rows
         elif "INSERT INTO audit.executions" in query:
@@ -141,9 +149,11 @@ class _FakeConnection:
             ]
             if conflicting:
                 rows = []
+                rowcount = 0
             else:
                 self.executions.append(candidate)
-                rows = [(candidate[0],)]
+                rows = []
+                rowcount = 1
         elif "INSERT INTO audit.events" in query:
             assert params is not None
             encoded_payload = params[7]
@@ -156,23 +166,47 @@ class _FakeConnection:
             ]
             if conflicting:
                 rows = []
+                rowcount = 0
             else:
                 self.events.append(candidate)
-                rows = [(candidate[0],)]
-        elif "FROM audit.executions" in query:
+                rows = []
+                rowcount = 1
+        elif "audit.verify_execution_v1" in query:
             assert params is not None
-            rows = [row for row in self.executions if row[0] == params[0] or row[1] == params[1]]
-        elif "FROM audit.events AS event" in query:
+            conflicting = [
+                row for row in self.executions if row[0] == params[0] or row[1] == params[1]
+            ]
+            rows = [(len(conflicting) == 1 and conflicting[0] == params,)]
+        elif "audit.verify_event_v1" in query:
             assert params is not None
-            rows = []
-            for event in self.events:
-                if event[0] != params[0] and not (event[1] == params[1] and event[2] == params[2]):
-                    continue
-                execution = next(row for row in self.executions if row[0] == event[1])
-                rows.append((*event[:2], execution[1], *event[2:]))
+            encoded_payload = params[8]
+            assert isinstance(encoded_payload, Jsonb)
+            conflicting = [
+                row
+                for row in self.events
+                if row[0] == params[0] or (row[1] == params[1] and row[2] == params[3])
+            ]
+            expected = (
+                params[0],
+                params[1],
+                params[3],
+                params[4],
+                params[5],
+                params[6],
+                params[7],
+                encoded_payload.obj,
+            )
+            execution_ids = [row[1] for row in self.executions if row[0] == params[1]]
+            rows = [
+                (
+                    len(conflicting) == 1
+                    and conflicting[0] == expected
+                    and execution_ids == [params[2]],
+                )
+            ]
         else:
             rows = []
-        return _FakeCursor(rows)
+        return _FakeCursor(rows, rowcount=rowcount)
 
     def _fixed_rows(self, query: str) -> list[tuple[object, ...]] | None:
         if "SELECT version FROM audit.schema_version" in query:
@@ -183,8 +217,9 @@ class _FakeConnection:
 
 
 class _FakeCursor:
-    def __init__(self, rows: list[tuple[object, ...]]) -> None:
+    def __init__(self, rows: list[tuple[object, ...]], *, rowcount: int = -1) -> None:
         self._rows = rows
+        self.rowcount = rowcount
 
     async def fetchone(self) -> tuple[object, ...] | None:
         return self._rows[0] if self._rows else None
@@ -226,10 +261,18 @@ def _patch_connection(
 
 
 def test_migration_is_an_ordered_packaged_explicit_resource() -> None:
+    bootstrap = packaged_role_bootstrap()
     migrations = packaged_migrations()
+    assert bootstrap.startswith("BEGIN;")
+    assert bootstrap.rstrip().endswith("COMMIT;")
+    assert "LOGIN PASSWORD NULL" in bootstrap
+    assert "GRANT CONNECT, CREATE" in bootstrap
+    assert "GRANT CONNECT ON DATABASE" in bootstrap
+    assert "PASSWORD '" not in bootstrap
     assert [(migration.version, migration.name) for migration in migrations] == [
         (1, "0001_audit_tracer.sql"),
         (2, "0002_execution_failed.sql"),
+        (3, "0003_roles_and_read_views.sql"),
     ]
     assert migrations[0].sql.startswith("BEGIN;")
     assert migrations[0].sql.rstrip().endswith("COMMIT;")
@@ -240,6 +283,14 @@ def test_migration_is_an_ordered_packaged_explicit_resource() -> None:
     assert "execution.failed" in migrations[1].sql
     assert "UPDATE audit.events" not in migrations[1].sql
     assert "DELETE FROM audit.events" not in migrations[1].sql
+    assert "CREATE VIEW audit_read.execution_summary" in migrations[2].sql
+    assert "CREATE VIEW audit_read.event_timeline" in migrations[2].sql
+    assert "CREATE VIEW audit_read.evidence" in migrations[2].sql
+    assert "SECURITY DEFINER" in migrations[2].sql
+    assert "SET search_path = pg_catalog" in migrations[2].sql
+    assert "GRANT SELECT ON ALL TABLES IN SCHEMA audit_read" in migrations[2].sql
+    assert "UPDATE audit.events" not in migrations[2].sql
+    assert "DELETE FROM audit.events" not in migrations[2].sql
 
 
 @pytest.mark.parametrize(
@@ -352,10 +403,8 @@ async def test_identical_start_and_terminal_retries_require_exact_verification(
 
     assert len(connection.executions) == 1
     assert len(connection.events) == 2
-    assert sum("FROM audit.executions" in statement for statement in connection.statements) == 1
-    assert (
-        sum("FROM audit.events AS event" in statement for statement in connection.statements) == 2
-    )
+    assert sum("audit.verify_execution_v1" in statement for statement in connection.statements) == 1
+    assert sum("audit.verify_event_v1" in statement for statement in connection.statements) == 2
     assert all(
         "ON CONFLICT DO NOTHING" in statement
         for statement in connection.statements
@@ -378,7 +427,7 @@ async def test_identical_failure_retry_verifies_exact_terminal_record(
 
     assert len(connection.executions) == 1
     assert len(connection.events) == 2
-    assert any("FROM audit.events AS event" in statement for statement in connection.statements)
+    assert any("audit.verify_event_v1" in statement for statement in connection.statements)
     assert port._active_failure_writes == {}  # pyright: ignore[reportPrivateUsage]
 
 
@@ -410,8 +459,8 @@ async def test_ambiguous_start_retry_uses_a_fresh_connection_and_exact_prior_com
     assert first.closed is second.closed is True
     assert second.executions == first.executions
     assert second.events == first.events
-    assert any("FROM audit.executions" in statement for statement in second.statements)
-    assert any("FROM audit.events AS event" in statement for statement in second.statements)
+    assert any("audit.verify_execution_v1" in statement for statement in second.statements)
+    assert any("audit.verify_event_v1" in statement for statement in second.statements)
 
 
 @pytest.mark.asyncio
@@ -884,6 +933,79 @@ async def _records() -> tuple[
     return fake.starts[0], fake.completions[0], repository
 
 
+async def _completion_records(
+    identifier_start: int,
+    *,
+    repository_id: str,
+    objective: str,
+    result: AuditInvestigationCompletionInput,
+) -> tuple[AuditExecutionStartV1, AuditInvestigationCompletionV1]:
+    identifiers = iter(UUID(int=value) for value in range(identifier_start, identifier_start + 5))
+    fake = FakeAuditPort()
+    recorder = AuditRecorder(
+        fake,
+        AuditRuntimeMetadata(
+            server_version="1.0.0",
+            runtime_name="codex",
+            runtime_version="0.147.0",
+            model=ModelIdentifier("gpt-5.4"),
+            prompt_policy_version="repository-verifier/v1",
+        ),
+        id_factory=lambda: next(identifiers),
+        clock=lambda: datetime(2026, 8, 25, tzinfo=UTC),
+    )
+    repository = AuthorizedRepository(root=Path.cwd(), repository_id=repository_id)
+    fingerprint = RepositoryFingerprint(
+        digest=f"{identifier_start:064x}",
+        repository_id=repository.repository_id,
+        git_top_level_id=None,
+        head=None,
+        dirty_digest=None,
+        files={},
+        truncated=False,
+    )
+    handle = await recorder.start_resolve_codebase_fact(repository, fingerprint, objective)
+    await recorder.record_investigation_completed(
+        handle,
+        repository,
+        result,
+    )
+    return fake.starts[0], fake.completions[0]
+
+
+async def _incomplete_record(identifier_start: int) -> AuditExecutionStartV1:
+    identifiers = iter(UUID(int=value) for value in range(identifier_start, identifier_start + 5))
+    fake = FakeAuditPort()
+    recorder = AuditRecorder(
+        fake,
+        AuditRuntimeMetadata(
+            server_version="1.0.0",
+            runtime_name="codex",
+            runtime_version="0.147.0",
+            model=ModelIdentifier("gpt-5.4"),
+            prompt_policy_version="repository-verifier/v1",
+        ),
+        id_factory=lambda: next(identifiers),
+        clock=lambda: datetime(2026, 8, 25, tzinfo=UTC),
+    )
+    repository = AuthorizedRepository(root=Path.cwd(), repository_id="a" * 16)
+    fingerprint = RepositoryFingerprint(
+        digest=f"{identifier_start:064x}",
+        repository_id=repository.repository_id,
+        git_top_level_id=None,
+        head=None,
+        dirty_digest=None,
+        files={},
+        truncated=False,
+    )
+    await recorder.start_resolve_codebase_fact(
+        repository,
+        fingerprint,
+        "Will this execution reach a terminal event?",
+    )
+    return fake.starts[0]
+
+
 async def _failure_records(
     identifier_start: int = 101,
 ) -> tuple[AuditExecutionStartV1, AuditExecutionFailureV1]:
@@ -998,46 +1120,639 @@ async def _assert_native_unsafe_durability_rejected(
     return unsafe_execution.audit_id
 
 
+def _role_dsn(raw_dsn: str, role: str, password: str, application_name: str) -> str:
+    return make_conninfo(
+        raw_dsn,
+        user=role,
+        password=password,
+        application_name=application_name,
+    )
+
+
+async def _execute_resource(
+    connection: AsyncConnection[tuple[object, ...]],
+    resource: str,
+) -> None:
+    reviewed_sql = cast(LiteralString, resource)
+    await connection.execute(sql.SQL(reviewed_sql))
+
+
+async def _set_role_password(
+    connection: AsyncConnection[tuple[object, ...]],
+    role: str,
+    password: str,
+) -> None:
+    statement = sql.SQL("ALTER ROLE {} PASSWORD {}").format(
+        sql.Identifier(role),
+        sql.Literal(password),
+    )
+    await connection.execute(statement)
+
+
+async def _assert_denied(
+    dsn: str,
+    statement: LiteralString,
+    *,
+    autocommit: bool = False,
+) -> None:
+    connection = await AsyncConnection.connect(dsn, autocommit=autocommit)
+    try:
+        with pytest.raises(errors.InsufficientPrivilege):
+            await connection.execute(statement)
+    finally:
+        await connection.close()
+
+
+async def _bootstrap_v2_database(raw_dsn: str) -> tuple[str, str, str]:
+    migrations = packaged_migrations()
+    admin = await AsyncConnection.connect(raw_dsn)
+    try:
+        for migration in migrations[:2]:
+            await _execute_resource(admin, migration.sql)
+        await _execute_resource(admin, packaged_role_bootstrap())
+
+        cursor = await admin.execute(
+            """
+            SELECT
+                rolname,
+                rolcanlogin,
+                rolsuper,
+                rolcreatedb,
+                rolcreaterole,
+                rolinherit,
+                rolreplication,
+                rolbypassrls,
+                rolpassword IS NULL
+            FROM pg_catalog.pg_authid
+            WHERE rolname IN (%s, %s, %s)
+            ORDER BY rolname
+            """,
+            (_MIGRATOR_ROLE, _WRITER_ROLE, _READER_ROLE),
+        )
+        expected_role_rows = sorted(
+            (
+                role,
+                True,
+                False,
+                False,
+                False,
+                False,
+                False,
+                False,
+                True,
+            )
+            for role in (_MIGRATOR_ROLE, _WRITER_ROLE, _READER_ROLE)
+        )
+        assert await cursor.fetchall() == expected_role_rows
+
+        cursor = await admin.execute(
+            """
+            SELECT
+                rolname,
+                pg_catalog.has_database_privilege(rolname, current_database(), 'CONNECT'),
+                pg_catalog.has_database_privilege(rolname, current_database(), 'CREATE'),
+                pg_catalog.has_database_privilege(rolname, current_database(), 'TEMP')
+            FROM pg_catalog.pg_roles
+            WHERE rolname IN (%s, %s, %s)
+            ORDER BY rolname
+            """,
+            (_MIGRATOR_ROLE, _WRITER_ROLE, _READER_ROLE),
+        )
+        assert await cursor.fetchall() == sorted(
+            [
+                (_MIGRATOR_ROLE, True, True, False),
+                (_WRITER_ROLE, True, False, False),
+                (_READER_ROLE, True, False, False),
+            ]
+        )
+        cursor = await admin.execute(
+            """
+            SELECT
+                pg_catalog.has_database_privilege('public', current_database(), 'CONNECT'),
+                pg_catalog.has_database_privilege('public', current_database(), 'CREATE'),
+                pg_catalog.has_database_privilege('public', current_database(), 'TEMP'),
+                pg_catalog.has_schema_privilege('public', 'public', 'USAGE'),
+                pg_catalog.has_schema_privilege('public', 'public', 'CREATE')
+            """
+        )
+        assert await cursor.fetchone() == (False, False, False, False, False)
+        cursor = await admin.execute(
+            """
+            SELECT count(*)
+            FROM pg_catalog.pg_auth_members AS membership
+            WHERE membership.roleid IN (
+                SELECT oid FROM pg_catalog.pg_roles WHERE rolname IN (%s, %s, %s)
+            ) OR membership.member IN (
+                SELECT oid FROM pg_catalog.pg_roles WHERE rolname IN (%s, %s, %s)
+            )
+            """,
+            (
+                _MIGRATOR_ROLE,
+                _WRITER_ROLE,
+                _READER_ROLE,
+                _MIGRATOR_ROLE,
+                _WRITER_ROLE,
+                _READER_ROLE,
+            ),
+        )
+        assert await cursor.fetchone() == (0,)
+
+        migrator_password = secrets.token_urlsafe(24)
+        writer_password = secrets.token_urlsafe(24)
+        reader_password = secrets.token_urlsafe(24)
+        outsider_password = secrets.token_urlsafe(24)
+        await _set_role_password(admin, _MIGRATOR_ROLE, migrator_password)
+        await _set_role_password(admin, _WRITER_ROLE, writer_password)
+        await _set_role_password(admin, _READER_ROLE, reader_password)
+        create_outsider = sql.SQL(
+            "CREATE ROLE {} LOGIN PASSWORD {} "
+            "NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS"
+        ).format(sql.Identifier(_OUTSIDER_ROLE), sql.Literal(outsider_password))
+        await admin.execute(create_outsider)
+        await admin.commit()
+
+        cursor = await admin.execute(
+            """
+            SELECT count(*)
+            FROM pg_catalog.pg_authid
+            WHERE rolname IN (%s, %s, %s) AND rolpassword IS NOT NULL
+            """,
+            (_MIGRATOR_ROLE, _WRITER_ROLE, _READER_ROLE),
+        )
+        assert await cursor.fetchone() == (3,)
+    finally:
+        await admin.close()
+
+    outsider_dsn = _role_dsn(raw_dsn, _OUTSIDER_ROLE, outsider_password, "audit-outsider")
+    with pytest.raises(errors.OperationalError):
+        await AsyncConnection.connect(outsider_dsn)
+    return migrator_password, writer_password, reader_password
+
+
+async def _apply_roles_and_views(raw_dsn: str, migrator_password: str) -> str:
+    migrator_dsn = _role_dsn(
+        raw_dsn,
+        _MIGRATOR_ROLE,
+        migrator_password,
+        "maestro-audit-migrator",
+    )
+    connection = await AsyncConnection.connect(migrator_dsn)
+    try:
+        await _execute_resource(connection, packaged_migrations()[2].sql)
+        await connection.commit()
+        await connection.execute("CREATE SCHEMA audit_migrator_probe")
+        await connection.execute("DROP SCHEMA audit_migrator_probe")
+        await connection.commit()
+    finally:
+        await connection.close()
+    return migrator_dsn
+
+
+async def _assert_role_and_object_security(
+    raw_dsn: str,
+    migrator_dsn: str,
+    writer_dsn: str,
+    reader_dsn: str,
+) -> None:
+    admin = await AsyncConnection.connect(raw_dsn)
+    try:
+        cursor = await admin.execute(
+            """
+            SELECT nspname, pg_catalog.pg_get_userbyid(nspowner)
+            FROM pg_catalog.pg_namespace
+            WHERE nspname IN ('audit', 'audit_read')
+            ORDER BY nspname
+            """
+        )
+        assert await cursor.fetchall() == [
+            ("audit", _MIGRATOR_ROLE),
+            ("audit_read", _MIGRATOR_ROLE),
+        ]
+        cursor = await admin.execute(
+            """
+            SELECT namespace.nspname, object.relname, pg_catalog.pg_get_userbyid(object.relowner)
+            FROM pg_catalog.pg_class AS object
+            JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = object.relnamespace
+            WHERE namespace.nspname IN ('audit', 'audit_read')
+              AND object.relkind IN ('r', 'v')
+            ORDER BY namespace.nspname, object.relname
+            """
+        )
+        assert all(row[2] == _MIGRATOR_ROLE for row in await cursor.fetchall())
+        cursor = await admin.execute(
+            """
+            SELECT
+                proname,
+                pg_catalog.pg_get_userbyid(proowner),
+                prosecdef,
+                proconfig
+            FROM pg_catalog.pg_proc AS function
+            JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = function.pronamespace
+            WHERE namespace.nspname = 'audit' AND proname LIKE 'verify_%'
+            ORDER BY proname
+            """
+        )
+        assert await cursor.fetchall() == [
+            ("verify_event_v1", _MIGRATOR_ROLE, True, ["search_path=pg_catalog"]),
+            ("verify_execution_v1", _MIGRATOR_ROLE, True, ["search_path=pg_catalog"]),
+        ]
+        cursor = await admin.execute(
+            """
+            SELECT
+                pg_catalog.has_function_privilege(
+                    'public',
+                    'audit.verify_execution_v1(uuid,uuid,text,text,text)',
+                    'EXECUTE'
+                ),
+                pg_catalog.has_function_privilege(
+                    'public',
+                    'audit.verify_event_v1(uuid,uuid,uuid,smallint,text,smallint,timestamptz,text,jsonb)',
+                    'EXECUTE'
+                ),
+                pg_catalog.has_function_privilege(
+                    %s,
+                    'audit.verify_execution_v1(uuid,uuid,text,text,text)',
+                    'EXECUTE'
+                ),
+                pg_catalog.has_function_privilege(
+                    %s,
+                    'audit.verify_event_v1(uuid,uuid,uuid,smallint,text,smallint,timestamptz,text,jsonb)',
+                    'EXECUTE'
+                )
+            """,
+            (_WRITER_ROLE, _WRITER_ROLE),
+        )
+        assert await cursor.fetchone() == (False, False, True, True)
+        cursor = await admin.execute(
+            """
+            SELECT
+                pg_catalog.has_schema_privilege(%s, 'audit', 'USAGE'),
+                pg_catalog.has_schema_privilege(%s, 'audit', 'CREATE'),
+                pg_catalog.has_schema_privilege(%s, 'audit_read', 'USAGE'),
+                pg_catalog.has_schema_privilege(%s, 'audit', 'USAGE'),
+                pg_catalog.has_schema_privilege(%s, 'audit_read', 'USAGE'),
+                pg_catalog.has_column_privilege(%s, 'audit.events', 'event_id', 'INSERT'),
+                pg_catalog.has_table_privilege(%s, 'audit.events', 'SELECT'),
+                pg_catalog.has_column_privilege(
+                    %s, 'audit.schema_version', 'version', 'SELECT'
+                ),
+                pg_catalog.has_column_privilege(
+                    %s, 'audit.schema_version', 'applied_at', 'SELECT'
+                ),
+                pg_catalog.has_table_privilege(
+                    %s, 'audit_read.execution_summary', 'SELECT'
+                ),
+                pg_catalog.has_table_privilege(
+                    %s, 'audit_read.execution_summary', 'UPDATE'
+                ),
+                pg_catalog.has_table_privilege(%s, 'audit.events', 'SELECT')
+            """,
+            (
+                _WRITER_ROLE,
+                _WRITER_ROLE,
+                _WRITER_ROLE,
+                _READER_ROLE,
+                _READER_ROLE,
+                _WRITER_ROLE,
+                _WRITER_ROLE,
+                _WRITER_ROLE,
+                _WRITER_ROLE,
+                _READER_ROLE,
+                _READER_ROLE,
+                _READER_ROLE,
+            ),
+        )
+        assert await cursor.fetchone() == (
+            True,
+            False,
+            False,
+            False,
+            True,
+            True,
+            False,
+            True,
+            False,
+            True,
+            False,
+            False,
+        )
+    finally:
+        await admin.close()
+
+    writer_denials: tuple[LiteralString, ...] = (
+        "SELECT * FROM audit.executions",
+        "SELECT applied_at FROM audit.schema_version",
+        "SELECT * FROM audit_read.execution_summary",
+        "UPDATE audit.events SET content_hash = repeat('0', 64)",
+        "DELETE FROM audit.events",
+        "TRUNCATE audit.events",
+        "ALTER TABLE audit.events ADD COLUMN forbidden integer",
+        "CREATE SCHEMA writer_forbidden",
+        "CREATE TEMP TABLE writer_forbidden (value integer)",
+        "GRANT SELECT ON audit.events TO maestro_audit_reader",
+        "CREATE TRIGGER writer_forbidden BEFORE UPDATE ON audit.events "
+        "FOR EACH ROW EXECUTE FUNCTION pg_catalog.suppress_redundant_updates_trigger()",
+        "SET ROLE maestro_audit_migrator",
+        "GRANT maestro_audit_reader TO maestro_audit_writer",
+    )
+    for statement in writer_denials:
+        await _assert_denied(writer_dsn, statement)
+
+    reader_denials: tuple[LiteralString, ...] = (
+        "SELECT * FROM audit.events",
+        "INSERT INTO audit.events DEFAULT VALUES",
+        "CREATE SCHEMA reader_forbidden",
+        "CREATE TEMP TABLE reader_forbidden (value integer)",
+        "SET ROLE maestro_audit_writer",
+        "SELECT audit.verify_execution_v1(gen_random_uuid(), gen_random_uuid(), '', '', '')",
+    )
+    for statement in reader_denials:
+        await _assert_denied(reader_dsn, statement)
+
+    migrator = await AsyncConnection.connect(migrator_dsn)
+    try:
+        await migrator.execute("CREATE TABLE audit.default_table_probe (value integer)")
+        await migrator.execute(
+            "CREATE VIEW audit_read.default_view_probe AS SELECT 1::integer AS value"
+        )
+        await migrator.execute(
+            "CREATE FUNCTION audit.default_function_probe() RETURNS integer "
+            "LANGUAGE sql AS 'SELECT 1'"
+        )
+        await migrator.commit()
+    finally:
+        await migrator.close()
+
+    await _assert_denied(writer_dsn, "SELECT * FROM audit.default_table_probe")
+    await _assert_denied(writer_dsn, "INSERT INTO audit.default_table_probe VALUES (1)")
+    await _assert_denied(reader_dsn, "SELECT * FROM audit.default_table_probe")
+    reader = await AsyncConnection.connect(reader_dsn)
+    try:
+        cursor = await reader.execute("SELECT value FROM audit_read.default_view_probe")
+        assert await cursor.fetchone() == (1,)
+    finally:
+        await reader.close()
+    admin = await AsyncConnection.connect(raw_dsn)
+    try:
+        cursor = await admin.execute(
+            """
+            SELECT
+                pg_catalog.has_function_privilege(
+                    'public', 'audit.default_function_probe()', 'EXECUTE'
+                ),
+                pg_catalog.has_function_privilege(
+                    %s, 'audit.default_function_probe()', 'EXECUTE'
+                ),
+                pg_catalog.has_function_privilege(
+                    %s, 'audit.default_function_probe()', 'EXECUTE'
+                )
+            """,
+            (_WRITER_ROLE, _READER_ROLE),
+        )
+        assert await cursor.fetchone() == (False, False, False)
+    finally:
+        await admin.close()
+
+    await _assert_denied(migrator_dsn, "CREATE ROLE migrator_forbidden")
+    await _assert_denied(
+        migrator_dsn,
+        "CREATE DATABASE migrator_forbidden",
+        autocommit=True,
+    )
+
+
+async def _write_view_scenarios(port: PostgresAuditPort) -> dict[str, UUID]:
+    uncertain_start, uncertain_completion, _repository = await _records()
+    resolved_start, resolved_completion = await _completion_records(
+        1001,
+        repository_id="b" * 16,
+        objective="Where is the supported behavior established?",
+        result=AuditInvestigationCompletionInput(
+            status=AuditResultStatus.RESOLVED,
+            answer="The implementation and migration establish it.",
+            confidence=AuditConfidence.HIGH,
+            rationale="The resolved evidence establishes the behavior.",
+            evidence=(
+                AuditEvidenceInput(
+                    path="src/maestro/audit/contracts.py",
+                    line_start=10,
+                    line_end=12,
+                    symbol="AuditEventV1",
+                    finding="The contract defines the semantic event.",
+                ),
+            ),
+            conflicts=(
+                AuditConflictInput(
+                    description="An older document describes a different behavior.",
+                    evidence=(
+                        AuditEvidenceInput(
+                            path="docs/legacy.md",
+                            line_start=3,
+                            line_end=3,
+                            symbol=None,
+                            finding="The older document conflicts with the implementation.",
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+    human_start, human_completion = await _completion_records(
+        1101,
+        repository_id="c" * 16,
+        objective="Which policy should the maintainers select?",
+        result=AuditInvestigationCompletionInput(
+            status=AuditResultStatus.HUMAN_DECISION_REQUIRED,
+            answer=None,
+            confidence=AuditConfidence.MEDIUM,
+            evidence=(),
+            conflicts=(),
+            rationale="Maintainer authority is required.",
+        ),
+    )
+    failed_start, failure = await _failure_records(1201)
+    incomplete_start = await _incomplete_record(1301)
+
+    await asyncio.gather(
+        port.start_execution(uncertain_start),
+        port.start_execution(uncertain_start),
+    )
+    await port.complete_investigation(uncertain_completion)
+    await port.start_execution(resolved_start)
+    await port.complete_investigation(resolved_completion)
+    await port.start_execution(human_start)
+    await port.complete_investigation(human_completion)
+    await port.start_execution(failed_start)
+    await port.fail_execution(failure)
+    await port.start_execution(incomplete_start)
+    await port.complete_investigation(uncertain_completion)
+
+    return {
+        "uncertain": uncertain_start.execution.execution_id,
+        "resolved": resolved_start.execution.execution_id,
+        "human_decision_required": human_start.execution.execution_id,
+        "failed": failed_start.execution.execution_id,
+        "incomplete": incomplete_start.execution.execution_id,
+        "resolved_audit": resolved_start.execution.audit_id,
+        "resolved_start_event": resolved_start.event.event_id,
+        "resolved_terminal_event": resolved_completion.event.event_id,
+    }
+
+
+async def _assert_curated_views(reader_dsn: str, identities: dict[str, UUID]) -> None:
+    reader = await AsyncConnection.connect(reader_dsn)
+    try:
+        cursor = await reader.execute(
+            """
+            SELECT
+                execution_id,
+                outcome,
+                is_incomplete,
+                error_code,
+                failure_stage,
+                evidence_count,
+                conflict_count
+            FROM audit_read.execution_summary
+            ORDER BY execution_id
+            """
+        )
+        rows = {row[0]: row[1:] for row in await cursor.fetchall()}
+        assert rows[identities["uncertain"]] == ("uncertain", False, None, None, 0, 0)
+        assert rows[identities["resolved"]] == ("resolved", False, None, None, 1, 1)
+        assert rows[identities["human_decision_required"]] == (
+            "human_decision_required",
+            False,
+            None,
+            None,
+            0,
+            0,
+        )
+        assert rows[identities["failed"]] == (
+            "failed",
+            False,
+            "AGENT_RUNTIME_ERROR",
+            "investigation",
+            0,
+            0,
+        )
+        assert rows[identities["incomplete"]] == ("incomplete", True, None, None, 0, 0)
+
+        cursor = await reader.execute(
+            """
+            SELECT outcome, count(*)
+            FROM audit_read.execution_summary
+            GROUP BY outcome
+            ORDER BY outcome
+            """
+        )
+        assert await cursor.fetchall() == [
+            ("failed", 1),
+            ("human_decision_required", 1),
+            ("incomplete", 1),
+            ("resolved", 1),
+            ("uncertain", 1),
+        ]
+        cursor = await reader.execute(
+            """
+            SELECT count(*)
+            FROM audit_read.execution_summary
+            WHERE repository_id = %s
+            """,
+            ("a" * 16,),
+        )
+        assert await cursor.fetchone() == (2,)
+
+        cursor = await reader.execute(
+            """
+            SELECT event_id, sequence, event_type
+            FROM audit_read.event_timeline
+            WHERE audit_id = %s
+            ORDER BY sequence
+            """,
+            (identities["resolved_audit"],),
+        )
+        assert await cursor.fetchall() == [
+            (identities["resolved_start_event"], 1, "execution.started"),
+            (identities["resolved_terminal_event"], 2, "investigation.completed"),
+        ]
+
+        cursor = await reader.execute(
+            """
+            SELECT
+                evidence_scope,
+                conflict_ordinal,
+                conflict_description,
+                evidence_ordinal,
+                path,
+                line_start,
+                line_end,
+                symbol,
+                finding
+            FROM audit_read.evidence
+            WHERE execution_id = %s
+            ORDER BY evidence_scope DESC, evidence_ordinal
+            """,
+            (identities["resolved"],),
+        )
+        assert await cursor.fetchall() == [
+            (
+                "primary",
+                None,
+                None,
+                1,
+                "src/maestro/audit/contracts.py",
+                "10",
+                "12",
+                "AuditEventV1",
+                "The contract defines the semantic event.",
+            ),
+            (
+                "conflict",
+                1,
+                "An older document describes a different behavior.",
+                1,
+                "docs/legacy.md",
+                "3",
+                "3",
+                None,
+                "The older document conflicts with the implementation.",
+            ),
+        ]
+        cursor = await reader.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'audit_read'
+            ORDER BY table_name, ordinal_position
+            """
+        )
+        exposed_columns = {row[0] for row in await cursor.fetchall()}
+        assert "payload" not in exposed_columns
+        assert "content_hash" not in exposed_columns
+        assert "repository_fingerprint" not in exposed_columns
+        assert "persisted_at" not in exposed_columns
+        assert "created_at" not in exposed_columns
+    finally:
+        await reader.close()
+
+
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("socket_enabled")
-async def test_postgres_atomic_start_terminal_uniqueness_and_connection_lifetime() -> None:
+async def test_postgres_roles_views_and_forward_migration() -> None:
     raw_dsn = os.environ.get(_TEST_DSN_ENV)
     if raw_dsn is None:
         pytest.skip(f"set {_TEST_DSN_ENV} to run PostgreSQL Audit adapter tests")
-    migrations = packaged_migrations()
-    migration_connection = await AsyncConnection.connect(raw_dsn)
-    try:
-        for migration in migrations:
-            reviewed_sql = cast(LiteralString, migration.sql)
-            await migration_connection.execute(sql.SQL(reviewed_sql))
-        await migration_connection.commit()
-    finally:
-        await migration_connection.close()
-
-    application_dsn = make_conninfo(raw_dsn, application_name="maestro-audit-issue7")
-    port = PostgresAuditPort(SecretStr(application_dsn))
+    migrator_password, writer_password, reader_password = await _bootstrap_v2_database(raw_dsn)
+    migrator_dsn = await _apply_roles_and_views(raw_dsn, migrator_password)
+    writer_dsn = _role_dsn(raw_dsn, _WRITER_ROLE, writer_password, "maestro-audit-issue11")
+    reader_dsn = _role_dsn(raw_dsn, _READER_ROLE, reader_password, "maestro-audit-reader")
+    port = PostgresAuditPort(SecretStr(writer_dsn))
     start, completion, _repository = await _records()
-    await asyncio.gather(port.start_execution(start), port.start_execution(start))
-    await port.complete_investigation(completion)
-
-    observer = await AsyncConnection.connect(raw_dsn)
-    try:
-        cursor = await observer.execute(
-            """
-            SELECT
-                (SELECT count(*) FROM audit.executions),
-                (SELECT count(*) FROM audit.events),
-                (SELECT count(*) FROM pg_stat_activity WHERE application_name = %s)
-            """,
-            ("maestro-audit-issue7",),
-        )
-        assert await cursor.fetchone() == (1, 2, 0)
-    finally:
-        await observer.close()
-
-    await port.complete_investigation(completion)
+    identities = await _write_view_scenarios(port)
     new_audit_id = await _assert_native_mismatches_rollback(port, start, completion)
-    unsafe_audit_id = await _assert_native_unsafe_durability_rejected(raw_dsn, start)
+    unsafe_audit_id = await _assert_native_unsafe_durability_rejected(writer_dsn, start)
+    await _assert_curated_views(reader_dsn, identities)
+    await _assert_role_and_object_security(raw_dsn, migrator_dsn, writer_dsn, reader_dsn)
 
     observer = await AsyncConnection.connect(raw_dsn)
     try:
@@ -1047,11 +1762,14 @@ async def test_postgres_atomic_start_terminal_uniqueness_and_connection_lifetime
         )
         assert await cursor.fetchone() == (0,)
         cursor = await observer.execute(
-            "SELECT sequence, event_type FROM audit.events ORDER BY sequence"
+            """
+            SELECT
+                (SELECT count(*) FROM audit.executions),
+                (SELECT count(*) FROM audit.events),
+                (SELECT count(*) FROM pg_stat_activity WHERE application_name = %s)
+            """,
+            ("maestro-audit-issue11",),
         )
-        assert await cursor.fetchall() == [
-            (1, "execution.started"),
-            (2, "investigation.completed"),
-        ]
+        assert await cursor.fetchone() == (5, 9, 0)
     finally:
         await observer.close()

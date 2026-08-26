@@ -85,6 +85,14 @@ does not persist prompts, transcripts, repository content, or model output.
   details, SQL, SQLSTATE, hosts, users, settings values, and credentials are excluded from public
   errors and logs. Abrupt process/host loss can still leave a start-only Trail, and an unresolved
   infrastructure failure may leave a complete-but-unacknowledged Trail.
+- PostgreSQL bootstrap creates separate migration-owner, append-writer, and query-reader login
+  identities without default passwords. It revokes `PUBLIC` database/schema privileges; the
+  writer receives column-scoped inserts, schema-version reads, and only fixed-signature exact
+  verification functions with a pinned `pg_catalog` search path. The reader receives curated-view
+  `SELECT` only. Neither runtime role receives schema creation, temporary-table, role membership,
+  grant, base-table read, mutation, trigger, or truncate authority. The migrator and database
+  administrator remain trusted and administratively capable of changing Audit data; this is least
+  privilege, not cryptographic tamper evidence. See `docs/audit-postgresql.md`.
 - Operational failures after a durable start persist only their safe error code, bounded lifecycle
   stage, and approved version metadata. The configured model value crosses one typed safe-identifier
   boundary before startup: only a bounded ASCII alphanumeric/dot/underscore/hyphen grammar is

@@ -13,12 +13,19 @@ class AuditMigration:
     sql: str
 
 
+def packaged_role_bootstrap() -> str:
+    """Load the one-time administrator bootstrap for fixed least-privilege roles."""
+
+    return files(__package__).joinpath("bootstrap_roles.sql").read_text(encoding="utf-8")
+
+
 def packaged_migrations() -> tuple[AuditMigration, ...]:
     """Load ordered SQL resources; normal application startup never calls this."""
 
     resources = (
         (1, files(__package__).joinpath("0001_audit_tracer.sql")),
         (2, files(__package__).joinpath("0002_execution_failed.sql")),
+        (3, files(__package__).joinpath("0003_roles_and_read_views.sql")),
     )
     return tuple(
         AuditMigration(
@@ -28,4 +35,4 @@ def packaged_migrations() -> tuple[AuditMigration, ...]:
     )
 
 
-__all__ = ["AuditMigration", "packaged_migrations"]
+__all__ = ["AuditMigration", "packaged_migrations", "packaged_role_bootstrap"]

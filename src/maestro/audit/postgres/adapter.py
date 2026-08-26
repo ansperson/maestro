@@ -21,7 +21,7 @@ from maestro.audit.contracts import (
 )
 from maestro.audit.port import AuditWriteError, AuditWriteFailureKind
 
-_SUPPORTED_SCHEMA_VERSION = 2
+_SUPPORTED_SCHEMA_VERSION = 3
 _RETRYABLE_SQLSTATES = frozenset({"40001", "40P01", "53300", "57P01", "57P02", "57P03"})
 _TRANSACTION_ABORT_SQLSTATES = frozenset({"40001", "40P01"})
 _SAFE_SYNCHRONOUS_COMMIT_VALUES = frozenset({"on", "remote_apply"})
@@ -249,7 +249,6 @@ async def _insert_execution(
             repository_fingerprint
         ) VALUES (%s, %s, %s, %s, %s)
         ON CONFLICT DO NOTHING
-        RETURNING audit_id
         """,
         (
             record.execution.audit_id,
@@ -259,8 +258,7 @@ async def _insert_execution(
             record.execution.repository_fingerprint,
         ),
     )
-    row = await cursor.fetchone()
-    return row == (record.execution.audit_id,)
+    return cursor.rowcount == 1
 
 
 async def _insert_event(
@@ -281,7 +279,6 @@ async def _insert_event(
             payload
         ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT DO NOTHING
-        RETURNING event_id
         """,
         (
             event.event_id,
@@ -294,8 +291,7 @@ async def _insert_event(
             Jsonb(event.payload.model_dump(mode="json")),
         ),
     )
-    row = await cursor.fetchone()
-    return row == (event.event_id,)
+    return cursor.rowcount == 1
 
 
 async def _verify_start_record(
@@ -304,26 +300,17 @@ async def _verify_start_record(
 ) -> None:
     cursor = await connection.execute(
         """
-        SELECT
-            audit_id,
-            execution_id,
-            capability,
-            repository_id,
-            repository_fingerprint
-        FROM audit.executions
-        WHERE audit_id = %s OR execution_id = %s
+        SELECT audit.verify_execution_v1(%s, %s, %s, %s, %s)
         """,
-        (record.execution.audit_id, record.execution.execution_id),
+        (
+            record.execution.audit_id,
+            record.execution.execution_id,
+            record.execution.capability,
+            record.execution.repository_id,
+            record.execution.repository_fingerprint,
+        ),
     )
-    execution_rows = await cursor.fetchall()
-    expected_execution = (
-        record.execution.audit_id,
-        record.execution.execution_id,
-        record.execution.capability,
-        record.execution.repository_id,
-        record.execution.repository_fingerprint,
-    )
-    if execution_rows != [expected_execution]:
+    if await cursor.fetchone() != (True,):
         raise AuditWriteError(AuditWriteFailureKind.PERMANENT)
     await _verify_event_record(
         connection,
@@ -341,33 +328,19 @@ async def _verify_event_record(
 ) -> None:
     cursor = await connection.execute(
         """
-        SELECT
+        SELECT audit.verify_event_v1(%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        (
             event.event_id,
             event.audit_id,
-            execution.execution_id,
+            execution_id,
             event.sequence,
-            event.event_type,
+            event.event_type.value,
             event.event_version,
             event.occurred_at,
-            event.content_hash,
-            event.payload
-        FROM audit.events AS event
-        JOIN audit.executions AS execution ON execution.audit_id = event.audit_id
-        WHERE event.event_id = %s OR (event.audit_id = %s AND event.sequence = %s)
-        """,
-        (event.event_id, event.audit_id, event.sequence),
+            content_hash,
+            Jsonb(event.payload.model_dump(mode="json")),
+        ),
     )
-    rows = await cursor.fetchall()
-    expected = (
-        event.event_id,
-        event.audit_id,
-        execution_id,
-        event.sequence,
-        event.event_type.value,
-        event.event_version,
-        event.occurred_at,
-        content_hash,
-        event.payload.model_dump(mode="json"),
-    )
-    if rows != [expected]:
+    if await cursor.fetchone() != (True,):
         raise AuditWriteError(AuditWriteFailureKind.PERMANENT)
