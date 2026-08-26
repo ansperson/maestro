@@ -201,7 +201,7 @@ class AuditEventV1(_StrictFrozenModel):
         return self
 
     def content_hash(self) -> str:
-        """Hash canonical application-supplied content; persistence time is excluded."""
+        """Hash canonical immutable application content; database timestamps are excluded."""
 
         canonical = json.dumps(
             self.model_dump(mode="json"),
@@ -223,6 +223,7 @@ class AuditExecutionV1(_StrictFrozenModel):
 class AuditExecutionStartV1(_StrictFrozenModel):
     execution: AuditExecutionV1
     event: AuditEventV1
+    content_hash: _Digest
 
     @model_validator(mode="after")
     def validate_identity(self) -> Self:
@@ -230,24 +231,34 @@ class AuditExecutionStartV1(_StrictFrozenModel):
             raise ValueError("execution and start event Audit identities must agree")
         if self.event.event_type is not AuditEventType.EXECUTION_STARTED:
             raise ValueError("start record requires execution.started")
+        if self.content_hash != self.event.content_hash():
+            raise ValueError("start record content hash must match its immutable event")
         return self
 
 
 class AuditInvestigationCompletionV1(_StrictFrozenModel):
+    execution_id: UUID
     event: AuditEventV1
+    content_hash: _Digest
 
     @model_validator(mode="after")
     def validate_type(self) -> Self:
         if self.event.event_type is not AuditEventType.INVESTIGATION_COMPLETED:
             raise ValueError("completion record requires investigation.completed")
+        if self.content_hash != self.event.content_hash():
+            raise ValueError("completion record content hash must match its immutable event")
         return self
 
 
 class AuditExecutionFailureV1(_StrictFrozenModel):
+    execution_id: UUID
     event: AuditEventV1
+    content_hash: _Digest
 
     @model_validator(mode="after")
     def validate_type(self) -> Self:
         if self.event.event_type is not AuditEventType.EXECUTION_FAILED:
             raise ValueError("failure record requires execution.failed")
+        if self.content_hash != self.event.content_hash():
+            raise ValueError("failure record content hash must match its immutable event")
         return self

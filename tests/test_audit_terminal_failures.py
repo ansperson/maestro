@@ -403,6 +403,9 @@ async def test_failure_retry_reuses_one_terminal_identity(
     assert {record.event.event_id for record in port.failure_attempts} == {
         port.failures[0].event.event_id
     }
+    assert {record.content_hash for record in port.failure_attempts} == {
+        port.failures[0].content_hash
+    }
 
 
 @pytest.mark.asyncio

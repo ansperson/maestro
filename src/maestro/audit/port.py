@@ -30,7 +30,11 @@ class AuditWriteError(Exception):
 
 
 class AuditPort(Protocol):
-    """Persist the concrete v1 execution lifecycle; this is not a generic append API."""
+    """Persist the concrete idempotent v1 lifecycle; this is not a generic append API.
+
+    Retried calls receive the same immutable record. An implementation may accept an existing
+    identity only after exact record verification and must reject mismatched identity reuse.
+    """
 
     async def start_execution(self, record: AuditExecutionStartV1) -> None:
         """Atomically persist an execution and its sequence-one start event."""

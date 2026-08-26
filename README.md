@@ -151,11 +151,21 @@ questions and never includes an answer. Operational failures are typed tool erro
 `AUDIT_UNAVAILABLE`, `AUDIT_PERSISTENCE_ERROR`, and `INTERNAL_ERROR`.
 
 Audit is fail-closed. Maestro attempts each start or terminal write at most three times within
-one five-second budget, with fixed 100 ms and 250 ms backoffs. Only failures established as
-transient and not committed are retried. Exhausted availability failures return
-`AUDIT_UNAVAILABLE`; permanent or commit-ambiguous failures return `AUDIT_PERSISTENCE_ERROR`.
-Without a durable start, neither normative evaluation nor the AI worker runs. Without an
-established durable completion, Maestro withholds the semantic result.
+one five-second budget, with fixed 100 ms and 250 ms backoffs. Transient failures known not
+committed and ambiguous acknowledgement/commit outcomes are retried using the original immutable
+identities and record. A conflict succeeds only after the adapter verifies the exact execution,
+event envelope, canonical SHA-256 content hash, and typed JSON payload already stored; row
+existence or `ON CONFLICT DO NOTHING` alone is never success. Any identity/sequence mismatch or
+ambiguity that remains unresolved after the bounded budget returns `AUDIT_PERSISTENCE_ERROR`.
+Exhausted failures known not committed return `AUDIT_UNAVAILABLE`. Without a durable start,
+neither normative evaluation nor the AI worker runs. Without an established durable completion,
+Maestro withholds the semantic result.
+
+Before accepting a start, each short-lived PostgreSQL connection verifies the supported Audit
+schema and safe server durability settings: `fsync=on`, `full_page_writes=on`, and
+`synchronous_commit=on` or the stronger `remote_apply`. Unsupported, malformed, or weaker values
+fail closed before an execution or start event is inserted. Every persistence attempt uses a new
+connection; the successful start connection is closed before worker execution begins.
 
 After a durable start, a typed operational failure is recorded as the single sequence-two
 `execution.failed` event before the original operational error is returned. Its payload contains

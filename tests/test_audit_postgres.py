@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from types import TracebackType
@@ -11,6 +12,7 @@ from uuid import UUID
 import pytest
 from psycopg import AsyncConnection, errors, sql
 from psycopg.conninfo import make_conninfo
+from psycopg.types.json import Jsonb
 from pydantic import SecretStr
 
 import maestro.audit.postgres.adapter as adapter_module
@@ -80,6 +82,13 @@ class _FakePGconn:
             raise self._finish_error
 
 
+@dataclass(frozen=True, slots=True)
+class _FakeDurability:
+    fsync: object = "on"
+    full_page_writes: object = "on"
+    synchronous_commit: object = "on"
+
+
 class _FakeConnection:
     def __init__(
         self,
@@ -87,12 +96,22 @@ class _FakeConnection:
         transaction_exit_error: Exception | None = None,
         close_error: Exception | None = None,
         schema_version: int | None = 2,
+        durability: _FakeDurability | None = None,
     ) -> None:
         self._transaction_exit_error = transaction_exit_error
         self._close_error = close_error
         self._schema_version = schema_version
+        settings = durability or _FakeDurability()
+        self._durability: dict[str, object] = {
+            "SHOW fsync": settings.fsync,
+            "SHOW full_page_writes": settings.full_page_writes,
+            "SHOW synchronous_commit": settings.synchronous_commit,
+        }
         self.closed = False
         self.statements: list[str] = []
+        self.statement_params: list[tuple[object, ...] | None] = []
+        self.executions: list[tuple[object, ...]] = []
+        self.events: list[tuple[object, ...]] = []
         self.pgconn = _FakePGconn()
 
     def transaction(self) -> _FakeTransaction:
@@ -108,17 +127,70 @@ class _FakeConnection:
         query: str,
         params: tuple[object, ...] | None = None,
     ) -> _FakeCursor:
-        del params
         self.statements.append(query)
-        return _FakeCursor(self._schema_version)
+        self.statement_params.append(params)
+        fixed_rows = self._fixed_rows(query)
+        rows: list[tuple[object, ...]]
+        if fixed_rows is not None:
+            rows = fixed_rows
+        elif "INSERT INTO audit.executions" in query:
+            assert params is not None
+            candidate = params
+            conflicting = [
+                row for row in self.executions if row[0] == candidate[0] or row[1] == candidate[1]
+            ]
+            if conflicting:
+                rows = []
+            else:
+                self.executions.append(candidate)
+                rows = [(candidate[0],)]
+        elif "INSERT INTO audit.events" in query:
+            assert params is not None
+            encoded_payload = params[7]
+            assert isinstance(encoded_payload, Jsonb)
+            candidate = (*params[:7], encoded_payload.obj)
+            conflicting = [
+                row
+                for row in self.events
+                if row[0] == candidate[0] or (row[1] == candidate[1] and row[2] == candidate[2])
+            ]
+            if conflicting:
+                rows = []
+            else:
+                self.events.append(candidate)
+                rows = [(candidate[0],)]
+        elif "FROM audit.executions" in query:
+            assert params is not None
+            rows = [row for row in self.executions if row[0] == params[0] or row[1] == params[1]]
+        elif "FROM audit.events AS event" in query:
+            assert params is not None
+            rows = []
+            for event in self.events:
+                if event[0] != params[0] and not (event[1] == params[1] and event[2] == params[2]):
+                    continue
+                execution = next(row for row in self.executions if row[0] == event[1])
+                rows.append((*event[:2], execution[1], *event[2:]))
+        else:
+            rows = []
+        return _FakeCursor(rows)
+
+    def _fixed_rows(self, query: str) -> list[tuple[object, ...]] | None:
+        if "SELECT version FROM audit.schema_version" in query:
+            return [(self._schema_version,)] if self._schema_version is not None else []
+        if query in self._durability:
+            return [(self._durability[query],)]
+        return None
 
 
 class _FakeCursor:
-    def __init__(self, schema_version: int | None) -> None:
-        self._schema_version = schema_version
+    def __init__(self, rows: list[tuple[object, ...]]) -> None:
+        self._rows = rows
 
-    async def fetchone(self) -> tuple[int] | None:
-        return (self._schema_version,) if self._schema_version is not None else None
+    async def fetchone(self) -> tuple[object, ...] | None:
+        return self._rows[0] if self._rows else None
+
+    async def fetchall(self) -> list[tuple[object, ...]]:
+        return self._rows.copy()
 
 
 class _BlockingFailureConnection(_FakeConnection):
@@ -254,12 +326,250 @@ async def test_postgres_port_runs_all_short_transaction_shapes(
     await port.complete_investigation(completion)
     await port.fail_execution(failure)
 
-    assert len(connection.statements) == 7
+    assert len(connection.statements) == 10
     assert sum("SELECT version" in statement for statement in connection.statements) == 3
+    assert sum(statement.startswith("SHOW ") for statement in connection.statements) == 3
     assert (
         sum("INSERT INTO audit.executions" in statement for statement in connection.statements) == 1
     )
     assert sum("INSERT INTO audit.events" in statement for statement in connection.statements) == 3
+    assert connection.closed is True
+
+
+@pytest.mark.asyncio
+async def test_identical_start_and_terminal_retries_require_exact_verification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = _FakeConnection()
+    _patch_connection(monkeypatch, connection)
+    start, completion, _repository = await _records()
+    port = PostgresAuditPort(SecretStr("postgresql:///synthetic"))
+
+    await port.start_execution(start)
+    await port.start_execution(start)
+    await port.complete_investigation(completion)
+    await port.complete_investigation(completion)
+
+    assert len(connection.executions) == 1
+    assert len(connection.events) == 2
+    assert sum("FROM audit.executions" in statement for statement in connection.statements) == 1
+    assert (
+        sum("FROM audit.events AS event" in statement for statement in connection.statements) == 2
+    )
+    assert all(
+        "ON CONFLICT DO NOTHING" in statement
+        for statement in connection.statements
+        if "INSERT INTO audit." in statement
+    )
+
+
+@pytest.mark.asyncio
+async def test_identical_failure_retry_verifies_exact_terminal_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = _FakeConnection()
+    _patch_connection(monkeypatch, connection)
+    start, failure = await _failure_records()
+    port = PostgresAuditPort(SecretStr("postgresql:///synthetic"))
+
+    await port.start_execution(start)
+    await port.fail_execution(failure)
+    await port.fail_execution(failure)
+
+    assert len(connection.executions) == 1
+    assert len(connection.events) == 2
+    assert any("FROM audit.events AS event" in statement for statement in connection.statements)
+    assert port._active_failure_writes == {}  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_start_retry_uses_a_fresh_connection_and_exact_prior_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _FakeConnection(
+        transaction_exit_error=errors.AdminShutdown("lost commit acknowledgement")
+    )
+    second = _FakeConnection()
+    second.executions = first.executions
+    second.events = first.events
+    connections = iter((first, second))
+
+    async def connect(_database_url: str) -> _FakeConnection:
+        return next(connections)
+
+    monkeypatch.setattr(adapter_module.AsyncConnection, "connect", staticmethod(connect))
+    start, _completion, _repository = await _records()
+    port = PostgresAuditPort(SecretStr("postgresql:///synthetic"))
+
+    with pytest.raises(AuditWriteError) as ambiguous:
+        await port.start_execution(start)
+    assert ambiguous.value.kind is AuditWriteFailureKind.AMBIGUOUS
+    await port.start_execution(start)
+
+    assert first is not second
+    assert first.closed is second.closed is True
+    assert second.executions == first.executions
+    assert second.events == first.events
+    assert any("FROM audit.executions" in statement for statement in second.statements)
+    assert any("FROM audit.events AS event" in statement for statement in second.statements)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("collision", ["execution", "event", "sequence"])
+async def test_start_identity_reuse_with_different_content_is_rejected_atomically(
+    monkeypatch: pytest.MonkeyPatch,
+    collision: str,
+) -> None:
+    connection = _FakeConnection()
+    _patch_connection(monkeypatch, connection)
+    start, _completion, _repository = await _records()
+    port = PostgresAuditPort(SecretStr("postgresql:///synthetic"))
+    await port.start_execution(start)
+    changed_execution = start.execution.model_copy(
+        update={
+            "audit_id": UUID(int=20) if collision == "event" else start.execution.audit_id,
+            "execution_id": (
+                UUID(int=21) if collision == "sequence" else start.execution.execution_id
+            ),
+            "repository_fingerprint": "c" * 64,
+        }
+    )
+    changed_event = start.event.model_copy(
+        update={
+            "audit_id": changed_execution.audit_id,
+            "event_id": UUID(int=22) if collision == "sequence" else start.event.event_id,
+        }
+    )
+    changed = start.model_copy(update={"execution": changed_execution, "event": changed_event})
+
+    with pytest.raises(AuditWriteError) as failure:
+        await port.start_execution(changed)
+
+    assert failure.value.kind is AuditWriteFailureKind.PERMANENT
+    assert connection.executions == [
+        (
+            start.execution.audit_id,
+            start.execution.execution_id,
+            start.execution.capability,
+            start.execution.repository_id,
+            start.execution.repository_fingerprint,
+        )
+    ]
+    assert len(connection.events) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mismatch",
+    ["event_id", "execution_id", "timestamp", "payload", "stored_hash", "stored_type"],
+)
+async def test_terminal_conflict_verifies_every_immutable_field(
+    monkeypatch: pytest.MonkeyPatch,
+    mismatch: str,
+) -> None:
+    connection = _FakeConnection()
+    _patch_connection(monkeypatch, connection)
+    start, completion, _repository = await _records()
+    port = PostgresAuditPort(SecretStr("postgresql:///synthetic"))
+    await port.start_execution(start)
+    await port.complete_investigation(completion)
+    candidate = completion
+    if mismatch == "event_id":
+        candidate = completion.model_copy(
+            update={"event": completion.event.model_copy(update={"event_id": UUID(int=50)})}
+        )
+    elif mismatch == "execution_id":
+        candidate = completion.model_copy(update={"execution_id": UUID(int=51)})
+    elif mismatch == "timestamp":
+        candidate = completion.model_copy(
+            update={
+                "event": completion.event.model_copy(
+                    update={"occurred_at": datetime(2026, 8, 25, 0, 0, 1, tzinfo=UTC)}
+                )
+            }
+        )
+    elif mismatch == "payload":
+        payload = completion.event.payload
+        assert hasattr(payload, "rationale")
+        candidate = completion.model_copy(
+            update={
+                "event": completion.event.model_copy(
+                    update={
+                        "payload": payload.model_copy(
+                            update={"rationale": "Different validated rationale."}
+                        )
+                    }
+                )
+            }
+        )
+    elif mismatch == "stored_hash":
+        stored = connection.events[1]
+        connection.events[1] = (*stored[:6], "0" * 64, stored[7])
+    else:
+        stored = connection.events[1]
+        connection.events[1] = (*stored[:3], "execution.failed", *stored[4:])
+
+    with pytest.raises(AuditWriteError) as failure:
+        await port.complete_investigation(candidate)
+
+    assert failure.value.kind is AuditWriteFailureKind.PERMANENT
+    assert len(connection.events) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "durability",
+    [
+        _FakeDurability(fsync="off"),
+        _FakeDurability(full_page_writes="off"),
+        _FakeDurability(synchronous_commit="off"),
+        _FakeDurability(synchronous_commit="local"),
+        _FakeDurability(synchronous_commit="remote_write"),
+        _FakeDurability(synchronous_commit="unsupported"),
+        _FakeDurability(synchronous_commit=1),
+    ],
+)
+async def test_unsafe_or_unsupported_durability_fails_before_start_write(
+    monkeypatch: pytest.MonkeyPatch,
+    durability: _FakeDurability,
+) -> None:
+    connection = _FakeConnection(durability=durability)
+    _patch_connection(monkeypatch, connection)
+    start, _completion, _repository = await _records()
+    port = PostgresAuditPort(SecretStr("postgresql:///synthetic"))
+
+    with pytest.raises(AuditWriteError) as failure:
+        await port.start_execution(start)
+
+    assert failure.value.kind is AuditWriteFailureKind.PERMANENT
+    assert connection.executions == []
+    assert connection.events == []
+    assert connection.closed is True
+    assert all(
+        params is None
+        for statement, params in zip(
+            connection.statements,
+            connection.statement_params,
+            strict=True,
+        )
+        if statement.startswith("SHOW ")
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("synchronous_commit", ["on", "ON", "remote_apply"])
+async def test_supported_durability_is_accepted(
+    monkeypatch: pytest.MonkeyPatch,
+    synchronous_commit: str,
+) -> None:
+    connection = _FakeConnection(durability=_FakeDurability(synchronous_commit=synchronous_commit))
+    _patch_connection(monkeypatch, connection)
+    start, _completion, _repository = await _records()
+
+    await PostgresAuditPort(SecretStr("postgresql:///synthetic")).start_execution(start)
+
+    assert len(connection.executions) == 1
+    assert connection.closed is True
 
 
 @pytest.mark.asyncio
@@ -574,7 +884,9 @@ async def _records() -> tuple[
     return fake.starts[0], fake.completions[0], repository
 
 
-async def _failure_record(identifier_start: int = 101) -> AuditExecutionFailureV1:
+async def _failure_records(
+    identifier_start: int = 101,
+) -> tuple[AuditExecutionStartV1, AuditExecutionFailureV1]:
     identifiers = iter(UUID(int=value) for value in range(identifier_start, identifier_start + 5))
     fake = FakeAuditPort()
     recorder = AuditRecorder(
@@ -609,7 +921,81 @@ async def _failure_record(identifier_start: int = 101) -> AuditExecutionFailureV
         ErrorCode.AGENT_RUNTIME_ERROR,
         AuditFailureStage.INVESTIGATION,
     )
-    return fake.failures[0]
+    return fake.starts[0], fake.failures[0]
+
+
+async def _failure_record(identifier_start: int = 101) -> AuditExecutionFailureV1:
+    return (await _failure_records(identifier_start))[1]
+
+
+async def _assert_native_mismatches_rollback(
+    port: PostgresAuditPort,
+    start: AuditExecutionStartV1,
+    completion: AuditInvestigationCompletionV1,
+) -> UUID:
+    sequence_collision = completion.model_copy(
+        update={"event": completion.event.model_copy(update={"event_id": UUID(int=12)})}
+    )
+    with pytest.raises(AuditWriteError) as duplicate_mismatch:
+        await port.complete_investigation(sequence_collision)
+    assert duplicate_mismatch.value.kind is AuditWriteFailureKind.PERMANENT
+
+    content_collision = completion.model_copy(
+        update={
+            "event": completion.event.model_copy(
+                update={"occurred_at": datetime(2026, 8, 25, 0, 0, 1, tzinfo=UTC)}
+            )
+        }
+    )
+    with pytest.raises(AuditWriteError) as content_mismatch:
+        await port.complete_investigation(content_collision)
+    assert content_mismatch.value.kind is AuditWriteFailureKind.PERMANENT
+
+    new_audit_id = UUID(int=10)
+    rollback_event = AuditEventV1(
+        event_id=start.event.event_id,
+        audit_id=new_audit_id,
+        sequence=1,
+        event_type=AuditEventType.EXECUTION_STARTED,
+        occurred_at=start.event.occurred_at,
+        payload=start.event.payload,
+    )
+    rollback_start = AuditExecutionStartV1(
+        execution=AuditExecutionV1(
+            audit_id=new_audit_id,
+            execution_id=UUID(int=11),
+            repository_id="c" * 16,
+            repository_fingerprint="d" * 64,
+        ),
+        event=rollback_event,
+        content_hash=rollback_event.content_hash(),
+    )
+    with pytest.raises(AuditWriteError) as mismatch:
+        await port.start_execution(rollback_start)
+    assert mismatch.value.kind is AuditWriteFailureKind.PERMANENT
+    return new_audit_id
+
+
+async def _assert_native_unsafe_durability_rejected(
+    raw_dsn: str,
+    start: AuditExecutionStartV1,
+) -> UUID:
+    unsafe_execution = start.execution.model_copy(
+        update={"audit_id": UUID(int=20), "execution_id": UUID(int=21)}
+    )
+    unsafe_event = start.event.model_copy(
+        update={"audit_id": unsafe_execution.audit_id, "event_id": UUID(int=22)}
+    )
+    unsafe_start = start.model_copy(update={"execution": unsafe_execution, "event": unsafe_event})
+    unsafe_dsn = make_conninfo(
+        raw_dsn,
+        application_name="maestro-audit-unsafe-durability",
+        options="-c synchronous_commit=off",
+    )
+    with pytest.raises(AuditWriteError) as unsafe_durability:
+        await PostgresAuditPort(SecretStr(unsafe_dsn)).start_execution(unsafe_start)
+    assert unsafe_durability.value.kind is AuditWriteFailureKind.PERMANENT
+    return unsafe_execution.audit_id
 
 
 @pytest.mark.asyncio
@@ -631,7 +1017,7 @@ async def test_postgres_atomic_start_terminal_uniqueness_and_connection_lifetime
     application_dsn = make_conninfo(raw_dsn, application_name="maestro-audit-issue7")
     port = PostgresAuditPort(SecretStr(application_dsn))
     start, completion, _repository = await _records()
-    await port.start_execution(start)
+    await asyncio.gather(port.start_execution(start), port.start_execution(start))
     await port.complete_investigation(completion)
 
     observer = await AsyncConnection.connect(raw_dsn)
@@ -649,37 +1035,15 @@ async def test_postgres_atomic_start_terminal_uniqueness_and_connection_lifetime
     finally:
         await observer.close()
 
-    with pytest.raises(AuditWriteError) as duplicate:
-        await port.complete_investigation(completion)
-    assert duplicate.value.kind is AuditWriteFailureKind.PERMANENT
-
-    new_audit_id = UUID(int=10)
-    rollback_event = AuditEventV1(
-        event_id=start.event.event_id,
-        audit_id=new_audit_id,
-        sequence=1,
-        event_type=AuditEventType.EXECUTION_STARTED,
-        occurred_at=start.event.occurred_at,
-        payload=start.event.payload,
-    )
-    rollback_start = AuditExecutionStartV1(
-        execution=AuditExecutionV1(
-            audit_id=new_audit_id,
-            execution_id=UUID(int=11),
-            repository_id="c" * 16,
-            repository_fingerprint="d" * 64,
-        ),
-        event=rollback_event,
-    )
-    with pytest.raises(AuditWriteError) as mismatch:
-        await port.start_execution(rollback_start)
-    assert mismatch.value.kind is AuditWriteFailureKind.PERMANENT
+    await port.complete_investigation(completion)
+    new_audit_id = await _assert_native_mismatches_rollback(port, start, completion)
+    unsafe_audit_id = await _assert_native_unsafe_durability_rejected(raw_dsn, start)
 
     observer = await AsyncConnection.connect(raw_dsn)
     try:
         cursor = await observer.execute(
-            "SELECT count(*) FROM audit.executions WHERE audit_id = %s",
-            (new_audit_id,),
+            "SELECT count(*) FROM audit.executions WHERE audit_id IN (%s, %s)",
+            (new_audit_id, unsafe_audit_id),
         )
         assert await cursor.fetchone() == (0,)
         cursor = await observer.execute(

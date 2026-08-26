@@ -171,7 +171,11 @@ class AuditRecorder:
                     **self._metadata_fields(),
                 ),
             )
-            record = AuditExecutionStartV1(execution=execution, event=event)
+            record = AuditExecutionStartV1(
+                execution=execution,
+                event=event,
+                content_hash=event.content_hash(),
+            )
         except ValidationError:
             self._raise_public(AuditPersistenceError(), "start", 0)
         await self._persist("start", lambda: self._port.start_execution(record))
@@ -205,7 +209,11 @@ class AuditRecorder:
                 occurred_at=self._clock(),
                 payload=payload,
             )
-            record = AuditInvestigationCompletionV1(event=event)
+            record = AuditInvestigationCompletionV1(
+                execution_id=handle.execution_id,
+                event=event,
+                content_hash=event.content_hash(),
+            )
         except ValidationError:
             self._raise_public(AuditPersistenceError(), "completion", 0)
         await self._persist("completion", lambda: self._port.complete_investigation(record))
@@ -231,7 +239,11 @@ class AuditRecorder:
                     **self._metadata_fields(),
                 ),
             )
-            record = AuditExecutionFailureV1(event=event)
+            record = AuditExecutionFailureV1(
+                execution_id=handle.execution_id,
+                event=event,
+                content_hash=event.content_hash(),
+            )
         except ValidationError:
             self._raise_public(AuditPersistenceError(), "failure", 0)
         await self._persist("failure", lambda: self._port.fail_execution(record))
@@ -245,23 +257,31 @@ class AuditRecorder:
         policy = _AUDIT_RETRY_POLICY
         started = self._retry_timing.monotonic_clock()
         attempts = 0
+        ambiguous_outcome = False
         for attempt in range(1, policy.max_attempts + 1):
             remaining = self._remaining_budget(started)
             if remaining <= 0:
-                self._raise_public(AuditUnavailableError(), operation_name, attempts)
+                self._raise_exhausted(operation_name, attempts, ambiguous_outcome)
             attempts = attempt
             failure = await self._attempt(operation, remaining)
             if failure is None:
                 return
-            if failure is not AuditWriteFailureKind.RETRYABLE_NOT_COMMITTED:
+            if failure is AuditWriteFailureKind.PERMANENT:
                 self._raise_public(AuditPersistenceError(), operation_name, attempts)
+            ambiguous_outcome |= failure is AuditWriteFailureKind.AMBIGUOUS
             if attempt == policy.max_attempts:
-                self._raise_public(AuditUnavailableError(), operation_name, attempts)
+                self._raise_exhausted(operation_name, attempts, ambiguous_outcome)
             backoff = policy.backoffs_seconds[attempt - 1]
             remaining = self._remaining_budget(started)
             if backoff >= remaining:
-                self._raise_public(AuditUnavailableError(), operation_name, attempts)
-            await self._backoff(backoff, remaining, operation_name, attempts)
+                self._raise_exhausted(operation_name, attempts, ambiguous_outcome)
+            await self._backoff(
+                backoff,
+                remaining,
+                operation_name,
+                attempts,
+                ambiguous_outcome,
+            )
 
     @staticmethod
     async def _attempt(
@@ -287,12 +307,13 @@ class AuditRecorder:
         remaining: float,
         operation_name: str,
         attempts: int,
+        ambiguous_outcome: bool,
     ) -> None:
         try:
             async with asyncio.timeout(remaining):
                 await self._retry_timing.sleep(backoff)
         except TimeoutError:
-            self._raise_public(AuditUnavailableError(), operation_name, attempts)
+            self._raise_exhausted(operation_name, attempts, ambiguous_outcome)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -302,6 +323,18 @@ class AuditRecorder:
         return _AUDIT_RETRY_POLICY.total_budget_seconds - (
             self._retry_timing.monotonic_clock() - started
         )
+
+    @classmethod
+    def _raise_exhausted(
+        cls,
+        operation_name: str,
+        attempts: int,
+        ambiguous_outcome: bool,
+    ) -> NoReturn:
+        error: MaestroError = (
+            AuditPersistenceError() if ambiguous_outcome else AuditUnavailableError()
+        )
+        cls._raise_public(error, operation_name, attempts)
 
     @staticmethod
     def _raise_public(error: MaestroError, operation_name: str, attempts: int) -> NoReturn:
