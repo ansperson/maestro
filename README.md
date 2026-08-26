@@ -162,10 +162,17 @@ After a durable start, a typed operational failure is recorded as the single seq
 only the safe error code, lifecycle stage, and approved runtime/version metadata. If that terminal
 write also fails, the Audit operational error takes precedence. Cooperative cancellation remains
 the exception to error precedence: after owned worker cleanup, Maestro attempts the failure write
-in a separate one-second bounded task, joins that task, and always propagates the caller's original
-cancellation. A durable start without either terminal event is explicitly incomplete. Abrupt
-process loss can therefore leave an incomplete Trail; startup does not reconcile it or invent an
-outcome.
+in a separate task. The PostgreSQL adapter registers the failure-event identity before connecting;
+on timeout it marks a pending connection aborted or synchronously finishes the active libpq
+connection before task cancellation. The one-second cooperative persistence-and-drain budget
+reserves time for that abort and reap. Maestro then joins the task to quiescence and always
+propagates the caller's original cancellation. If connection finish itself fails, that joined drain
+can extend past the cooperative budget rather than leave orphan work. A durable start without
+either terminal event is explicitly incomplete. Abrupt process loss can therefore leave an
+incomplete Trail; startup does not reconcile it or invent an outcome.
+
+Stated conservatively, this is a one-second cooperative persistence-attempt budget followed by
+joined quiescence, not an unconditional hard wall-clock return bound.
 
 ### Configuration and bounds
 
@@ -176,6 +183,11 @@ and 1 MiB per file. Every limit is environment-configurable with the correspondi
 `MAESTRO_` setting in `.env.example`. Invalid configuration fails before the server starts.
 Allowed roots are canonicalized and filesystem anchors are prohibited; repository requests for
 an anchor fail with the existing `REPOSITORY_NOT_ALLOWED` public error.
+
+`MAESTRO_CODEX_MODEL` is an Audit- and log-safe identifier, not free-form metadata. It must begin
+with an ASCII letter or digit, contain only ASCII letters, digits, dots, underscores, or hyphens,
+and be at most 128 characters. This deliberately rejects URI credentials, filesystem identities,
+secret assignments, controls, unsafe Unicode, and prose before startup.
 
 File discovery does not follow symlinks, skips `.git`, dependency/build caches, binary,
 non-UTF-8, and oversized content, and preserves an explicitly requested subdirectory rather

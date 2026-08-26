@@ -15,9 +15,7 @@ from maestro.capabilities.resolve_codebase_fact.contracts import (
     MAX_EVIDENCE_ITEMS,
     MAX_QUESTION_CHARS,
 )
-
-_MAX_MODEL_IDENTIFIER_CHARS = 128
-_FIRST_PRINTABLE_CODEPOINT = 33
+from maestro.model_identity import ModelIdentifier
 
 
 class Settings(BaseSettings):
@@ -28,6 +26,7 @@ class Settings(BaseSettings):
         extra="ignore",
         enable_decoding=False,
         case_sensitive=False,
+        hide_input_in_errors=True,
     )
 
     allowed_roots: tuple[Path, ...]
@@ -44,7 +43,7 @@ class Settings(BaseSettings):
     max_repository_bytes: Annotated[int, Field(ge=1_024, le=1_073_741_824)] = 67_108_864
     max_file_bytes: Annotated[int, Field(ge=1, le=67_108_864)] = 1_048_576
     log_level: str = "INFO"
-    codex_model: str = "gpt-5.4"
+    codex_model: ModelIdentifier = Field(default_factory=lambda: ModelIdentifier("gpt-5.4"))
     codex_auth_file: Path | None = None
     codex_api_key: SecretStr | None = None
     audit_database_url: Annotated[SecretStr, Field(min_length=1, max_length=4_096)] = Field()
@@ -94,20 +93,6 @@ class Settings(BaseSettings):
         if normalized not in {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"}:
             raise ValueError("MAESTRO_LOG_LEVEL is invalid")
         return normalized
-
-    @field_validator("codex_model")
-    @classmethod
-    def validate_model(_cls, value: str) -> str:  # noqa: N804
-        """Reject empty or control-bearing model identifiers."""
-
-        stripped = value.strip()
-        if (
-            not stripped
-            or len(stripped) > _MAX_MODEL_IDENTIFIER_CHARS
-            or any(ord(char) < _FIRST_PRINTABLE_CODEPOINT for char in stripped)
-        ):
-            raise ValueError("MAESTRO_CODEX_MODEL is invalid")
-        return stripped
 
     @field_validator("codex_auth_file")
     @classmethod

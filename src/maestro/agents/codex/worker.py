@@ -29,7 +29,7 @@ async def investigate(request: CodexWorkerRequest) -> VerificationResult:
     """Perform exactly one structured, deny-escalation, read-only Codex turn."""
 
     codex_home = Path(os.environ["CODEX_HOME"])
-    _write_isolated_config(codex_home, request.model)
+    _write_isolated_config(codex_home, request.model.value)
     config = CodexConfig(cwd=str(request.repository_root), env={"CODEX_HOME": str(codex_home)})
     async with AsyncCodex(config) as codex:
         api_key = os.environ.get("MAESTRO_CODEX_API_KEY")
@@ -40,7 +40,7 @@ async def investigate(request: CodexWorkerRequest) -> VerificationResult:
             cwd=str(request.repository_root),
             developer_instructions=VERIFIER_INSTRUCTIONS,
             ephemeral=True,
-            model=request.model,
+            model=request.model.value,
             sandbox=Sandbox.read_only,
         )
         handle = await thread.turn(

@@ -9,7 +9,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import NoReturn
+from typing import NoReturn, TypedDict
 from uuid import UUID, uuid4
 
 from pydantic import ValidationError
@@ -33,6 +33,7 @@ from maestro.audit.contracts import (
 from maestro.audit.port import AuditPort, AuditWriteError, AuditWriteFailureKind
 from maestro.audit.sanitization import sanitize_audit_text
 from maestro.errors import AuditPersistenceError, AuditUnavailableError, ErrorCode, MaestroError
+from maestro.model_identity import ModelIdentifier
 from maestro.repository.guard import AuthorizedRepository, RepositoryFingerprint
 
 _LOGGER = logging.getLogger("maestro.audit")
@@ -68,7 +69,15 @@ class AuditRuntimeMetadata:
     server_version: str
     runtime_name: str
     runtime_version: str
-    model: str
+    model: ModelIdentifier
+    prompt_policy_version: str
+
+
+class _MetadataFields(TypedDict):
+    server_version: str
+    runtime_name: str
+    runtime_version: str
+    model: ModelIdentifier
     prompt_policy_version: str
 
 
@@ -227,6 +236,11 @@ class AuditRecorder:
             self._raise_public(AuditPersistenceError(), "failure", 0)
         await self._persist("failure", lambda: self._port.fail_execution(record))
 
+    def abort_execution_failure(self, handle: AuditExecutionHandle) -> None:
+        """Abort only this execution's active failure write without awaiting adapter I/O."""
+
+        self._port.abort_execution_failure(handle.terminal_event_id)
+
     async def _persist(self, operation_name: str, operation: _PersistenceOperation) -> None:
         policy = _AUDIT_RETRY_POLICY
         started = self._retry_timing.monotonic_clock()
@@ -304,7 +318,7 @@ class AuditRecorder:
         )
         raise error from None
 
-    def _metadata_fields(self) -> dict[str, str]:
+    def _metadata_fields(self) -> _MetadataFields:
         return {
             "server_version": self._metadata.server_version,
             "runtime_name": self._metadata.runtime_name,

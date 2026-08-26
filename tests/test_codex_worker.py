@@ -11,6 +11,7 @@ from typing import cast
 
 import pytest
 from openai_codex import ApprovalMode, Sandbox
+from pydantic import ValidationError
 
 from maestro.agents.codex import worker
 from maestro.agents.codex.protocol import CodexWorkerRequest
@@ -20,6 +21,7 @@ from maestro.capabilities.resolve_codebase_fact.contracts import (
     VerificationResult,
     VerificationStatus,
 )
+from maestro.model_identity import ModelIdentifier
 
 
 def _result() -> VerificationResult:
@@ -38,9 +40,32 @@ def _request(repository: Path) -> CodexWorkerRequest:
         repository_root=repository,
         question="Is the field a list?",
         context="Consumer background only.",
-        model="gpt-5.4",
+        model=ModelIdentifier("gpt-5.4"),
         max_output_bytes=8_192,
     )
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "postgresql://reader:fixture-password@db/maestro",  # pragma: allowlist secret
+        "/private/model",
+        r"C:\private\model",
+        r"\\server\share\model",
+        "API_KEY=fixture-secret",
+        "gpt-5.4\u200b",
+        "production model",
+    ],
+)
+def test_worker_protocol_rejects_unsafe_model_identifier_families(
+    repository: Path,
+    model: str,
+) -> None:
+    payload = _request(repository).model_dump()
+    payload["model"] = model
+
+    with pytest.raises(ValidationError, match="Audit-safe"):
+        CodexWorkerRequest.model_validate(payload, strict=True)
 
 
 class _FakeHandle:

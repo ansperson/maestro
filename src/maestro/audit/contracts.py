@@ -13,6 +13,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 from maestro.errors import ErrorCode
+from maestro.model_identity import ModelIdentifier
 
 MAX_AUDIT_OBJECTIVE_CHARS = 4_000
 MAX_AUDIT_ANSWER_CHARS = 8_000
@@ -119,7 +120,7 @@ class ExecutionStartedV1(_StrictFrozenModel):
     server_version: _VersionText
     runtime_name: _VersionText
     runtime_version: _VersionText
-    model: _VersionText
+    model: ModelIdentifier
     prompt_policy_version: _VersionText
 
 
@@ -143,7 +144,7 @@ class InvestigationCompletedV1(_StrictFrozenModel):
     server_version: _VersionText
     runtime_name: _VersionText
     runtime_version: _VersionText
-    model: _VersionText
+    model: ModelIdentifier
     prompt_policy_version: _VersionText
 
     @model_validator(mode="after")
@@ -161,7 +162,7 @@ class ExecutionFailedV1(_StrictFrozenModel):
     server_version: _VersionText
     runtime_name: _VersionText
     runtime_version: _VersionText
-    model: _VersionText
+    model: ModelIdentifier
     prompt_policy_version: _VersionText
 
 

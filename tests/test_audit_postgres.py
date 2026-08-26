@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from datetime import UTC, datetime
 from pathlib import Path
@@ -34,6 +35,7 @@ from maestro.audit.recorder import (
 )
 from maestro.audit.testing import FakeAuditPort
 from maestro.errors import ErrorCode
+from maestro.model_identity import ModelIdentifier
 from maestro.repository.guard import AuthorizedRepository, RepositoryFingerprint
 
 _TEST_DSN_ENV = "MAESTRO_TEST_POSTGRES_DSN"
@@ -58,6 +60,26 @@ class _FakeTransaction:
         return False
 
 
+class _FakePGconn:
+    def __init__(
+        self,
+        *,
+        finish_error: Exception | None = None,
+        release_on_finish: bool = True,
+    ) -> None:
+        self._finish_error = finish_error
+        self._release_on_finish = release_on_finish
+        self.finished = asyncio.Event()
+        self.finish_calls = 0
+
+    def finish(self) -> None:
+        self.finish_calls += 1
+        if self._release_on_finish:
+            self.finished.set()
+        if self._finish_error is not None:
+            raise self._finish_error
+
+
 class _FakeConnection:
     def __init__(
         self,
@@ -71,6 +93,7 @@ class _FakeConnection:
         self._schema_version = schema_version
         self.closed = False
         self.statements: list[str] = []
+        self.pgconn = _FakePGconn()
 
     def transaction(self) -> _FakeTransaction:
         return _FakeTransaction(self._transaction_exit_error)
@@ -96,6 +119,26 @@ class _FakeCursor:
 
     async def fetchone(self) -> tuple[int] | None:
         return (self._schema_version,) if self._schema_version is not None else None
+
+
+class _BlockingFailureConnection(_FakeConnection):
+    def __init__(self, *, pgconn: _FakePGconn | None = None) -> None:
+        super().__init__()
+        self.pgconn = pgconn or _FakePGconn()
+        self.failure_query_entered = asyncio.Event()
+
+    async def execute(
+        self,
+        query: str,
+        params: tuple[object, ...] | None = None,
+    ) -> _FakeCursor:
+        if "INSERT INTO audit.events" not in query:
+            return await super().execute(query, params)
+        del params
+        self.statements.append(query)
+        self.failure_query_entered.set()
+        await self.pgconn.finished.wait()
+        raise errors.OperationalError("synthetic closed connection")
 
 
 def _patch_connection(
@@ -217,6 +260,145 @@ async def test_postgres_port_runs_all_short_transaction_shapes(
         sum("INSERT INTO audit.executions" in statement for statement in connection.statements) == 1
     )
     assert sum("INSERT INTO audit.events" in statement for statement in connection.statements) == 3
+
+
+@pytest.mark.asyncio
+async def test_failure_abort_before_connection_marks_and_finishes_late_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connect_entered = asyncio.Event()
+    release_connect = asyncio.Event()
+    connection = _FakeConnection()
+
+    async def connect(_database_url: str) -> _FakeConnection:
+        connect_entered.set()
+        await release_connect.wait()
+        return connection
+
+    monkeypatch.setattr(adapter_module.AsyncConnection, "connect", staticmethod(connect))
+    failure = await _failure_record()
+    port = PostgresAuditPort(SecretStr("postgresql:///synthetic"))
+    task = asyncio.create_task(port.fail_execution(failure))
+    await connect_entered.wait()
+
+    port.abort_execution_failure(failure.event.event_id)
+    release_connect.set()
+
+    with pytest.raises(AuditWriteError) as error:
+        await task
+    assert error.value.kind is AuditWriteFailureKind.RETRYABLE_NOT_COMMITTED
+    assert connection.pgconn.finish_calls == 1
+    assert connection.closed is True
+    assert port._active_failure_writes == {}  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_failure_abort_then_cancellation_reaps_pending_connection_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connect_entered = asyncio.Event()
+    connect_cleaned = asyncio.Event()
+
+    async def connect(_database_url: str) -> _FakeConnection:
+        connect_entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            connect_cleaned.set()
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(adapter_module.AsyncConnection, "connect", staticmethod(connect))
+    failure = await _failure_record()
+    port = PostgresAuditPort(SecretStr("postgresql:///synthetic"))
+    task = asyncio.create_task(port.fail_execution(failure))
+    await connect_entered.wait()
+
+    port.abort_execution_failure(failure.event.event_id)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert connect_cleaned.is_set()
+    assert port._active_failure_writes == {}  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_failure_abort_finishes_active_query_and_unregisters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = _BlockingFailureConnection()
+    _patch_connection(monkeypatch, connection)
+    failure = await _failure_record()
+    port = PostgresAuditPort(SecretStr("postgresql:///synthetic"))
+    task = asyncio.create_task(port.fail_execution(failure))
+    await connection.failure_query_entered.wait()
+
+    port.abort_execution_failure(failure.event.event_id)
+
+    with pytest.raises(AuditWriteError):
+        await task
+    assert connection.pgconn.finish_calls == 1
+    assert connection.closed is True
+    assert port._active_failure_writes == {}  # pyright: ignore[reportPrivateUsage]
+    port.abort_execution_failure(failure.event.event_id)
+    assert connection.pgconn.finish_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_failure_abort_isolated_across_concurrent_event_identities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_connection = _BlockingFailureConnection()
+    second_connection = _BlockingFailureConnection()
+    connections = iter((first_connection, second_connection))
+
+    async def connect(_database_url: str) -> _BlockingFailureConnection:
+        return next(connections)
+
+    monkeypatch.setattr(adapter_module.AsyncConnection, "connect", staticmethod(connect))
+    first = await _failure_record(101)
+    second = await _failure_record(201)
+    port = PostgresAuditPort(SecretStr("postgresql:///synthetic"))
+    first_task = asyncio.create_task(port.fail_execution(first))
+    second_task = asyncio.create_task(port.fail_execution(second))
+    await first_connection.failure_query_entered.wait()
+    await second_connection.failure_query_entered.wait()
+
+    port.abort_execution_failure(first.event.event_id)
+    with pytest.raises(AuditWriteError):
+        await first_task
+    assert second_task.done() is False
+    assert second_connection.pgconn.finish_calls == 0
+
+    port.abort_execution_failure(second.event.event_id)
+    with pytest.raises(AuditWriteError):
+        await second_task
+    assert port._active_failure_writes == {}  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_failure_abort_finish_error_still_allows_cancellation_to_reap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pgconn = _FakePGconn(
+        finish_error=RuntimeError("private finish diagnostic"),
+        release_on_finish=False,
+    )
+    connection = _BlockingFailureConnection(pgconn=pgconn)
+    _patch_connection(monkeypatch, connection)
+    failure = await _failure_record()
+    port = PostgresAuditPort(SecretStr("postgresql:///synthetic"))
+    task = asyncio.create_task(port.fail_execution(failure))
+    await connection.failure_query_entered.wait()
+
+    port.abort_execution_failure(failure.event.event_id)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert pgconn.finish_calls == 1
+    assert connection.closed is True
+    assert port._active_failure_writes == {}  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.asyncio
@@ -360,7 +542,7 @@ async def _records() -> tuple[
             server_version="1.0.0",
             runtime_name="codex",
             runtime_version="0.147.0",
-            model="gpt-5.4",
+            model=ModelIdentifier("gpt-5.4"),
             prompt_policy_version="repository-verifier/v1",
         ),
         id_factory=lambda: next(identifiers),
@@ -392,8 +574,8 @@ async def _records() -> tuple[
     return fake.starts[0], fake.completions[0], repository
 
 
-async def _failure_record() -> AuditExecutionFailureV1:
-    identifiers = iter(UUID(int=value) for value in range(101, 106))
+async def _failure_record(identifier_start: int = 101) -> AuditExecutionFailureV1:
+    identifiers = iter(UUID(int=value) for value in range(identifier_start, identifier_start + 5))
     fake = FakeAuditPort()
     recorder = AuditRecorder(
         fake,
@@ -401,7 +583,7 @@ async def _failure_record() -> AuditExecutionFailureV1:
             server_version="1.0.0",
             runtime_name="codex",
             runtime_version="0.147.0",
-            model="gpt-5.4",
+            model=ModelIdentifier("gpt-5.4"),
             prompt_policy_version="repository-verifier/v1",
         ),
         id_factory=lambda: next(identifiers),

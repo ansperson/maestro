@@ -168,3 +168,64 @@ def test_settings_rejects_malformed_audit_url_without_reflecting_credentials(
         )
 
     assert private_value not in str(error.value)
+
+
+_UNSAFE_MODEL_IDENTIFIERS = (
+    "postgresql://reader:fixture-password@db/maestro",  # pragma: allowlist secret
+    "/Users/alice/.config/model",
+    r"C:\Users\alice\model",
+    r"\\server\share\model",
+    "gpt-5.4\nAPI_KEY=fixture-secret",
+    "gpt-5.4\u200b",
+    "API_KEY=fixture-secret",
+    "the current production model",
+)
+
+
+@pytest.mark.parametrize("model", _UNSAFE_MODEL_IDENTIFIERS)
+def test_settings_rejects_unsafe_model_identifier_families_before_startup(
+    tmp_path: Path,
+    model: str,
+) -> None:
+    with pytest.raises(ValidationError, match="Audit-safe") as error:
+        Settings.model_validate(
+            {
+                "allowed_roots": (tmp_path,),
+                "audit_database_url": "postgresql://audit-writer@localhost/maestro",
+                "codex_model": model,
+            }
+        )
+    assert model not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "gpt-5.4",
+        "o3",
+        "codex-mini-latest",
+        "gpt-5.4-2026-08-01",
+        "m" * 128,
+    ],
+)
+def test_settings_retains_supported_safe_model_identifiers(tmp_path: Path, model: str) -> None:
+    settings = Settings.model_validate(
+        {
+            "allowed_roots": (tmp_path,),
+            "audit_database_url": "postgresql://audit-writer@localhost/maestro",
+            "codex_model": model,
+        }
+    )
+
+    assert settings.codex_model.value == model
+
+
+def test_settings_rejects_overlong_model_identifier(tmp_path: Path) -> None:
+    with pytest.raises(ValidationError, match="Audit-safe"):
+        Settings.model_validate(
+            {
+                "allowed_roots": (tmp_path,),
+                "audit_database_url": "postgresql://audit-writer@localhost/maestro",
+                "codex_model": "m" * 129,
+            }
+        )

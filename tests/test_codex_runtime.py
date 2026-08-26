@@ -29,7 +29,7 @@ def _request(repository: Path, max_output_bytes: int = 8_192) -> InvestigationRe
         question="Is Order.payments a list?",
         context=None,
         repository_fingerprint="fixture-fingerprint",
-        model="gpt-5.4",
+        model="gpt-5.4",  # pyright: ignore[reportArgumentType]
         max_output_bytes=max_output_bytes,
     )
 

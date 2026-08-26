@@ -81,10 +81,20 @@ does not persist prompts, transcripts, repository content, or model output.
   trail; duplicate verification and recovery remain outside this release boundary. Adapter
   details, SQL, SQLSTATE, hosts, users, and credentials are excluded from public errors and logs.
 - Operational failures after a durable start persist only their safe error code, bounded lifecycle
-  stage, and approved version metadata. Cancellation failure persistence has a separate one-second
-  budget and is joined before the original cancellation propagates. Host/process loss or an
-  unestablished terminal write can still leave a start-only Trail; startup deliberately does not
-  manufacture a terminal outcome.
+  stage, and approved version metadata. The configured model value crosses one typed safe-identifier
+  boundary before startup: only a bounded ASCII alphanumeric/dot/underscore/hyphen grammar is
+  accepted, so URI credentials, path identities, secret assignments, controls, unsafe Unicode,
+  and prose cannot enter Audit or structured model metadata. Cancellation failure persistence has
+  a separate one-second cooperative persistence-attempt and drain budget. The PostgreSQL adapter
+  marks a pre-connect abort or synchronously finishes the active failure connection before task
+  cancellation; Maestro joins the task before propagating the original cancellation. A failed
+  connection finish or nonconforming port can make joined quiescence extend past the cooperative
+  budget, which is preferred to orphaning persistence work. Host/process loss or an unestablished
+  terminal write can still leave a start-only Trail; startup deliberately does not manufacture a
+  terminal outcome.
+
+  The cancellation guarantee is therefore a one-second cooperative persistence-attempt budget
+  followed by joined quiescence, not an unconditional one-second wall-clock return guarantee.
 - The Level 2 container permits provider networking and cannot technically distinguish it from
   arbitrary egress by a compromised process. Every configured allowed root is readable by the
   shared container. Higher assurance requires controlled egress and/or per-worker containers.

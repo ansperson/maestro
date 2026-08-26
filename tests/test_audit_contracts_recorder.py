@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 from uuid import UUID
 
 import pytest
@@ -37,6 +37,7 @@ from maestro.capabilities.resolve_codebase_fact.audit_mapping import (
     map_result_to_audit_completion,
 )
 from maestro.errors import AuditPersistenceError, ErrorCode
+from maestro.model_identity import ModelIdentifier
 from maestro.repository.guard import AuthorizedRepository, RepositoryFingerprint
 
 _NOW = datetime(2026, 8, 25, 12, 0, tzinfo=UTC)
@@ -52,13 +53,24 @@ type DurableTextField = Literal[
     "conflict_evidence_finding",
 ]
 
+_UNSAFE_MODEL_IDENTIFIERS = (
+    "postgresql://reader:fixture-password@db/maestro",  # pragma: allowlist secret
+    "/Users/alice/.config/model",
+    r"C:\Users\alice\model",
+    r"\\server\share\model",
+    "gpt-5.4\nAPI_KEY=fixture-secret",
+    "gpt-5.4\u200b",
+    "API_KEY=fixture-secret",
+    "the current production model",
+)
+
 
 def _metadata() -> AuditRuntimeMetadata:
     return AuditRuntimeMetadata(
         server_version="1.0.0",
         runtime_name="codex",
         runtime_version="0.147.0",
-        model="gpt-5.4",
+        model=ModelIdentifier("gpt-5.4"),
         prompt_policy_version="repository-verifier/v1",
     )
 
@@ -545,7 +557,7 @@ async def test_recorder_maps_start_contract_construction_failure_before_port_cal
             server_version=metadata.server_version,
             runtime_name=metadata.runtime_name,
             runtime_version=metadata.runtime_version,
-            model="m" * 129,
+            model=cast(ModelIdentifier, "m" * 129),
             prompt_policy_version=metadata.prompt_policy_version,
         ),
     )
@@ -585,7 +597,7 @@ def test_event_contract_rejects_extra_fields_and_mismatched_sequence() -> None:
         server_version="1.0.0",
         runtime_name="codex",
         runtime_version="0.147.0",
-        model="gpt-5.4",
+        model=ModelIdentifier("gpt-5.4"),
         prompt_policy_version="repository-verifier/v1",
     )
     with pytest.raises(ValidationError, match="extra_forbidden"):
@@ -612,6 +624,45 @@ def test_event_contract_rejects_extra_fields_and_mismatched_sequence() -> None:
         )
 
 
+@pytest.mark.parametrize("model", _UNSAFE_MODEL_IDENTIFIERS)
+def test_every_audit_event_payload_rejects_unsafe_model_identifiers(model: str) -> None:
+    metadata = {
+        "server_version": "1.0.0",
+        "runtime_name": "codex",
+        "runtime_version": "0.147.0",
+        "model": model,
+        "prompt_policy_version": "repository-verifier/v1",
+    }
+    payloads = (
+        {
+            "objective": "Determine whether the fact is true.",
+            **metadata,
+        },
+        {
+            "status": "uncertain",
+            "answer": None,
+            "confidence": "low",
+            "rationale": "The repository does not establish the fact.",
+            "evidence": (),
+            "conflicts": (),
+            **metadata,
+        },
+        {
+            "error_code": "INTERNAL_ERROR",
+            "failure_stage": "validation",
+            **metadata,
+        },
+    )
+
+    for contract, payload in zip(
+        (ExecutionStartedV1, InvestigationCompletedV1, ExecutionFailedV1),
+        payloads,
+        strict=True,
+    ):
+        with pytest.raises(ValidationError, match="Audit-safe"):
+            contract.model_validate(payload, strict=True)
+
+
 def test_completed_contract_preserves_all_semantic_statuses() -> None:
     for status in AuditResultStatus:
         payload = InvestigationCompletedV1(
@@ -628,7 +679,7 @@ def test_completed_contract_preserves_all_semantic_statuses() -> None:
             server_version="1.0.0",
             runtime_name="codex",
             runtime_version="0.147.0",
-            model="gpt-5.4",
+            model=ModelIdentifier("gpt-5.4"),
             prompt_policy_version="repository-verifier/v1",
         )
         assert payload.status is status
@@ -686,7 +737,7 @@ def test_failure_contract_rejects_non_terminal_shape() -> None:
         server_version="1.0.0",
         runtime_name="codex",
         runtime_version="0.147.0",
-        model="gpt-5.4",
+        model=ModelIdentifier("gpt-5.4"),
         prompt_policy_version="repository-verifier/v1",
     )
 
@@ -712,7 +763,7 @@ def test_failure_record_rejects_a_semantic_completion_event() -> None:
         server_version="1.0.0",
         runtime_name="codex",
         runtime_version="0.147.0",
-        model="gpt-5.4",
+        model=ModelIdentifier("gpt-5.4"),
         prompt_policy_version="repository-verifier/v1",
     )
     event = AuditEventV1(
@@ -738,7 +789,7 @@ async def test_failure_contract_construction_error_precedes_port_call() -> None:
             server_version=metadata.server_version,
             runtime_name=metadata.runtime_name,
             runtime_version=metadata.runtime_version,
-            model="m" * 129,
+            model=cast(ModelIdentifier, "m" * 129),
             prompt_policy_version=metadata.prompt_policy_version,
         ),
         clock=lambda: _NOW,

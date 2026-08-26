@@ -46,6 +46,7 @@ from maestro.repository.guard import AuthorizedRepository, RepositoryFingerprint
 _DEPTH: contextvars.ContextVar[int] = contextvars.ContextVar("maestro_verifier_depth", default=0)
 _LOGGER = logging.getLogger("maestro.resolve_codebase_fact")
 _CANCELLATION_AUDIT_BUDGET_SECONDS = 1.0
+_CANCELLATION_AUDIT_DRAIN_RESERVE_SECONDS = 0.1
 
 
 @dataclass(slots=True)
@@ -140,7 +141,7 @@ class ResolveCodebaseFactService:
                         "repository": repository.repository_id,
                         "repository_fingerprint": fingerprint.digest,
                         "server_version": __version__,
-                        "model": self._settings.codex_model,
+                        "model": self._settings.codex_model.value,
                         "prompt_policy_version": POLICY_VERSION,
                         "duration_ms": round((time.monotonic() - state.started) * 1_000, 2),
                         "queue_duration_ms": queue_duration_ms,
@@ -224,7 +225,7 @@ class ResolveCodebaseFactService:
                     if state.fingerprint is not None
                     else None,
                     "server_version": __version__,
-                    "model": self._settings.codex_model,
+                    "model": self._settings.codex_model.value,
                     "prompt_policy_version": POLICY_VERSION,
                     "duration_ms": round((time.monotonic() - state.started) * 1_000, 2),
                     "error_code": error_code.value,
@@ -301,15 +302,28 @@ class ResolveCodebaseFactService:
             ),
             name=f"audit-cancellation-{handle.execution_id.hex}",
         )
-        try:
-            async with asyncio.timeout(_CANCELLATION_AUDIT_BUDGET_SECONDS):
-                await asyncio.shield(cleanup)
-        except (Exception, asyncio.CancelledError):
-            cleanup.cancel()
-        finally:
-            if not cleanup.done():
-                cleanup.cancel()
-            await self._join_cleanup_task(cleanup)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _CANCELLATION_AUDIT_BUDGET_SECONDS
+        drain_reserve = min(
+            _CANCELLATION_AUDIT_DRAIN_RESERVE_SECONDS,
+            _CANCELLATION_AUDIT_BUDGET_SECONDS / 5,
+        )
+        await self._wait_for_cleanup(cleanup, deadline - drain_reserve)
+        if not cleanup.done():
+            self._abort_and_cancel_cleanup(handle, cleanup)
+        exceeded_budget = await self._join_cleanup_task(cleanup, handle, deadline)
+        if exceeded_budget:
+            _LOGGER.warning(
+                "audit cancellation cleanup exceeded cooperative budget",
+                extra={
+                    "metadata": {
+                        "request_id": handle.execution_id.hex,
+                        "capability": "resolve_codebase_fact",
+                        "error_code": ErrorCode.AGENT_CANCELLED.value,
+                        "failure_stage": failure_stage.value,
+                    }
+                },
+            )
         established = cleanup.done() and not cleanup.cancelled() and cleanup.exception() is None
         if not established:
             _LOGGER.warning(
@@ -325,18 +339,54 @@ class ResolveCodebaseFactService:
             )
 
     @staticmethod
-    async def _join_cleanup_task(cleanup: asyncio.Task[None]) -> None:
-        """Cancel and join owned cleanup despite repeated caller cancellation."""
+    async def _wait_for_cleanup(cleanup: asyncio.Task[None], deadline: float) -> None:
+        """Wait within the persistence-attempt share without cancelling the owned task."""
 
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            return
+        try:
+            await asyncio.wait({cleanup}, timeout=remaining)
+        except asyncio.CancelledError:
+            # A repeated caller cancellation accelerates abort; the original cancellation is
+            # re-raised by execute only after this owned task is quiescent.
+            return
+
+    def _abort_and_cancel_cleanup(
+        self,
+        handle: AuditExecutionHandle,
+        cleanup: asyncio.Task[None],
+    ) -> None:
+        with suppress(Exception):
+            self._audit.abort_execution_failure(handle)
+        cleanup.cancel()
+
+    async def _join_cleanup_task(
+        self,
+        cleanup: asyncio.Task[None],
+        handle: AuditExecutionHandle,
+        deadline: float,
+    ) -> bool:
+        """Join despite repeated cancellation, preserving quiescence beyond a bad port."""
+
+        loop = asyncio.get_running_loop()
+        while not cleanup.done() and (remaining := deadline - loop.time()) > 0:
+            try:
+                await asyncio.wait({cleanup}, timeout=remaining)
+            except asyncio.CancelledError:
+                self._abort_and_cancel_cleanup(handle, cleanup)
+        exceeded_budget = not cleanup.done()
         while not cleanup.done():
+            self._abort_and_cancel_cleanup(handle, cleanup)
             try:
                 await asyncio.shield(cleanup)
             except asyncio.CancelledError:
-                cleanup.cancel()
+                continue
             except Exception:
                 break
         with suppress(BaseException):
             cleanup.result()
+        return exceeded_budget
 
 
 def _all_evidence(result: VerificationResult) -> Iterable[Evidence]:

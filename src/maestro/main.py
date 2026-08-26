@@ -50,7 +50,7 @@ def main() -> None:
                 "mcp_sdk_version": versions.mcp_sdk,
                 "codex_sdk_version": versions.codex_sdk,
                 "codex_runtime_version": versions.codex_runtime,
-                "model": settings.codex_model,
+                "model": settings.codex_model.value,
             }
         },
     )

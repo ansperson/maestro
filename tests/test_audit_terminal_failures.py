@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
@@ -8,11 +9,13 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+from pydantic import ValidationError
 
 import maestro.capabilities.resolve_codebase_fact.service as service_module
 from maestro.agents import FakeAgentRuntime, InvestigationRequest
 from maestro.audit.contracts import AuditFailureStage, ExecutionFailedV1
 from maestro.audit.port import AuditWriteError, AuditWriteFailureKind
+from maestro.audit.recorder import AuditRecorder, AuditRuntimeMetadata
 from maestro.audit.testing import FakeAuditPort, fake_audit_recorder
 from maestro.capabilities.resolve_codebase_fact.contracts import (
     Confidence,
@@ -32,9 +35,21 @@ from maestro.errors import (
     OutputLimitExceededError,
     RepositoryChangedError,
 )
+from maestro.observability import JsonFormatter
 from maestro.repository.guard import AuthorizedRepository, RepositoryFingerprint, RepositoryGuard
 
 SettingsFactory = Callable[..., Settings]
+
+_UNSAFE_MODEL_IDENTIFIERS = (
+    "postgresql://reader:fixture-password@db/maestro",  # pragma: allowlist secret
+    "/Users/alice/.config/model",
+    r"C:\Users\alice\model",
+    r"\\server\share\model",
+    "gpt-5.4\nAPI_KEY=fixture-secret",
+    "gpt-5.4\u200b",
+    "API_KEY=fixture-secret",
+    "the current production model",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,9 +197,10 @@ async def test_post_start_operational_failures_are_safe_terminal_events(
 
     async def respond(_request: InvestigationRequest) -> VerificationResult:
         if case == "agent":
-            raise AgentRuntimeError(
-                "private traceback postgresql://writer:fixture-password@db/internal"
+            credential_uri = (
+                "postgresql://writer:fixture-password@db/internal"  # pragma: allowlist secret
             )
+            raise AgentRuntimeError(f"private traceback {credential_uri}")
         if case == "mutation":
             (repository / "mutation-after-start.txt").write_text("changed", encoding="utf-8")
         if case == "timeout":
@@ -229,6 +245,67 @@ async def test_post_start_operational_failures_are_safe_terminal_events(
     assert "fixture-password" not in encoded
     assert "db/internal" not in encoded
     assert str(repository) not in encoded
+
+
+@pytest.mark.parametrize("model", _UNSAFE_MODEL_IDENTIFIERS)
+def test_unsafe_settings_model_cannot_reach_service_audit_or_structured_log(
+    repository: Path,
+    settings_factory: SettingsFactory,
+    caplog: pytest.LogCaptureFixture,
+    model: str,
+) -> None:
+    port = FakeAuditPort()
+
+    with caplog.at_level(logging.DEBUG), pytest.raises(ValidationError, match="Audit-safe"):
+        settings_factory(allowed_roots=(repository,), codex_model=model)
+
+    assert port.starts == port.completions == port.failures == []
+    assert caplog.records == []
+    assert model not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["gpt-5.4", "o3", "codex-mini-latest"])
+async def test_settings_model_identifier_flows_safely_to_audit_and_structured_log(
+    repository: Path,
+    settings_factory: SettingsFactory,
+    caplog: pytest.LogCaptureFixture,
+    model: str,
+) -> None:
+    settings = settings_factory(allowed_roots=(repository,), codex_model=model)
+
+    async def fail_operation(_request: InvestigationRequest) -> VerificationResult:
+        raise AgentRuntimeError("private diagnostic must not cross either sink")
+
+    port = FakeAuditPort()
+    recorder = AuditRecorder(
+        port,
+        AuditRuntimeMetadata(
+            server_version="1.0.0",
+            runtime_name="codex",
+            runtime_version="0.147.0",
+            model=settings.codex_model,
+            prompt_policy_version="repository-verifier/v1",
+        ),
+    )
+    service = ResolveCodebaseFactService(settings, FakeAgentRuntime(fail_operation), recorder)
+
+    with caplog.at_level(logging.WARNING), pytest.raises(AgentRuntimeError):
+        await service.execute(_request(repository))
+
+    failure = _assert_failure(
+        port,
+        ErrorCode.AGENT_RUNTIME_ERROR,
+        AuditFailureStage.INVESTIGATION,
+    )
+    assert failure.model.value == model
+    assert port.starts[0].event.payload.model.value == model
+    capability_record = next(
+        record for record in caplog.records if record.name == "maestro.resolve_codebase_fact"
+    )
+    structured = cast(dict[str, object], json.loads(JsonFormatter().format(capability_record)))
+    assert structured["model"] == model
+    assert "private diagnostic" not in json.dumps(structured)
 
 
 @pytest.mark.asyncio
@@ -432,7 +509,7 @@ async def test_post_start_cancellation_is_propagated_after_joined_failure_record
 
 
 @pytest.mark.asyncio
-async def test_cancellation_cleanup_has_hard_budget_and_no_orphan_task(
+async def test_cancellation_cleanup_aborts_noncooperative_write_within_budget(
     repository: Path,
     settings_factory: SettingsFactory,
     monkeypatch: pytest.MonkeyPatch,
@@ -441,6 +518,7 @@ async def test_cancellation_cleanup_has_hard_budget_and_no_orphan_task(
     worker_cleaned = asyncio.Event()
     audit_entered = asyncio.Event()
     audit_cleaned = asyncio.Event()
+    release_audit = asyncio.Event()
 
     async def block_worker(_request: InvestigationRequest) -> VerificationResult:
         worker_entered.set()
@@ -452,13 +530,24 @@ async def test_cancellation_cleanup_has_hard_budget_and_no_orphan_task(
 
     async def block_audit(_record: object) -> None:
         audit_entered.set()
+        cancellation_received = False
         try:
-            await asyncio.Event().wait()
+            while not release_audit.is_set():
+                try:
+                    await release_audit.wait()
+                except asyncio.CancelledError:
+                    cancellation_received = True
+                    continue
         finally:
             audit_cleaned.set()
+        if cancellation_received:
+            raise asyncio.CancelledError
+
+    def abort_audit(_event_id: object) -> None:
+        release_audit.set()
 
     monkeypatch.setattr(service_module, "_CANCELLATION_AUDIT_BUDGET_SECONDS", 0.05)
-    port = FakeAuditPort(on_failure=block_audit)
+    port = FakeAuditPort(on_failure=block_audit, on_failure_abort=abort_audit)
     service = ResolveCodebaseFactService(
         settings_factory(allowed_roots=(repository,)),
         FakeAgentRuntime(block_worker),
@@ -466,6 +555,8 @@ async def test_cancellation_cleanup_has_hard_budget_and_no_orphan_task(
     )
     task = asyncio.create_task(service.execute(_request(repository)))
     await worker_entered.wait()
+    loop = asyncio.get_running_loop()
+    cancelled_at = loop.time()
     task.cancel()
 
     with pytest.raises(asyncio.CancelledError):
@@ -474,6 +565,8 @@ async def test_cancellation_cleanup_has_hard_budget_and_no_orphan_task(
     assert worker_cleaned.is_set()
     assert audit_entered.is_set()
     assert audit_cleaned.is_set()
+    assert loop.time() - cancelled_at < 0.2
+    assert port.failure_aborts == [port.failure_attempts[0].event.event_id]
     assert port.failures == []
     assert all(
         not task.get_name().startswith("audit-cancellation-") for task in asyncio.all_tasks()
@@ -517,6 +610,7 @@ async def test_repeated_cancellation_cannot_orphan_audit_cleanup(
         await task
 
     assert audit_cleaned.is_set()
+    assert port.failure_aborts == [port.failure_attempts[0].event.event_id]
     assert all(
         not task.get_name().startswith("audit-cancellation-") for task in asyncio.all_tasks()
     )
@@ -552,6 +646,112 @@ async def test_audit_cleanup_failure_never_replaces_cancellation(
 
     assert len(port.failure_attempts) == 1
     assert port.failures == []
+
+
+@pytest.mark.asyncio
+async def test_cancellation_abort_failure_still_joins_and_preserves_cancellation(
+    repository: Path,
+    settings_factory: SettingsFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker_entered = asyncio.Event()
+    audit_entered = asyncio.Event()
+    audit_cleaned = asyncio.Event()
+
+    async def block_worker(_request: InvestigationRequest) -> VerificationResult:
+        worker_entered.set()
+        await asyncio.Event().wait()
+        return _result()
+
+    async def block_audit(_record: object) -> None:
+        audit_entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            audit_cleaned.set()
+
+    def fail_abort(_event_id: object) -> None:
+        raise RuntimeError("private abort diagnostic")
+
+    monkeypatch.setattr(service_module, "_CANCELLATION_AUDIT_BUDGET_SECONDS", 0.05)
+    port = FakeAuditPort(on_failure=block_audit, on_failure_abort=fail_abort)
+    service = ResolveCodebaseFactService(
+        settings_factory(allowed_roots=(repository,)),
+        FakeAgentRuntime(block_worker),
+        fake_audit_recorder(port),
+    )
+    task = asyncio.create_task(service.execute(_request(repository)))
+    await worker_entered.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert audit_entered.is_set()
+    assert audit_cleaned.is_set()
+    assert len(port.failure_aborts) == 1
+    assert all(
+        not active.get_name().startswith("audit-cancellation-") for active in asyncio.all_tasks()
+    )
+
+
+@pytest.mark.asyncio
+async def test_nonconforming_cleanup_is_joined_after_cooperative_budget(
+    repository: Path,
+    settings_factory: SettingsFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    worker_entered = asyncio.Event()
+    audit_entered = asyncio.Event()
+    audit_cleaned = asyncio.Event()
+
+    async def block_worker(_request: InvestigationRequest) -> VerificationResult:
+        worker_entered.set()
+        await asyncio.Event().wait()
+        return _result()
+
+    async def drain_after_every_cancellation(_record: object) -> None:
+        audit_entered.set()
+        drain_deadline: float | None = None
+        try:
+            while True:
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    if drain_deadline is None:
+                        drain_deadline = asyncio.get_running_loop().time() + 0.06
+                    while (remaining := drain_deadline - asyncio.get_running_loop().time()) > 0:
+                        try:
+                            await asyncio.sleep(remaining)
+                        except asyncio.CancelledError:
+                            continue
+                    raise
+        finally:
+            audit_cleaned.set()
+
+    monkeypatch.setattr(service_module, "_CANCELLATION_AUDIT_BUDGET_SECONDS", 0.02)
+    port = FakeAuditPort(on_failure=drain_after_every_cancellation)
+    service = ResolveCodebaseFactService(
+        settings_factory(allowed_roots=(repository,)),
+        FakeAgentRuntime(block_worker),
+        fake_audit_recorder(port),
+    )
+    task = asyncio.create_task(service.execute(_request(repository)))
+    await worker_entered.wait()
+    started = asyncio.get_running_loop().time()
+    task.cancel()
+
+    with caplog.at_level(logging.WARNING), pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert asyncio.get_running_loop().time() - started >= 0.05
+    assert audit_entered.is_set()
+    assert audit_cleaned.is_set()
+    assert "exceeded cooperative budget" in caplog.text
+    assert all(
+        not active.get_name().startswith("audit-cancellation-") for active in asyncio.all_tasks()
+    )
 
 
 @pytest.mark.asyncio
