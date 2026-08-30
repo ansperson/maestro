@@ -95,6 +95,8 @@ Use a Maestro Job only when multiple executions, systems, capabilities, or check
 
 Prefer a small number of strong primitives over a large catalog of overlapping tools.
 
+Every tool carries an evaluation with recorded ground truth, and a tool whose behavior depends on model judgement also carries a control arm answering the same questions without it. That keeps the promotion argument above falsifiable rather than asserted once. See ADR-0011.
+
 ## Security invariants
 
 Security requirements are architectural constraints, not optional cleanup.
