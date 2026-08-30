@@ -170,7 +170,8 @@ def test_database_publication_is_loopback_only(tmp_path: Path) -> None:
         published_port=55432,
     )
 
-    services = compose_module.build_compose_override(configuration)["services"]
+    override = compose_module.build_compose_override(configuration)
+    services = override["services"]
     assert isinstance(services, dict)
     service = cast(dict[str, object], services["audit-postgres"])
     assert service["ports"] == [
@@ -182,6 +183,25 @@ def test_database_publication_is_loopback_only(tmp_path: Path) -> None:
             "mode": "host",
         }
     ]
+    # Docker silently ignores a published port on a container attached only to an internal
+    # network, so the opt-in exposure must also add a non-internal attachment.
+    assert service["networks"] == ["audit-internal", "database-loopback"]
+    assert override["networks"] == {"database-loopback": {"internal": False}}
+
+
+def test_hardened_database_stays_internal_with_no_published_port(tmp_path: Path) -> None:
+    """Without the development opt-in, PostgreSQL keeps the internal network alone."""
+
+    configuration = _configuration(
+        _environment(tmp_path), compose_module.DeploymentAction.DATABASE_UP
+    )
+
+    override = compose_module.build_compose_override(configuration)
+    services = cast(dict[str, object], override["services"])
+    service = cast(dict[str, object], services["audit-postgres"])
+    assert "ports" not in service
+    assert "networks" not in service
+    assert "networks" not in override
 
 
 def test_compose_launcher_rejects_secret_aliases_and_repository_exposure(tmp_path: Path) -> None:

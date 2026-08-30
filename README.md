@@ -44,6 +44,14 @@ or placeholder package exists for future features.
 
 ### Install and run
 
+The `Makefile` wraps the local development flow: `make up` generates the four role
+credentials, starts the pinned PostgreSQL container with a loopback-only exposure, creates
+the roles, and applies migrations. `make run` then starts the server natively, `make read`
+queries the curated Audit views, and `make clean` removes the volume and credentials. Point
+it at your own checkout with `make up REPO=/absolute/repository/root`.
+
+The equivalent explicit invocation:
+
 ```bash
 uv sync --frozen --all-groups
 cp .env.example .env  # copy values into your launcher; Maestro does not load this file itself

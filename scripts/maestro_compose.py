@@ -241,6 +241,8 @@ def build_compose_override(configuration: ComposeConfiguration) -> dict[str, obj
     override: dict[str, object] = {"services": services}
     if secrets:
         override["secrets"] = secrets
+    if configuration.published_port is not None:
+        override["networks"] = {"database-loopback": {"internal": False}}
     return override
 
 
@@ -350,6 +352,11 @@ def _database_override(
                 "mode": "host",
             }
         ]
+        # Docker silently ignores a published port on a container attached only to an
+        # internal network, so the opt-in loopback exposure also needs a non-internal
+        # attachment. The hardened deployment never sets a published port and therefore
+        # keeps PostgreSQL on the internal network alone.
+        service["networks"] = ["audit-internal", "database-loopback"]
     return service
 
 
