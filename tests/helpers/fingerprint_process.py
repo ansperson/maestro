@@ -54,7 +54,11 @@ def _write_result(result: object) -> None:
 
 def _block(marker: Path, *, close_stdout: bool = False) -> None:
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    marker.write_text(str(os.getpid()), encoding="ascii")
+    # Publish the identifier atomically. A waiter polling for existence must never observe
+    # a created-but-still-empty marker, which parses as an invalid process identifier.
+    staged = marker.with_name(marker.name + ".staged")
+    staged.write_text(str(os.getpid()), encoding="ascii")
+    staged.replace(marker)
     if close_stdout:
         sys.stdout.close()
     while True:
@@ -140,7 +144,10 @@ def main() -> int:  # noqa: PLR0911 - process-mode fixture exits explicitly
         return 0
     if mode == "environment-fd":
         expected_environment = set(sys.argv[2].split(","))
-        expected_environment.add("__CF_USER_TEXT_ENCODING")
+        # macOS injects __CF_USER_TEXT_ENCODING into every process. It is outside the
+        # launcher's allowlist and outside Maestro's control, so ignore it rather than
+        # expecting it — expecting it makes this probe fail on every other platform.
+        actual_environment = set(os.environ) - {"__CF_USER_TEXT_ENCODING"}
         descriptor = int(sys.argv[3])
         expected_cwd = Path(sys.argv[4])
         try:
@@ -153,7 +160,7 @@ def main() -> int:  # noqa: PLR0911 - process-mode fixture exits explicitly
         files = result["files"]
         item = files[0]
         clean = (
-            set(os.environ) == expected_environment
+            actual_environment == expected_environment
             and descriptor_closed
             and Path.cwd() == expected_cwd
         )

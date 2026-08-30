@@ -222,7 +222,10 @@ async def test_post_start_operational_failures_are_safe_terminal_events(
         )
         overrides["max_evidence_items"] = 1
     elif case == "timeout":
-        overrides["verifier_timeout_seconds"] = 0.3
+        # The repository fingerprint spawns real subprocesses inside the same timeout budget.
+        # A budget tight enough to expire during that work times out before the execution is
+        # ever started, leaving no start event for the terminal-failure assertions.
+        overrides["verifier_timeout_seconds"] = 2.0
 
     port = FakeAuditPort()
     service = ResolveCodebaseFactService(

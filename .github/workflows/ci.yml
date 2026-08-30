@@ -64,10 +64,59 @@ jobs:
           uv pip install --python "$RUNNER_TEMP/maestro-smoke/bin/python" dist/*.whl
           "$RUNNER_TEMP/maestro-smoke/bin/python" scripts/package_smoke.py "$RUNNER_TEMP/maestro-smoke/bin/maestro" tests/fixtures/codebase
 
+  integration:
+    name: PostgreSQL integration
+    runs-on: ubuntu-latest
+    needs: deterministic
+
+    # The Audit adapter, migration, role, and curated-view tests skip themselves without a
+    # real database, so the deterministic job cannot prove them. This job supplies the exact
+    # pinned PostgreSQL the deployment uses, reachable only on the runner's loopback address.
+    services:
+      postgres:
+        image: postgres:18.6-trixie@sha256:1957b2ff3137e4ef7f3bc813e74fff50b1e1ffddc85c8b9d6f14ade972be8687
+        env:
+          POSTGRES_PASSWORD: maestro-integration # pragma: allowlist secret
+          POSTGRES_DB: maestro_audit
+          POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+        ports:
+          - 127.0.0.1:5432:5432
+        options: >-
+          --health-cmd "pg_isready --username postgres --dbname maestro_audit"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.12.1"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install Python
+        run: uv python install 3.13
+
+      - name: Sync locked environment
+        run: uv sync --frozen --all-groups --python 3.13
+
+      - name: Run PostgreSQL Audit integration tests
+        env:
+          # Throwaway credential for an ephemeral loopback-only service container that is
+          # destroyed with the runner. It grants no access to anything outside this job.
+          MAESTRO_TEST_POSTGRES_DSN: postgresql://postgres:maestro-integration@127.0.0.1:5432/maestro_audit # pragma: allowlist secret
+        run: uv run pytest --strict-config --strict-markers tests/test_audit_postgres.py
+
   container:
     name: Hardened container
     runs-on: ubuntu-latest
-    needs: deterministic
+    needs: [deterministic, integration]
 
     steps:
       - name: Check out repository
