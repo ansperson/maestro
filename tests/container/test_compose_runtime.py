@@ -342,9 +342,14 @@ async def test_compose_audit_deployment_is_hardened_private_durable_and_fail_clo
             _POSTGRES_BOOTSTRAP_TARGET,
         )
     ).stdout.strip()
-    # PostgreSQL consumes its bootstrap credential as root before dropping to the postgres
-    # runtime user, so the projection is root-owned and owner-only rather than host-owned.
-    assert bootstrap_projection == "600:0"
+    # Owner-only is the security property to enforce. The owning identity is an engine
+    # detail that legitimately differs — native Linux Docker preserves the host owner while
+    # Docker Desktop projects a root-owned copy into its virtual machine — which is exactly
+    # why role credentials for non-root services use bind mounts instead of file secrets.
+    # PostgreSQL reaching a healthy state above already proves it could read this file.
+    bootstrap_mode, _, bootstrap_owner = bootstrap_projection.partition(":")
+    assert bootstrap_mode == "600", bootstrap_projection
+    assert bootstrap_owner in {"0", str(os.getuid())}, bootstrap_projection
     # The daemon parses ps output positionally and requires an explicit PID column.
     postgres_processes = _run(("docker", "top", postgres_name, "-eo", "pid,uid,comm")).stdout
     assert "999 postgres" in " ".join(postgres_processes.split())
