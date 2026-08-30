@@ -89,23 +89,35 @@ configure the child server:
 ```bash
 SERVER=/absolute/path/to/maestro/.venv/bin/maestro
 REPOSITORY=/absolute/allowed/repository
+AUDIT_PASSWORD_FILE=/absolute/path/to/owner-only-test-password
 
 npx --yes @modelcontextprotocol/inspector@2.2.0 --cli "$SERVER" \
   -e MAESTRO_ALLOWED_ROOTS="$REPOSITORY" -e MAESTRO_LOG_LEVEL=WARNING \
+  -e MAESTRO_AUDIT_WRITER_HOST=127.0.0.1 -e MAESTRO_AUDIT_WRITER_PORT=1 \
+  -e MAESTRO_AUDIT_WRITER_USER=maestro_audit_writer \
+  -e MAESTRO_AUDIT_WRITER_PASSWORD_FILE="$AUDIT_PASSWORD_FILE" \
   --method tools/list --format json
 
 npx --yes @modelcontextprotocol/inspector@2.2.0 --cli "$SERVER" \
   -e MAESTRO_ALLOWED_ROOTS="$REPOSITORY" -e MAESTRO_LOG_LEVEL=WARNING \
+  -e MAESTRO_AUDIT_WRITER_HOST=127.0.0.1 -e MAESTRO_AUDIT_WRITER_PORT=1 \
+  -e MAESTRO_AUDIT_WRITER_USER=maestro_audit_writer \
+  -e MAESTRO_AUDIT_WRITER_PASSWORD_FILE="$AUDIT_PASSWORD_FILE" \
   --method tools/call --tool-name resolve_codebase_fact \
   --tool-args-json "{\"repository_path\":\"$REPOSITORY\",\"question\":\"Should an Order support multiple Payments?\"}" \
   --format json
 
 npx --yes @modelcontextprotocol/inspector@2.2.0 --cli "$SERVER" \
   -e MAESTRO_ALLOWED_ROOTS="$REPOSITORY" -e MAESTRO_LOG_LEVEL=WARNING \
+  -e MAESTRO_AUDIT_WRITER_HOST=127.0.0.1 -e MAESTRO_AUDIT_WRITER_PORT=1 \
+  -e MAESTRO_AUDIT_WRITER_USER=maestro_audit_writer \
+  -e MAESTRO_AUDIT_WRITER_PASSWORD_FILE="$AUDIT_PASSWORD_FILE" \
   --method tools/call --tool-name resolve_codebase_fact --tool-args-json '{}' --format json
 ```
 
-For the expected operational-error check, call with an existing `repository_path` outside
+The normative call returns `AUDIT_UNAVAILABLE` because the example Audit endpoint deliberately
+refuses connections, while discovery remains available. For the expected authorization-error
+check, call with an existing `repository_path` outside
 `MAESTRO_ALLOWED_ROOTS`; the tool must return `REPOSITORY_NOT_ALLOWED`. The invalid and
 operational-error commands return Inspector exit status 5 because `isError` is true. Inspector
 2.2.0 emits two JSON lines for these cases: the tool result followed by its CLI error object.

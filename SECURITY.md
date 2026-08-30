@@ -16,11 +16,18 @@ history, and instructions), the Codex runtime/model, and model output are untrus
 provider is an explicit data-egress recipient. A stdio client gets the privileges of the user
 who launches Maestro; v1 has no remote authentication, authorization, or multi-tenancy.
 
-Maestro canonicalizes allowed roots, rejects traversal/symlink escape, performs bounded
-no-follow file discovery, isolates the Codex home and environment, disables inherited
-MCPs/skills/apps/web/subagents, selects deny-all/read-only at both SDK boundaries, validates
-structured output and evidence, sanitizes results, fingerprints the repository before and
-after investigation, bounds admission/deadlines/pipes/results, and owns worker cancellation.
+Maestro canonicalizes allowed roots, rejects filesystem anchors plus traversal/symlink escape,
+performs bounded no-follow file discovery, isolates the Codex home and environment, disables
+inherited MCPs/skills/apps/web/subagents, selects deny-all/read-only at both SDK boundaries,
+validates structured output and evidence, sanitizes results, fingerprints the repository before
+and after investigation through an isolated package-owned helper with a versioned bounded protocol,
+bounds admission/deadlines/pipes/results, owns helper/Git/worker termination and reaping after a
+child-process handle is acquired, and requires durable Audit start/completion records before AI
+work/result release. Central configuration gives the Codex adapter only a Codex-specific
+projection and gives the PostgreSQL adapter only the append-writer projection. Audit connections
+are lazy and short-lived; the start connection closes before worker creation, and no database
+connection or transaction remains open during AI work. Worker creation uses a fixed environment
+allowlist and closes non-standard descriptors.
 Logs exclude request text, source, credentials, transcripts, model responses, and absolute
 paths. The recommended Level 2 deployment additionally encloses the unchanged application in a
 hardened Linux container with read-only repository mounts and root filesystem, ephemeral
@@ -35,10 +42,35 @@ copied through a no-follow regular-file descriptor into a mode-0700 temporary Co
 latter exists only in the worker process and is omitted from its shell environment. Temporary
 state is removed on success, failure, timeout, and cancellation on a best-effort basis.
 
+The Audit writer password is loaded at startup only from a bounded UTF-8 regular, non-symlink file
+owned by the Maestro user with mode `0400` or `0600` on the supported POSIX boundary. Maestro
+opens it no-follow, close-on-exec, and nonblocking, then rechecks descriptor identity, type,
+ownership, mode, and size. Password-bearing DSNs, the removed legacy Audit URL, ambient
+driver-advertised libpq variables, `PGSERVICEFILE`, `PGSYSCONFDIR`, service/passfile indirection,
+and password command arguments are rejected. The environment check repeats immediately before
+every connection and never mutates process-global state. Bootstrap, migration-owner, writer, and
+reader settings and password files are distinct; normal Maestro runtime receives only the writer
+projection. Audit credentials and paths are excluded from the worker environment, argv, stdin
+request, temporary Codex configuration, prompt, and provider inputs. Audit settings/projections
+render no endpoint or identity fields; configuration, subprocess, and adapter errors expose only
+safe categories, not paths, endpoints, SQL, or driver diagnostics.
+
 In hardened container mode, mount only the dedicated authentication file read-only. Do not mount
 a complete home or `.codex` directory. File authentication is preferred because an API key passed
 as a Docker environment variable is visible in daemon container metadata to principals allowed
 to inspect Docker.
+
+In the two-container deployment, role credentials are delivered as read-only bind mounts rather
+than Compose file secrets, because Docker Desktop materializes file secrets as root-owned copies
+inside its virtual machine and reports shared-filesystem ownership inconsistently, which cannot
+satisfy the owner-only validation above. An image-owned startup guard re-materializes each
+credential on a bounded private tmpfs at mode `0400`, where ownership and mode are kernel-enforced,
+then executes a fixed target; it fails closed rather than starting with an unverified credential or
+a writable repository mount. PostgreSQL's bootstrap credential is the single exception and keeps
+the official file-secret path, because the official entrypoint consumes it as root before dropping
+to the unprivileged database user. Credential files must live outside every allowed root, since a
+credential inside an allowed root would be mounted into the container as readable repository
+content and could reach the model provider.
 
 The cloud model control plane remains reachable and selected repository content may leave the
 host. Do not authorize a repository whose contents may not be sent to that provider. Maestro
@@ -56,8 +88,60 @@ does not persist prompts, transcripts, repository content, or model output.
 - Filesystem namespace races, a compromised Python/Codex/MCP dependency, kernel compromise,
   process inspection by the same user, and failed best-effort temporary cleanup remain outside
   the application boundary.
-- Secret scanning and output redaction are heuristic; neither proves that a secret cannot be
-  selected by the model or encoded in an unexpected form.
+- The Maestro parent and disposable Codex worker remain co-resident in the hardened container and
+  share its OS and network namespace. Typed configuration projections, environment filtering,
+  closed descriptors, and closing the PostgreSQL start connection before worker creation reduce
+  accidental credential disclosure but are not complete isolation against a compromised worker.
+  Stronger isolation requires a different worker execution architecture; that residual is
+  explicitly accepted for Audit v1.
+- The fingerprint helper receives only a canonical root and numeric limits over stdin, runs with
+  isolated Python module discovery from a trusted directory outside the authorized repository,
+  closed inherited descriptors, and a minimal environment, and never intentionally opens a network
+  connection. It is not an OS network sandbox; a compromised interpreter or imported dependency
+  remains covered by the broader process-compromise risk.
+- Python's supported asynchronous subprocess API does not expose a child handle until process
+  creation finishes. Maestro awaits that trusted operation directly and uses the runtime's normal
+  cancellation behavior before handle acquisition; therefore it cannot claim an independent hard
+  application deadline or application-owned reaping during that narrow pre-handle interval. Once a
+  handle exists, cancellation and deadlines terminate, bounded-wait, kill if needed, and reap the
+  helper or Git process before returning.
+- Secret scanning and output redaction are heuristic. Audit redaction detects configured roots,
+  selected private/drive/UNC paths, credential-bearing URI user information, common secret forms,
+  and unsafe controls by collecting spans from the original input and applying bounded replacements
+  once. Unrecognized path syntax, secret formats, encodings, or deliberate obfuscation may survive;
+  neither control proves that a secret cannot be selected or encoded by the model.
+- Audit retries failures known not committed and ambiguous acknowledgement/commit outcomes using
+  one immutable record and stable identities. An identity conflict is accepted only after exact
+  execution/event envelope, correlation, canonical content-hash, and typed-payload verification;
+  mismatches and ambiguity unresolved after the bounded budget return
+  `AUDIT_PERSISTENCE_ERROR`. Before accepting a start, the adapter requires the supported schema,
+  `fsync=on`, `full_page_writes=on`, and `synchronous_commit=on` or `remote_apply`. Adapter
+  details, SQL, SQLSTATE, hosts, users, settings values, and credentials are excluded from public
+  errors and logs. Abrupt process/host loss can still leave a start-only Trail, and an unresolved
+  infrastructure failure may leave a complete-but-unacknowledged Trail.
+- PostgreSQL bootstrap creates separate migration-owner, append-writer, and query-reader login
+  identities without default passwords. It revokes `PUBLIC` database/schema privileges; the
+  writer receives column-scoped inserts, schema-version reads, and only fixed-signature exact
+  verification functions with a pinned `pg_catalog` search path. The reader receives curated-view
+  `SELECT` only. Neither runtime role receives schema creation, temporary-table, role membership,
+  grant, base-table read, mutation, trigger, or truncate authority. The migrator and database
+  administrator remain trusted and administratively capable of changing Audit data; this is least
+  privilege, not cryptographic tamper evidence. See `docs/audit-postgresql.md`.
+- Operational failures after a durable start persist only their safe error code, bounded lifecycle
+  stage, and approved version metadata. The configured model value crosses one typed safe-identifier
+  boundary before startup: only a bounded ASCII alphanumeric/dot/underscore/hyphen grammar is
+  accepted, so URI credentials, path identities, secret assignments, controls, unsafe Unicode,
+  and prose cannot enter Audit or structured model metadata. Cancellation failure persistence has
+  a separate one-second cooperative persistence-attempt and drain budget. The PostgreSQL adapter
+  marks a pre-connect abort or synchronously finishes the active failure connection before task
+  cancellation; Maestro joins the task before propagating the original cancellation. A failed
+  connection finish or nonconforming port can make joined quiescence extend past the cooperative
+  budget, which is preferred to orphaning persistence work. Host/process loss or an unestablished
+  terminal write can still leave a start-only Trail; startup deliberately does not manufacture a
+  terminal outcome.
+
+  The cancellation guarantee is therefore a one-second cooperative persistence-attempt budget
+  followed by joined quiescence, not an unconditional one-second wall-clock return guarantee.
 - The Level 2 container permits provider networking and cannot technically distinguish it from
   arbitrary egress by a compromised process. Every configured allowed root is readable by the
   shared container. Higher assurance requires controlled egress and/or per-worker containers.

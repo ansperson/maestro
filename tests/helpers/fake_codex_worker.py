@@ -32,7 +32,7 @@ def _success() -> dict[str, object]:
     }
 
 
-def _write_report(path: Path) -> None:
+def _write_report(path: Path, raw_request: bytes) -> None:
     codex_home = Path(os.environ["CODEX_HOME"])
     auth_file = codex_home / "auth.json"
     report = {
@@ -42,9 +42,34 @@ def _write_report(path: Path) -> None:
         "api_key_present": "MAESTRO_CODEX_API_KEY" in os.environ,
         "auth_present": auth_file.is_file(),
         "auth_contents": auth_file.read_text(encoding="utf-8") if auth_file.is_file() else None,
+        "audit_environment_names": [
+            name
+            for name in sorted(os.environ)
+            if "AUDIT" in name or name.startswith("PG") or name in {"DATABASE_URL", "DB_URL"}
+        ],
+        "environment_names": sorted(os.environ),
+        "argv": sys.argv,
+        "request": raw_request.decode("utf-8"),
+        "config": (
+            (codex_home / "config.toml").read_text(encoding="utf-8")
+            if (codex_home / "config.toml").is_file()
+            else None
+        ),
+        "open_fds": _open_nonstandard_descriptors(),
         "depth": os.environ.get("MAESTRO_VERIFIER_DEPTH"),
     }
     path.write_text(json.dumps(report), encoding="utf-8")
+
+
+def _open_nonstandard_descriptors() -> list[int]:
+    descriptors: list[int] = []
+    for descriptor in range(3, 256):
+        try:
+            os.fstat(descriptor)
+        except OSError:
+            continue
+        descriptors.append(descriptor)
+    return descriptors
 
 
 def main() -> None:
@@ -52,11 +77,12 @@ def main() -> None:
 
     mode = sys.argv[1]
     report_path = Path(sys.argv[2]) if len(sys.argv) > 2 else None
-    json.loads(sys.stdin.buffer.read())
+    raw_request = sys.stdin.buffer.read()
+    json.loads(raw_request)
     if mode == "ignore-term":
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
     if report_path is not None:
-        _write_report(report_path)
+        _write_report(report_path, raw_request)
     if mode in {"ignore-term", "sleep"}:
         time.sleep(30)
     elif mode == "malformed":

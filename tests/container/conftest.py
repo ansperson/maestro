@@ -16,7 +16,9 @@ import pytest
 _PROJECT_ROOT = Path(__file__).parents[2]
 _LAUNCHER = _PROJECT_ROOT / "scripts" / "maestro_container.py"
 _FIXTURE = _PROJECT_ROOT / "tests" / "fixtures" / "codebase"
-_TEST_ROOT = _PROJECT_ROOT / ".container-test-tmp"
+_TEST_ROOT = Path(
+    os.environ.get("MAESTRO_CONTAINER_TEST_ROOT", _PROJECT_ROOT / ".container-test-tmp")
+)
 _DEFAULT_IMAGE = "maestro-verifier:container-test"
 
 CommandFactory = Callable[[Path, str | None, Mapping[str, str] | None], list[str]]

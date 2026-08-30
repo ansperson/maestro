@@ -31,12 +31,15 @@ LABEL org.opencontainers.image.title="Maestro Engineering Verifier" \
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
     sed -i \
-        -e 's|URIs: http://deb.debian.org/debian$|URIs: http://snapshot.debian.org/archive/debian/20260824T000000Z|' \
-        -e 's|URIs: http://deb.debian.org/debian-security$|URIs: http://snapshot.debian.org/archive/debian-security/20260824T000000Z|' \
+        -e 's|URIs: http://deb.debian.org/debian$|URIs: http://snapshot.debian.org/archive/debian/20260827T000000Z|' \
+        -e 's|URIs: http://deb.debian.org/debian-security$|URIs: http://snapshot.debian.org/archive/debian-security/20260827T000000Z|' \
         /etc/apt/sources.list.d/debian.sources \
     && apt-get -o Acquire::Check-Valid-Until=false update \
     && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
         git=1:2.47.3-0+deb13u1 \
+        libssl3t64=3.5.7-1~deb13u2 \
+        openssl=3.5.7-1~deb13u2 \
+        openssl-provider-legacy=3.5.7-1~deb13u2 \
     && python -m pip uninstall --yes pip \
     && groupadd --gid 65532 --system maestro \
     && useradd --uid 65532 --gid 65532 --system --no-create-home --home-dir /nonexistent maestro \
@@ -46,6 +49,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     && chmod 0400 /run/maestro-auth/auth.json
 
 COPY --from=builder --chown=0:0 /opt/maestro/.venv /opt/maestro/.venv
+COPY --chown=0:0 scripts/maestro_mount_guard.py /opt/maestro/maestro_mount_guard.py
 
 ENV HOME=/nonexistent \
     LANG=C.UTF-8 \

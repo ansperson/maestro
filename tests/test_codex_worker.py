@@ -11,6 +11,7 @@ from typing import cast
 
 import pytest
 from openai_codex import ApprovalMode, Sandbox
+from pydantic import ValidationError
 
 from maestro.agents.codex import worker
 from maestro.agents.codex.protocol import CodexWorkerRequest
@@ -20,6 +21,7 @@ from maestro.capabilities.resolve_codebase_fact.contracts import (
     VerificationResult,
     VerificationStatus,
 )
+from maestro.model_identity import ModelIdentifier
 
 
 def _result() -> VerificationResult:
@@ -38,9 +40,32 @@ def _request(repository: Path) -> CodexWorkerRequest:
         repository_root=repository,
         question="Is the field a list?",
         context="Consumer background only.",
-        model="gpt-5.4",
+        model=ModelIdentifier("gpt-5.4"),
         max_output_bytes=8_192,
     )
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "postgresql://reader:fixture-password@db/maestro",  # pragma: allowlist secret
+        "/private/model",
+        r"C:\private\model",
+        r"\\server\share\model",
+        "API_KEY=fixture-secret",
+        "gpt-5.4\u200b",
+        "production model",
+    ],
+)
+def test_worker_protocol_rejects_unsafe_model_identifier_families(
+    repository: Path,
+    model: str,
+) -> None:
+    payload = _request(repository).model_dump()
+    payload["model"] = model
+
+    with pytest.raises(ValidationError, match="Audit-safe"):
+        CodexWorkerRequest.model_validate(payload, strict=True)
 
 
 class _FakeHandle:
@@ -120,6 +145,8 @@ async def test_worker_uses_one_ephemeral_read_only_deny_all_turn(
     monkeypatch.setenv("TMPDIR", str(temporary))
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("MAESTRO_CODEX_API_KEY", "opaque-api-key")
+    monkeypatch.setenv("MAESTRO_AUDIT_WRITER_PASSWORD_FILE", "/private/audit-password")
+    monkeypatch.setenv("PGPASSWORD", "writer-only-value")
     fake = _FakeCodex(_FakeHandle())
     monkeypatch.setattr(worker, "AsyncCodex", fake.factory)
 
@@ -153,6 +180,19 @@ async def test_worker_uses_one_ephemeral_read_only_deny_all_turn(
     assert 'inherit = "none"' in config
     assert 'MAESTRO_VERIFIER_DEPTH = "1"' in config
     assert "mcp_servers" not in config
+    provider_boundary = json.dumps(
+        {
+            "config": repr(fake.config),
+            "thread": {key: repr(value) for key, value in fake.thread_options.items()},
+            "turn": {key: repr(value) for key, value in fake.thread.turn_options.items()},
+            "prompt": prompt,
+            "temporary_config": config,
+        },
+        sort_keys=True,
+    )
+    assert "/private/audit-password" not in provider_boundary
+    assert "writer-only-value" not in provider_boundary
+    assert "PGPASSWORD" not in provider_boundary
 
 
 @pytest.mark.asyncio

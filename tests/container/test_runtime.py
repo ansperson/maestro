@@ -13,11 +13,6 @@ import pytest
 from mcp import Client, StdioServerParameters
 from mcp.types import TextContent
 
-from maestro.capabilities.resolve_codebase_fact.contracts import (
-    VerificationResult,
-    VerificationStatus,
-)
-
 pytestmark = [pytest.mark.container, pytest.mark.timeout(600)]
 
 _PROJECT_ROOT = Path(__file__).parents[2]
@@ -60,6 +55,10 @@ def test_runtime_image_metadata_is_minimal_and_non_root(container_image: str) ->
     serialized = json.dumps(config)
     assert "MAESTRO_CODEX_API_KEY" not in serialized
     assert "MAESTRO_CODEX_AUTH_FILE" not in serialized
+    assert "MAESTRO_AUDIT_WRITER_PASSWORD_FILE" not in serialized
+    assert "MAESTRO_AUDIT_MIGRATION_PASSWORD_FILE" not in serialized
+    assert "MAESTRO_AUDIT_READER_PASSWORD_FILE" not in serialized
+    assert "MAESTRO_AUDIT_BOOTSTRAP_PASSWORD_FILE" not in serialized
 
 
 def test_runtime_kernel_state_root_tmpfs_and_production_dependencies(
@@ -224,8 +223,17 @@ def test_git_fingerprint_control_operates_inside_hardened_container(
     script = """
 import asyncio
 import json
+import os
 import pathlib
 import sys
+
+# Audit is mandatory configuration. This probe never reaches PostgreSQL, so it stages an
+# owner-only credential on the container's own tmpfs, where ownership is kernel-enforced.
+_credential = pathlib.Path('/tmp/audit-writer-password')
+_credential.write_text('container-probe-password', encoding='utf-8')
+_credential.chmod(0o400)
+os.environ['MAESTRO_AUDIT_WRITER_USER'] = 'maestro_audit_writer'
+os.environ['MAESTRO_AUDIT_WRITER_PASSWORD_FILE'] = str(_credential)
 
 from maestro.config import Settings
 from maestro.repository.guard import RepositoryGuard
@@ -316,19 +324,36 @@ def test_launcher_applies_inspectable_privilege_network_mount_and_resource_polic
 
 
 @pytest.mark.asyncio
-async def test_mcp_stdio_tools_call_and_authorization_work_through_container(
+async def test_mcp_stdio_discovery_and_authorization_survive_audit_outage(
     mounted_repository: Path,
+    container_test_root: Path,
     hardened_command: CommandFactory,
 ) -> None:
-    command = hardened_command(mounted_repository, None, None)
+    """The direct launcher has no database, so an audited call must fail closed.
+
+    ADR-0005 requires tool discovery, protocol negotiation, and authorization to stay
+    available while Audit is unreachable; only the audited execution fails.
+    """
+
+    credential = container_test_root / f"writer-password-{uuid.uuid4().hex}"
+    credential.write_text("direct-launcher-password", encoding="utf-8")
+    credential.chmod(0o600)
+    command = hardened_command(
+        mounted_repository,
+        None,
+        {
+            "MAESTRO_AUDIT_WRITER_USER": "maestro_audit_writer",
+            "MAESTRO_AUDIT_WRITER_PASSWORD_FILE": str(credential),
+        },
+    )
     parameters = StdioServerParameters(
         command=command[0],
         args=command[1:],
         env=dict(os.environ),
     )
-    async with Client(parameters, read_timeout_seconds=30) as client:
+    async with Client(parameters, read_timeout_seconds=60) as client:
         tools = await client.list_tools()
-        result = await client.call_tool(
+        audited = await client.call_tool(
             "resolve_codebase_fact",
             {
                 "repository_path": str(mounted_repository),
@@ -344,12 +369,10 @@ async def test_mcp_stdio_tools_call_and_authorization_work_through_container(
         )
 
     assert [tool.name for tool in tools.tools] == ["resolve_codebase_fact"]
-    assert result.is_error is False
-    assert result.structured_content is not None
-    validated = VerificationResult.model_validate_json(
-        json.dumps(result.structured_content), strict=True
-    )
-    assert validated.status is VerificationStatus.HUMAN_DECISION_REQUIRED
+    assert audited.is_error is True
+    audited_content = audited.content[0]
+    assert isinstance(audited_content, TextContent)
+    assert "AUDIT_UNAVAILABLE" in audited_content.text
     assert unauthorized.is_error is True
     error_content = unauthorized.content[0]
     assert isinstance(error_content, TextContent)

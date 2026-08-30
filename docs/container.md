@@ -1,9 +1,13 @@
 # Hardened local container execution
 
-Maestro Level 2 runs the unchanged local stdio MCP server inside a hardened Linux container.
-The container is the recommended repository-investigation mode because its read-only bind mount
-prevents writes that application-level fingerprint detection can only discover after the fact.
-Native execution remains supported for development and troubleshooting.
+Maestro Level 2 runs the unchanged local stdio MCP server inside a hardened Linux container,
+whose read-only bind mount prevents writes that application-level fingerprint detection can only
+discover after the fact.
+
+This deployment is on hold and native execution is the current default: on macOS the worker's
+provider credential lives in the operating system keychain and cannot reach a container without
+metered billing. Everything here remains implemented and verified in CI. See
+[ADR-0009](adr/0009-native-execution-is-the-default-deployment.md).
 
 ADR-0003 defines the durable decisions. This guide owns operator procedures and commands.
 
@@ -17,8 +21,15 @@ fingerprints, and evidence validation remain active inside it.
 
 Level 2 does not provide provider-only egress, per-worker containers, confidentiality between
 multiple configured allowed roots, protection from a compromised Docker daemon/host kernel, or
-byte-identical OCI builds. It adds no Jobs, persistence, integration, subagent, or remote MCP
-behavior.
+byte-identical OCI builds. It adds no Jobs, non-Audit durable state, integration, subagent, or
+remote MCP behavior.
+
+Audit v1 intentionally keeps the Maestro parent and disposable Codex worker co-resident in this
+container. The parent-only writer projection, explicit worker environment, closed descriptors,
+and closing short-lived PostgreSQL connections before worker creation reduce accidental
+credential forwarding. They do not isolate a compromised worker from a co-resident parent or the
+shared network namespace. Stronger isolation requires a different worker execution architecture
+and is outside the accepted Audit v1 topology.
 
 ## Requirements and tested platforms
 
@@ -83,6 +94,9 @@ Multiple allowed roots use the host path separator (`:` on supported hosts). The
 each root before Docker starts, rejects missing/non-directory roots and ambiguous comma-bearing
 `--mount` paths, and mounts only those roots at identical absolute paths with
 `readonly,bind-recursive=readonly,bind-propagation=rprivate`. The MCP caller cannot add mounts.
+A filesystem anchor such as `/` is not an allowed root: the server rejects it during typed startup
+validation. Operators must configure narrower non-anchor directories; launcher canonicalization
+does not broaden that application policy.
 
 The image defaults to UID/GID 65532. The launcher normally overrides this with the invoking
 non-root UID/GID so read-only host files remain readable. A launcher invoked as root fails closed;
@@ -163,6 +177,67 @@ when the repository itself is untrusted. See <https://code.claude.com/docs/en/mc
 
 Both clients launch the local Docker CLI and communicate with the container solely over stdio.
 No port or remote MCP transport is involved.
+
+## Compose deployment with Audit
+
+Audit requires PostgreSQL, so the local deployment runs two containers. `scripts/maestro_compose.py`
+is the deployment adapter and `compose.yaml` holds the reviewed service profile. The direct launcher
+in `scripts/maestro_container.py` remains supported for a single container.
+
+PostgreSQL attaches only to an internal network and publishes no host port. Maestro attaches to that
+internal network and a separate provider-egress network, and keeps every ADR-0003 control: non-root
+identity, read-only root, dropped capabilities, `no-new-privileges`, bounded tmpfs, and resource
+limits.
+
+Create four distinct credential files outside every allowed root, owned by the container user with
+mode `0600` or `0400`. The launcher rejects symlinks, wrong ownership, group- or world-readable
+modes, empty or oversized files, and any credential located inside an allowed root, because such a
+file would be mounted into the container as readable repository content.
+
+```bash
+mkdir -p ~/maestro/secrets && chmod 700 ~/maestro/secrets
+for role in bootstrap migration writer reader; do
+  openssl rand -hex 24 > ~/maestro/secrets/"$role"-password
+  chmod 0600 ~/maestro/secrets/"$role"-password
+done
+
+export MAESTRO_ALLOWED_ROOTS=/path/to/repository
+export MAESTRO_DOCKER_UID="$(id -u)" MAESTRO_DOCKER_GID="$(id -g)"
+for role in BOOTSTRAP MIGRATION WRITER READER; do
+  lower="$(echo "$role" | tr 'A-Z' 'a-z')"
+  export "MAESTRO_AUDIT_${role}_PASSWORD_FILE=$HOME/maestro/secrets/${lower}-password"
+done
+
+python scripts/maestro_compose.py database-up   # start PostgreSQL on the internal network
+python scripts/maestro_compose.py bootstrap     # create the separate SCRAM roles
+python scripts/maestro_compose.py migrate       # apply Audit migrations
+python scripts/maestro_compose.py server        # stdio MCP server; the MCP client spawns this
+```
+
+`read --view summary|timeline|evidence` queries the curated read-only views. `down` stops the
+deployment and keeps the durable volume. Administration actions run as short-lived containers and
+exit; only `server` is long-running.
+
+The server receives only the append-writer credential, which cannot update, delete, or change
+schema. Bootstrap, migration, and reader credentials are mounted solely into the administration
+action that requires them.
+
+### How credentials reach the container
+
+Role credentials are delivered as read-only bind mounts rather than Compose file secrets. Docker
+Desktop materializes file secrets as root-owned copies inside its virtual machine and reports
+shared-filesystem ownership inconsistently, so a credential delivered that way cannot satisfy
+Maestro's owner-only validation. Before starting Maestro, the image-owned guard re-materializes
+each credential on a bounded private tmpfs at mode `0400`, where ownership and mode are enforced by
+the kernel rather than by a shared filesystem, then executes a fixed target. It fails closed with
+exit status 78 when a credential or repository mount is not exactly as expected.
+
+PostgreSQL is the single exception: its bootstrap credential uses the official
+`/run/secrets/audit-bootstrap-password` path, because the official entrypoint reads it as root
+before dropping to the unprivileged `postgres` user.
+
+Credentials never appear in environment variables, command arguments, container labels,
+`docker inspect` metadata, logs, or the Codex worker's environment.
 
 ## Networking and credentials
 

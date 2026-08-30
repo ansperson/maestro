@@ -3,7 +3,7 @@
 Maestro is an engineering execution platform for AI-assisted software development.
 
 > **Current implementation scope: `resolve_codebase_fact` only.** The Job, Checkpoint,
-> PR/Issue orchestration, durable persistence, external integration, remote transport, and
+> PR/Issue orchestration, external integration, remote transport, and
 > multi-agent concepts described later in this architectural README are future direction and
 > are not implemented in v1.
 
@@ -26,8 +26,9 @@ The v1 package mirrors the boundaries that already own behavior:
 ```text
 src/maestro/
 ├── mcp/                                  # stdio/MCP adapter
+├── audit/                                # contracts, recorder, PostgreSQL adapter/migrations
 ├── capabilities/resolve_codebase_fact/  # contracts, policy, sanitization, service
-├── repository/                           # authorization, fingerprint, evidence guard
+├── repository/                           # authorization, isolated fingerprint helper, evidence guard
 ├── agents/                               # runtime protocol and Codex adapter
 ├── execution/                            # admission and lifecycle control
 ├── observability/                        # structured stderr logging
@@ -49,14 +50,43 @@ cp .env.example .env  # copy values into your launcher; Maestro does not load th
 
 MAESTRO_ALLOWED_ROOTS=/absolute/repository/root \
 MAESTRO_CODEX_AUTH_FILE=/absolute/path/to/codex-auth.json \
+MAESTRO_AUDIT_WRITER_HOST=localhost \
+MAESTRO_AUDIT_WRITER_USER=maestro_audit_writer \
+MAESTRO_AUDIT_WRITER_PASSWORD_FILE=/absolute/path/to/audit-writer-password \
 uv run maestro
 ```
 
 `MAESTRO_ALLOWED_ROOTS` is required and accepts multiple canonical roots separated by the OS
-path separator (`:` on POSIX). Configure exactly one explicit Codex authentication source:
+path separator (`:` on POSIX). Each root must be a directory below the filesystem anchor;
+the anchor itself (`/` on POSIX, or the platform equivalent) is rejected. Configure exactly
+one explicit Codex authentication source:
 `MAESTRO_CODEX_AUTH_FILE` or `MAESTRO_CODEX_API_KEY`. Neither is inherited by repository
-shell commands. stdout is reserved for newline-delimited MCP protocol messages; structured
-JSON application logs go to stderr.
+shell commands. Audit writer host, port, database, user, and password-file settings are also
+required. On the supported POSIX native/container boundary, the password file must be an
+owner-owned, regular, non-symlink file with mode `0400` or `0600`, contain 1–4096 bytes of UTF-8
+password data, and remain outside every configured allowed root. Its no-follow open is
+nonblocking, then identity, type, owner, mode, and size are checked again through the descriptor.
+Maestro rejects the removed `MAESTRO_AUDIT_DATABASE_URL`, password-bearing DSNs, and every
+ambient libpq connection variable advertised by the installed driver, plus `PGSERVICEFILE` and
+`PGSYSCONFDIR`. Connection service, passfile, options, TLS/GSS, target-session, and other behavior
+therefore cannot supplement the typed projection. These checks run at startup, projection, and
+immediately before each connection. Maestro reads the password at startup, checks connectivity
+lazily when an audited call starts, and never applies migrations automatically. Bootstrap,
+migration-owner, writer, and SELECT-only reader settings use distinct
+`MAESTRO_AUDIT_<ROLE>_*` namespaces; the normal runtime loads only the writer projection. stdout
+is reserved for newline-delimited MCP protocol messages; structured JSON application logs go to
+stderr.
+
+Audit PostgreSQL bootstrap, forward-only migrations, least-privilege role boundaries, and curated
+reader queries are documented in [`docs/audit-postgresql.md`](docs/audit-postgresql.md). Keep the
+migration-owner, runtime-writer, and query-reader credentials separate; Maestro receives only the
+typed writer projection.
+
+Native execution shown above is the default deployment. The hardened two-container deployment
+(`scripts/maestro_compose.py`, [`docs/container.md`](docs/container.md)) is implemented and stays
+verified in CI, but is on hold: on macOS the worker's provider credential lives in the operating
+system keychain, so it cannot reach a container without metered billing. See
+[ADR-0009](docs/adr/0009-native-execution-is-the-default-deployment.md).
 
 An MCP client configuration can launch the server with `uv`:
 
@@ -66,7 +96,10 @@ An MCP client configuration can launch the server with `uv`:
   "args": ["--directory", "/absolute/path/to/maestro", "run", "maestro"],
   "env": {
     "MAESTRO_ALLOWED_ROOTS": "/absolute/repository/root",
-    "MAESTRO_CODEX_AUTH_FILE": "/absolute/path/to/codex-auth.json"
+    "MAESTRO_CODEX_AUTH_FILE": "/absolute/path/to/codex-auth.json",
+    "MAESTRO_AUDIT_WRITER_HOST": "localhost",
+    "MAESTRO_AUDIT_WRITER_USER": "maestro_audit_writer",
+    "MAESTRO_AUDIT_WRITER_PASSWORD_FILE": "/absolute/path/to/audit-writer-password"
   }
 }
 ```
@@ -141,7 +174,41 @@ questions and never includes an answer. Operational failures are typed tool erro
 `REPOSITORY_CHANGED_DURING_INVESTIGATION`, `SERVER_BUSY`, `AGENT_TIMEOUT`,
 `AGENT_CANCELLED`, `AGENT_RUNTIME_ERROR`, `INVALID_AGENT_OUTPUT`,
 `EVIDENCE_VALIDATION_ERROR`, `RECURSION_NOT_ALLOWED`, `OUTPUT_LIMIT_EXCEEDED`, and
-`INTERNAL_ERROR`.
+`AUDIT_UNAVAILABLE`, `AUDIT_PERSISTENCE_ERROR`, and `INTERNAL_ERROR`.
+
+Audit is fail-closed. Maestro attempts each start or terminal write at most three times within
+one five-second budget, with fixed 100 ms and 250 ms backoffs. Transient failures known not
+committed and ambiguous acknowledgement/commit outcomes are retried using the original immutable
+identities and record. A conflict succeeds only after the adapter verifies the exact execution,
+event envelope, canonical SHA-256 content hash, and typed JSON payload already stored; row
+existence or `ON CONFLICT DO NOTHING` alone is never success. Any identity/sequence mismatch or
+ambiguity that remains unresolved after the bounded budget returns `AUDIT_PERSISTENCE_ERROR`.
+Exhausted failures known not committed return `AUDIT_UNAVAILABLE`. Without a durable start,
+neither normative evaluation nor the AI worker runs. Without an established durable completion,
+Maestro withholds the semantic result.
+
+Before accepting a start, each short-lived PostgreSQL connection verifies the supported Audit
+schema and safe server durability settings: `fsync=on`, `full_page_writes=on`, and
+`synchronous_commit=on` or the stronger `remote_apply`. Unsupported, malformed, or weaker values
+fail closed before an execution or start event is inserted. Every persistence attempt uses a new
+connection; the successful start connection is closed before worker execution begins.
+
+After a durable start, a typed operational failure is recorded as the single sequence-two
+`execution.failed` event before the original operational error is returned. Its payload contains
+only the safe error code, lifecycle stage, and approved runtime/version metadata. If that terminal
+write also fails, the Audit operational error takes precedence. Cooperative cancellation remains
+the exception to error precedence: after owned worker cleanup, Maestro attempts the failure write
+in a separate task. The PostgreSQL adapter registers the failure-event identity before connecting;
+on timeout it marks a pending connection aborted or synchronously finishes the active libpq
+connection before task cancellation. The one-second cooperative persistence-and-drain budget
+reserves time for that abort and reap. Maestro then joins the task to quiescence and always
+propagates the caller's original cancellation. If connection finish itself fails, that joined drain
+can extend past the cooperative budget rather than leave orphan work. A durable start without
+either terminal event is explicitly incomplete. Abrupt process loss can therefore leave an
+incomplete Trail; startup does not reconcile it or invent an outcome.
+
+Stated conservatively, this is a one-second cooperative persistence-attempt budget followed by
+joined quiescence, not an unconditional hard wall-clock return bound.
 
 ### Configuration and bounds
 
@@ -150,6 +217,22 @@ question characters, 8,000 context characters, 128 KiB worker stdout/stderr, 64 
 result, 20 evidence items, 10 conflicts, 10,000 discovered files, 64 MiB aggregate discovery,
 and 1 MiB per file. Every limit is environment-configurable with the corresponding
 `MAESTRO_` setting in `.env.example`. Invalid configuration fails before the server starts.
+Allowed roots are canonicalized and filesystem anchors are prohibited; repository requests for
+an anchor fail with the existing `REPOSITORY_NOT_ALLOWED` public error.
+
+`MAESTRO_CODEX_MODEL` is an Audit- and log-safe identifier, not free-form metadata. It must begin
+with an ASCII letter or digit, contain only ASCII letters, digits, dots, underscores, or hyphens,
+and be at most 128 characters. This deliberately rejects URI credentials, filesystem identities,
+secret assignments, controls, unsafe Unicode, and prose before startup.
+
+Central configuration creates disjoint runtime projections. The PostgreSQL adapter receives only
+the writer connection fields and an in-memory secret; the Codex adapter receives only its own
+authentication source. Worker creation uses a fixed environment allowlist and closes inherited
+non-standard file descriptors. The start transaction's short-lived PostgreSQL connection is
+closed before the Codex adapter can launch a worker. Audit passwords, password-file paths,
+PostgreSQL environment variables, DSNs, and sockets are therefore not intentionally forwarded in
+the worker environment, argument vector, stdin request, temporary Codex configuration, prompt, or
+provider inputs.
 
 File discovery does not follow symlinks, skips `.git`, dependency/build caches, binary,
 non-UTF-8, and oversized content, and preserves an explicitly requested subdirectory rather
@@ -166,7 +249,17 @@ minimal allowlisted environment, no inherited MCPs/skills/plugins, no project in
 no apps, web search, hooks, goals, memories, subagents, or escalation. Thread and turn both
 select `deny_all` approvals and `read_only`. Repository content, caller text, Git history, and
 model output remain untrusted data. Results are redacted, bounded, schema-checked, evidence-
-checked, and rejected if the repository changes.
+checked, and rejected if the repository changes. Durable Audit text redaction detects configured
+repository roots, selected private absolute-path forms, credential-bearing URI user information,
+common secret forms, and unsafe controls from the same original input before applying bounded
+replacements once. It is heuristic and does not establish a general data-loss-prevention boundary.
+
+Maestro and that disposable worker remain co-resident in one container and share its OS and
+network namespace. Typed projections, environment filtering, closed descriptors, and short-lived
+database connections reduce accidental disclosure; they do not create a complete security
+boundary against a compromised co-resident process. Stronger isolation requires a separate worker
+execution architecture and is an explicitly accepted Audit v1 residual risk, not an unstated
+property of these controls.
 
 These controls do not make the cloud investigation offline: selected repository content is
 sent to the configured model provider. The SDK has no repository-only confidentiality
@@ -212,12 +305,16 @@ the target with only the environment passed through its `-e` options:
 npx --yes @modelcontextprotocol/inspector@2.2.0 --cli \
   /absolute/path/to/maestro/.venv/bin/maestro \
   -e MAESTRO_ALLOWED_ROOTS=/absolute/repository/root -e MAESTRO_LOG_LEVEL=WARNING \
+  -e MAESTRO_AUDIT_WRITER_HOST=127.0.0.1 -e MAESTRO_AUDIT_WRITER_PORT=1 \
+  -e MAESTRO_AUDIT_WRITER_USER=maestro_audit_writer \
+  -e MAESTRO_AUDIT_WRITER_PASSWORD_FILE=/absolute/path/to/owner-only-test-password \
   --method tools/list --format json
 ```
 
 Use `--method tools/call --tool-name resolve_codebase_fact --tool-args-json '<json>'` for a
-call. A normative question is the credential-free smoke path. `CONTRIBUTING.md` contains the
-complete local, package, schema, and secret-baseline workflow.
+call. A normative question with the deliberately unavailable example database is the
+provider-credential-free fail-closed smoke path and returns `AUDIT_UNAVAILABLE`. `CONTRIBUTING.md`
+contains the complete local, package, schema, and secret-baseline workflow.
 
 It coordinates AI agents, skills, engineering capabilities, external systems, and human decisions to carry engineering work from intent to a verified outcome.
 

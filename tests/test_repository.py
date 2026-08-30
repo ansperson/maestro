@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import os
 import subprocess
+import sys
+import time
 from collections.abc import Callable
 from pathlib import Path
 from shutil import which
@@ -16,12 +19,25 @@ from maestro.config import Settings
 from maestro.errors import (
     EvidenceValidationError,
     InvalidInputError,
+    RepositoryInspectionError,
     RepositoryNotAllowedError,
     RepositoryNotFoundError,
 )
-from maestro.repository import RepositoryGuard
+from maestro.repository import RepositoryGuard, canonical_path_worker, fingerprint_worker
+from maestro.repository.fingerprint_protocol import (
+    MAX_FINGERPRINT_REQUEST_BYTES,
+    CanonicalPathRequestV1,
+    CanonicalPathResultV1,
+    FingerprintFileV1,
+    FingerprintScanRequestV1,
+    FingerprintScanResultV1,
+    validate_fingerprint_result,
+)
+from maestro.repository.fingerprint_scan import scan_repository
+from maestro.repository.subprocess import run_owned_process
 
 SettingsFactory = Callable[..., Settings]
+_PROCESS_FIXTURE = Path(__file__).parent / "helpers" / "fingerprint_process.py"
 
 
 def _remove_top_level_files(repository: Path) -> None:
@@ -56,6 +72,47 @@ def test_authorize_rejects_nul(repository: Path, settings_factory: SettingsFacto
     guard = RepositoryGuard(settings_factory(allowed_roots=(repository,)))
     with pytest.raises(InvalidInputError, match="NUL"):
         guard.authorize(f"{repository}\x00suffix")
+
+
+def test_authorize_rejects_platform_anchor_even_if_settings_validation_is_bypassed(
+    repository: Path, settings_factory: SettingsFactory
+) -> None:
+    anchor = Path(repository.anchor)
+    settings = settings_factory(allowed_roots=(repository,)).model_copy(
+        update={"allowed_roots": (anchor,)}
+    )
+    guard = RepositoryGuard(settings)
+    with pytest.raises(RepositoryNotAllowedError):
+        guard.authorize(str(anchor))
+
+
+@given(redundant_segments=st.integers(min_value=0, max_value=8))
+@settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
+def test_authorize_rejects_every_canonical_anchor_alias(
+    repository: Path,
+    settings_factory: SettingsFactory,
+    redundant_segments: int,
+) -> None:
+    anchor = Path(repository.anchor)
+    bypassed = settings_factory(allowed_roots=(repository,)).model_copy(
+        update={"allowed_roots": (anchor,)}
+    )
+    candidate = f"{anchor}{f'.{os.sep}' * redundant_segments}"
+    with pytest.raises(RepositoryNotAllowedError):
+        RepositoryGuard(bypassed).authorize(candidate)
+
+
+@given(parts=st.lists(st.from_regex(r"[a-z]{1,8}", fullmatch=True), min_size=1, max_size=4))
+@settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
+def test_authorize_accepts_non_anchor_descendants(
+    repository: Path,
+    settings_factory: SettingsFactory,
+    parts: list[str],
+) -> None:
+    candidate = repository.joinpath(*parts)
+    candidate.mkdir(parents=True, exist_ok=True)
+    guard = RepositoryGuard(settings_factory(allowed_roots=(repository,)))
+    assert guard.authorize(str(candidate)).root == candidate.resolve()
 
 
 @given(traversals=st.lists(st.sampled_from(["..", ".", "src"]), min_size=1, max_size=6))
@@ -95,6 +152,473 @@ async def test_fingerprint_is_content_aware_and_bounds_special_files(
     (repository / "src" / "models.py").write_text("changed\n", encoding="utf-8")
     after = await guard.fingerprint(authorized)
     assert before.digest != after.digest
+
+
+@pytest.mark.asyncio
+async def test_isolated_fingerprint_preserves_valid_unicode_paths(
+    repository: Path,
+    settings_factory: SettingsFactory,
+) -> None:
+    unicode_file = repository / "日本語" / "café-e\u0301-🙂.txt"
+    unicode_file.parent.mkdir()
+    unicode_file.write_text("valid Unicode\n", encoding="utf-8")
+    guard = RepositoryGuard(settings_factory(allowed_roots=(repository,)))
+
+    fingerprint = await guard.fingerprint(guard.authorize(str(repository)))
+
+    assert "日本語/café-e\u0301-🙂.txt" in fingerprint.files
+
+
+@pytest.mark.asyncio
+async def test_isolated_helper_matches_trusted_scan_primitives(
+    repository: Path,
+    settings_factory: SettingsFactory,
+) -> None:
+    settings = settings_factory(allowed_roots=(repository,))
+    direct = scan_repository(
+        repository,
+        max_repository_files=settings.max_repository_files,
+        max_repository_bytes=settings.max_repository_bytes,
+        max_file_bytes=settings.max_file_bytes,
+    )
+    guard = RepositoryGuard(settings)
+    helper = await guard.fingerprint(guard.authorize(str(repository)))
+
+    assert helper.truncated is direct.truncated
+    assert helper.files == {relative: scanned.state for relative, scanned in direct.files.items()}
+
+
+class _BinaryStream:
+    def __init__(self, value: bytes = b"") -> None:
+        self.buffer = io.BytesIO(value)
+
+
+@pytest.mark.parametrize("payload", [b"{", b"x" * (MAX_FINGERPRINT_REQUEST_BYTES + 1)])
+def test_fingerprint_worker_rejects_invalid_or_oversized_request(
+    monkeypatch: pytest.MonkeyPatch,
+    payload: bytes,
+) -> None:
+    output = _BinaryStream()
+    monkeypatch.setattr(fingerprint_worker.sys, "stdin", _BinaryStream(payload))
+    monkeypatch.setattr(fingerprint_worker.sys, "stdout", output)
+
+    assert fingerprint_worker.main() == 1
+    assert output.buffer.getvalue() == b""
+
+
+def test_fingerprint_worker_emits_strict_result_for_canonical_root(
+    repository: Path,
+    settings_factory: SettingsFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = settings_factory(allowed_roots=(repository,))
+    request = FingerprintScanRequestV1(
+        protocol_version=1,
+        root=str(repository.resolve()),
+        max_repository_files=settings.max_repository_files,
+        max_repository_bytes=settings.max_repository_bytes,
+        max_file_bytes=settings.max_file_bytes,
+    )
+    output = _BinaryStream()
+    monkeypatch.setattr(
+        fingerprint_worker.sys,
+        "stdin",
+        _BinaryStream(request.model_dump_json().encode("utf-8")),
+    )
+    monkeypatch.setattr(fingerprint_worker.sys, "stdout", output)
+
+    assert fingerprint_worker.main() == 0
+    result = FingerprintScanResultV1.model_validate_json(output.buffer.getvalue(), strict=True)
+    validate_fingerprint_result(result, request)
+
+
+@pytest.mark.parametrize("payload", [b"{", b"x" * (MAX_FINGERPRINT_REQUEST_BYTES + 1)])
+def test_canonical_path_worker_rejects_invalid_or_oversized_request(
+    monkeypatch: pytest.MonkeyPatch,
+    payload: bytes,
+) -> None:
+    output = _BinaryStream()
+    monkeypatch.setattr(canonical_path_worker.sys, "stdin", _BinaryStream(payload))
+    monkeypatch.setattr(canonical_path_worker.sys, "stdout", output)
+
+    assert canonical_path_worker.main() == 1
+    assert output.buffer.getvalue() == b""
+
+
+def test_canonical_path_worker_emits_strict_result_for_existing_directory(
+    repository: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = CanonicalPathRequestV1(
+        protocol_version=1,
+        path=str(repository),
+    )
+    output = _BinaryStream()
+    monkeypatch.setattr(
+        canonical_path_worker.sys,
+        "stdin",
+        _BinaryStream(request.model_dump_json().encode("utf-8")),
+    )
+    monkeypatch.setattr(canonical_path_worker.sys, "stdout", output)
+
+    assert canonical_path_worker.main() == 0
+    result = CanonicalPathResultV1.model_validate_json(output.buffer.getvalue(), strict=True)
+    assert result.canonical_path == str(repository.resolve())
+
+
+def test_fingerprint_worker_is_packaged_and_receives_no_repository_argv(
+    repository: Path,
+) -> None:
+    command = repository_module._fingerprint_worker_command()  # pyright: ignore[reportPrivateUsage]
+    assert command == (
+        sys.executable,
+        "-I",
+        "-m",
+        "maestro.repository.fingerprint_worker",
+    )
+    assert str(repository) not in command
+    canonical_command = repository_module._canonical_path_worker_command()  # pyright: ignore[reportPrivateUsage]
+    assert canonical_command == (
+        sys.executable,
+        "-I",
+        "-m",
+        "maestro.repository.canonical_path_worker",
+    )
+    assert str(repository) not in canonical_command
+    package_worker = Path(repository_module.__file__).parent / "fingerprint_worker.py"
+    assert package_worker.is_file()
+    assert package_worker.with_name("canonical_path_worker.py").is_file()
+
+
+def test_trusted_worker_cwd_is_outside_fixture_and_editable_self_inspection(
+    repository: Path,
+) -> None:
+    for target in (repository.resolve(), Path.cwd().resolve()):
+        cwd = repository_module._trusted_worker_cwd(target)  # pyright: ignore[reportPrivateUsage]
+        assert cwd == Path(target.anchor)
+        assert not cwd.is_relative_to(target)
+
+
+@pytest.mark.asyncio
+async def test_isolated_helper_can_inspect_editable_worktree_from_outside_cwd(
+    settings_factory: SettingsFactory,
+) -> None:
+    worktree = Path.cwd().resolve()
+    guard = RepositoryGuard(
+        settings_factory(
+            allowed_roots=(worktree,),
+            max_repository_files=1,
+        )
+    )
+
+    fingerprint = await guard.fingerprint(guard.authorize(str(worktree)))
+
+    assert fingerprint.files
+    assert len(fingerprint.files) == 1
+
+
+@given(
+    parts=st.lists(
+        st.from_regex(r"[A-Za-z0-9][A-Za-z0-9._-]{0,19}", fullmatch=True),
+        min_size=1,
+        max_size=8,
+    ),
+    size=st.integers(min_value=0, max_value=1_024),
+)
+def test_fingerprint_protocol_accepts_normalized_paths_at_numeric_boundaries(
+    parts: list[str],
+    size: int,
+) -> None:
+    request = FingerprintScanRequestV1(
+        protocol_version=1,
+        root="/canonical/repository",
+        max_repository_files=1,
+        max_repository_bytes=1_024,
+        max_file_bytes=1_024,
+    )
+    result = FingerprintScanResultV1(
+        protocol_version=1,
+        files=(
+            FingerprintFileV1(
+                relative_path="/".join(parts),
+                token="file:bounded",  # noqa: S106 - fingerprint state, not a credential
+                content_digest="a" * 64,
+                line_count=0,
+                size=size,
+                consumed_bytes=size,
+            ),
+        ),
+        file_count=1,
+        consumed_bytes=size,
+        truncated=False,
+    )
+
+    validate_fingerprint_result(result, request)
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "café/naïve.py",
+        "日本語/設定.toml",
+        "Δοκιμή/αρχείο.txt",
+        "emoji🙂/e\u0301.md",
+    ],
+)
+def test_fingerprint_protocol_preserves_representative_valid_unicode(
+    relative_path: str,
+) -> None:
+    validate_fingerprint_result(
+        _protocol_result(
+            relative_path=relative_path,
+            token="state:日本語",  # noqa: S106 - fingerprint state, not a credential
+        ),
+        _protocol_request(),
+    )
+
+
+@given(character=st.characters(categories=("Cc", "Cf", "Cs")))
+def test_fingerprint_protocol_rejects_unsafe_unicode_categories(character: str) -> None:
+    with pytest.raises(ValueError, match=r"normalized|valid string"):
+        validate_fingerprint_result(
+            _protocol_result(
+                relative_path=f"bad{character}path",
+                token="state:valid",  # noqa: S106 - fingerprint state, not a credential
+            ),
+            _protocol_request(),
+        )
+    with pytest.raises(ValueError, match=r"control|valid string"):
+        validate_fingerprint_result(
+            _protocol_result(relative_path="valid.txt", token=f"state:{character}"),
+            _protocol_request(),
+        )
+
+
+@pytest.mark.parametrize("relative_path", ["C:/outside", "z:relative", "D:"])
+def test_fingerprint_protocol_rejects_windows_drive_shaped_paths(relative_path: str) -> None:
+    with pytest.raises(ValueError, match="normalized"):
+        validate_fingerprint_result(
+            _protocol_result(
+                relative_path=relative_path,
+                token="state:valid",  # noqa: S106 - fingerprint state, not a credential
+            ),
+            _protocol_request(),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "malformed",
+        "duplicate",
+        "traversal",
+        "absolute",
+        "backslash",
+        "nul",
+        "drive",
+        "c1-path",
+        "c1-token",
+        "bidi-path",
+        "format-token",
+        "wrong-version",
+        "missing-version",
+        "count-mismatch",
+        "aggregate-mismatch",
+        "bad-digest",
+        "bad-token",
+        "bad-file-state",
+        "negative-size",
+        "consumed-over-size",
+        "token-too-long",
+        "path-too-long",
+        "bad-truncation",
+        "stderr-detail",
+    ],
+)
+async def test_fingerprint_rejects_hostile_real_process_protocol(
+    repository: Path,
+    settings_factory: SettingsFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    monkeypatch.setattr(
+        repository_module,
+        "_fingerprint_worker_command",
+        lambda: (sys.executable, "-I", str(_PROCESS_FIXTURE), mode),
+    )
+    guard = RepositoryGuard(settings_factory(allowed_roots=(repository,)))
+
+    with pytest.raises(RepositoryInspectionError) as error:
+        await guard.fingerprint(guard.authorize(str(repository)))
+
+    assert str(repository) not in error.value.public_json()
+
+
+@pytest.mark.asyncio
+async def test_fingerprint_rejects_oversized_real_process_stdout(
+    repository: Path,
+    settings_factory: SettingsFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_limit = 1_024
+    monkeypatch.setattr(repository_module, "MAX_FINGERPRINT_RESULT_BYTES", output_limit)
+    monkeypatch.setattr(
+        repository_module,
+        "_fingerprint_worker_command",
+        lambda: (
+            sys.executable,
+            "-I",
+            str(_PROCESS_FIXTURE),
+            "oversized",
+            str(output_limit + 1),
+        ),
+    )
+    guard = RepositoryGuard(settings_factory(allowed_roots=(repository,)))
+
+    with pytest.raises(RepositoryInspectionError):
+        await guard.fingerprint(guard.authorize(str(repository)))
+
+
+@pytest.mark.asyncio
+async def test_fingerprint_real_process_has_minimal_environment_and_closed_fds(
+    repository: Path,
+    settings_factory: SettingsFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    descriptor = os.open(repository / "src" / "models.py", os.O_RDONLY)
+    os.set_inheritable(descriptor, True)
+    expected_environment = ",".join(sorted(repository_module._fingerprint_environment()))  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(
+        repository_module,
+        "_fingerprint_worker_command",
+        lambda: (
+            sys.executable,
+            "-I",
+            str(_PROCESS_FIXTURE),
+            "environment-fd",
+            expected_environment,
+            str(descriptor),
+            str(Path(repository.anchor)),
+        ),
+    )
+    guard = RepositoryGuard(settings_factory(allowed_roots=(repository,)))
+    try:
+        fingerprint = await guard.fingerprint(guard.authorize(str(repository)))
+    finally:
+        os.close(descriptor)
+
+    assert fingerprint.files["probe.txt"].token == "probe:clean"  # noqa: S105
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["block", "wait-block"])
+async def test_fingerprint_cancellation_forces_kill_and_reaps_real_process(
+    repository: Path,
+    settings_factory: SettingsFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    marker = tmp_path / f"{mode}.pid"
+    monkeypatch.setattr(
+        repository_module,
+        "_fingerprint_worker_command",
+        lambda: (sys.executable, "-I", str(_PROCESS_FIXTURE), mode, str(marker)),
+    )
+    guard = RepositoryGuard(settings_factory(allowed_roots=(repository,)))
+    task = asyncio.create_task(guard.fingerprint(guard.authorize(str(repository))))
+    await _wait_for_marker(marker)
+    process_id = int(marker.read_text(encoding="ascii"))
+
+    task.cancel()
+    asyncio.get_running_loop().call_later(0.05, task.cancel)
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    _assert_process_reaped(process_id)
+
+
+@pytest.mark.asyncio
+async def test_owned_process_cancellation_during_stdin_write_reaps_child(tmp_path: Path) -> None:
+    marker = tmp_path / "stdin.pid"
+    task = asyncio.create_task(
+        run_owned_process(
+            (sys.executable, "-I", str(_PROCESS_FIXTURE), "block-no-read", str(marker)),
+            cwd=Path(sys.executable).parent,
+            environment=repository_module._fingerprint_environment(),  # pyright: ignore[reportPrivateUsage]
+            input_data=b"x" * 1_048_576,
+            max_stdout_bytes=1_024,
+        )
+    )
+    await _wait_for_marker(marker)
+    process_id = int(marker.read_text(encoding="ascii"))
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    _assert_process_reaped(process_id)
+
+
+@pytest.mark.asyncio
+async def test_direct_runtime_spawn_cancellation_leaves_no_creator_or_live_child(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "create.pid"
+    task = asyncio.create_task(
+        run_owned_process(
+            (
+                sys.executable,
+                "-I",
+                str(_PROCESS_FIXTURE),
+                "block-no-read",
+                str(marker),
+            ),
+            cwd=Path(tmp_path.anchor),
+            environment=repository_module._fingerprint_environment(),  # pyright: ignore[reportPrivateUsage]
+            input_data=b"{}",
+            max_stdout_bytes=1_024,
+        )
+    )
+    await asyncio.sleep(0)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0.1)
+
+    if marker.exists():
+        _assert_process_reaped(int(marker.read_text(encoding="ascii")))
+
+
+def _protocol_request() -> FingerprintScanRequestV1:
+    return FingerprintScanRequestV1(
+        protocol_version=1,
+        root="/canonical/repository",
+        max_repository_files=1,
+        max_repository_bytes=1_024,
+        max_file_bytes=1_024,
+    )
+
+
+def _protocol_result(*, relative_path: str, token: str) -> FingerprintScanResultV1:
+    return FingerprintScanResultV1(
+        protocol_version=1,
+        files=(
+            FingerprintFileV1(
+                relative_path=relative_path,
+                token=token,
+                content_digest="a" * 64,
+                line_count=0,
+                size=0,
+                consumed_bytes=0,
+            ),
+        ),
+        file_count=1,
+        consumed_bytes=0,
+        truncated=False,
+    )
 
 
 @pytest.mark.asyncio
@@ -153,13 +677,36 @@ async def test_git_fingerprint_includes_head_dirty_state_without_widening(
     guard = RepositoryGuard(settings_factory(allowed_roots=(repository,)))
     authorized = guard.authorize(str(repository / "src"))
     clean = await guard.fingerprint(authorized)
-    assert clean.head is not None
+    assert clean.head is not None, _git_diagnostics(repository / "src")
     assert clean.git_top_level_id is not None
     assert clean.git_top_level_id != clean.repository_id
     (repository / "src" / "models.py").write_text("dirty\n", encoding="utf-8")
     dirty = await guard.fingerprint(authorized)
     assert clean.dirty_digest != dirty.dirty_digest
     assert authorized.root == (repository / "src").resolve()
+
+
+def _git_diagnostics(root: Path) -> str:
+    """Report why Git produced no state, since the guard deliberately discards its stderr."""
+
+    git = which("git") or "git"
+    environment = {"HOME": os.devnull, "LANG": "C", "LC_ALL": "C", "PATH": os.defpath}
+    lines = [f"git={git} root={root}"]
+    for arguments in (("rev-parse", "--show-toplevel"), ("rev-parse", "--verify", "HEAD")):
+        completed = subprocess.run(
+            [git, *arguments],
+            cwd=root,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        lines.append(
+            f"{' '.join(arguments)} -> rc={completed.returncode} "
+            f"out={completed.stdout.strip()!r} err={completed.stderr.strip()!r}"
+        )
+    return "\n".join(lines)
 
 
 def _initialize_git_repository(repository: Path) -> None:
@@ -293,3 +840,79 @@ async def test_git_state_fails_closed_on_invalid_path_and_missing_git(
         )
         is None
     )
+
+
+@pytest.mark.asyncio
+async def test_git_cancellation_forces_kill_and_reaps_real_process(
+    repository: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "git.pid"
+    monkeypatch.setattr(
+        repository_module,
+        "_git_command",
+        lambda: (
+            sys.executable,
+            "-I",
+            str(_PROCESS_FIXTURE),
+            "block",
+            str(marker),
+        ),
+    )
+    task = asyncio.create_task(
+        repository_module._run_git(repository, "status")  # pyright: ignore[reportPrivateUsage]
+    )
+    await _wait_for_marker(marker)
+    process_id = int(marker.read_text(encoding="ascii"))
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    _assert_process_reaped(process_id)
+
+
+@pytest.mark.asyncio
+async def test_git_top_level_canonicalization_cancellation_reaps_owned_worker(
+    repository: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _initialize_git_repository(repository)
+    marker = tmp_path / "git-canonical.pid"
+    monkeypatch.setattr(
+        repository_module,
+        "_canonical_path_worker_command",
+        lambda: (
+            sys.executable,
+            "-I",
+            str(_PROCESS_FIXTURE),
+            "block",
+            str(marker),
+        ),
+    )
+    task = asyncio.create_task(
+        repository_module._git_state(repository)  # pyright: ignore[reportPrivateUsage]
+    )
+    await _wait_for_marker(marker)
+    process_id = int(marker.read_text(encoding="ascii"))
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    _assert_process_reaped(process_id)
+
+
+async def _wait_for_marker(marker: Path) -> None:
+    deadline = time.monotonic() + 5
+    while not await asyncio.to_thread(marker.exists):
+        if time.monotonic() >= deadline:
+            pytest.fail("real subprocess did not create its lifecycle marker")
+        await asyncio.sleep(0.01)
+
+
+def _assert_process_reaped(process_id: int) -> None:
+    with pytest.raises(ProcessLookupError):
+        os.kill(process_id, 0)

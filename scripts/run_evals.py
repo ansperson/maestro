@@ -10,11 +10,10 @@ from typing import Annotated
 from pydantic import BaseModel, ConfigDict, Field
 
 from maestro import __version__
-from maestro.agents.codex import CodexAgentRuntime
 from maestro.capabilities.resolve_codebase_fact.contracts import ResolveCodebaseFactRequest
 from maestro.capabilities.resolve_codebase_fact.policy import POLICY_VERSION
-from maestro.capabilities.resolve_codebase_fact.service import ResolveCodebaseFactService
 from maestro.config import Settings
+from maestro.main import build_service
 from maestro.versions import verify_runtime_versions
 
 
@@ -48,8 +47,10 @@ async def run() -> int:
         (root / "evals" / "resolve_codebase_fact_v1.json").read_text(encoding="utf-8"),
         strict=True,
     )
-    settings = Settings(allowed_roots=(repository,))
-    service = ResolveCodebaseFactService(settings, CodexAgentRuntime(settings))
+    settings = Settings(  # pyright: ignore[reportCallIssue] - Audit URL comes from BaseSettings
+        allowed_roots=(repository,)
+    )
+    service = build_service(settings)
     versions = verify_runtime_versions()
     outcomes: list[dict[str, object]] = []
     passed = True
