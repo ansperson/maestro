@@ -706,7 +706,25 @@ def _git_diagnostics(root: Path) -> str:
             f"{' '.join(arguments)} -> rc={completed.returncode} "
             f"out={completed.stdout.strip()!r} err={completed.stderr.strip()!r}"
         )
+    # Git succeeding is not sufficient: the guard also canonicalizes the reported top level
+    # in a second owned subprocess, and drops all Git state when that step returns nothing.
+    lines.append(f"canonicalized top level -> {_canonical_top_level(root)!r}")
     return "\n".join(lines)
+
+
+def _canonical_top_level(root: Path) -> object:
+    async def resolve() -> object:
+        output = await repository_module._run_git(  # pyright: ignore[reportPrivateUsage]
+            root, "rev-parse", "--show-toplevel"
+        )
+        if output is None:
+            return "git returned nothing"
+        return await repository_module._canonicalize_git_top_level(root, output)  # pyright: ignore[reportPrivateUsage]
+
+    try:
+        return asyncio.run(resolve())
+    except Exception as exc:
+        return f"raised {type(exc).__name__}: {exc}"
 
 
 def _initialize_git_repository(repository: Path) -> None:
