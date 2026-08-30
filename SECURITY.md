@@ -2,7 +2,8 @@
 
 ## Supported version
 
-Maestro v1 (`1.x`) is the only supported implementation line. It is a local stdio process,
+Maestro v2 (`2.x`) is the only supported implementation line. The `1.x` line predates mandatory
+Audit persistence and is not supported. It is a local stdio process,
 not a remotely exposed service. Report security issues privately to the repository owner;
 do not include live credentials, private repository content, prompts, or model transcripts in
 a public issue. Include a minimal synthetic reproduction, affected version, operating system,
