@@ -677,13 +677,36 @@ async def test_git_fingerprint_includes_head_dirty_state_without_widening(
     guard = RepositoryGuard(settings_factory(allowed_roots=(repository,)))
     authorized = guard.authorize(str(repository / "src"))
     clean = await guard.fingerprint(authorized)
-    assert clean.head is not None
+    assert clean.head is not None, _git_diagnostics(repository / "src")
     assert clean.git_top_level_id is not None
     assert clean.git_top_level_id != clean.repository_id
     (repository / "src" / "models.py").write_text("dirty\n", encoding="utf-8")
     dirty = await guard.fingerprint(authorized)
     assert clean.dirty_digest != dirty.dirty_digest
     assert authorized.root == (repository / "src").resolve()
+
+
+def _git_diagnostics(root: Path) -> str:
+    """Report why Git produced no state, since the guard deliberately discards its stderr."""
+
+    git = which("git") or "git"
+    environment = {"HOME": os.devnull, "LANG": "C", "LC_ALL": "C", "PATH": os.defpath}
+    lines = [f"git={git} root={root}"]
+    for arguments in (("rev-parse", "--show-toplevel"), ("rev-parse", "--verify", "HEAD")):
+        completed = subprocess.run(
+            [git, *arguments],
+            cwd=root,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        lines.append(
+            f"{' '.join(arguments)} -> rc={completed.returncode} "
+            f"out={completed.stdout.strip()!r} err={completed.stderr.strip()!r}"
+        )
+    return "\n".join(lines)
 
 
 def _initialize_git_repository(repository: Path) -> None:
