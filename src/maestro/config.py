@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import stat
+from enum import StrEnum
 from ipaddress import ip_address
 from pathlib import Path
 from typing import Annotated, Self
@@ -46,6 +47,40 @@ class CodexRuntimeConfiguration(BaseModel):
 
     auth_file: Path | None = None
     api_key: SecretStr | None = None
+
+
+class AgentRuntimeName(StrEnum):
+    """Supported worker adapters. Selection is explicit; there is no silent fallback."""
+
+    CODEX = "codex"
+    CLAUDE = "claude"
+
+
+class ClaudeEffort(StrEnum):
+    """Reasoning depth for one Claude investigation.
+
+    Measured on the fixture corpus: `low` collected the same evidence but returned
+    `uncertain` where `medium` resolved, while `high` did not change the conclusion.
+    """
+
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    XHIGH = "xhigh"
+    MAX = "max"
+
+
+class ClaudeRuntimeConfiguration(BaseModel):
+    """The complete configuration projection permitted to reach the Claude adapter.
+
+    It carries no credential: the binary resolves the operator's own authentication.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    executable: str
+    effort: ClaudeEffort
+    max_budget_usd: Annotated[float, Field(gt=0, le=100)]
 
 
 class _AuditConnectionConfiguration(BaseModel):
@@ -237,6 +272,13 @@ class Settings(BaseSettings):
     codex_model: ModelIdentifier = Field(default_factory=lambda: ModelIdentifier("gpt-5.4"))
     codex_auth_file: Path | None = None
     codex_api_key: SecretStr | None = None
+    # Deliberately has no default: a deployment states which worker it runs, so a Trail
+    # never attributes a result to a provider nobody selected (ADR-0010).
+    agent_runtime: AgentRuntimeName
+    claude_model: ModelIdentifier = Field(default_factory=lambda: ModelIdentifier("claude-opus-5"))
+    claude_executable: Annotated[str, Field(min_length=1, max_length=4_096)] = "claude"
+    claude_effort: ClaudeEffort = ClaudeEffort.MEDIUM
+    claude_max_budget_usd: Annotated[float, Field(gt=0, le=100)] = 1.0
     audit_writer: AuditWriterSettings = Field(
         default_factory=_load_audit_writer_settings, exclude=True, repr=False
     )
@@ -325,6 +367,22 @@ class Settings(BaseSettings):
         ):
             raise ValueError("Audit writer password file must be outside every allowed root")
         return self
+
+    def claude_runtime_configuration(self) -> ClaudeRuntimeConfiguration:
+        """Project only values the Claude adapter is permitted to receive."""
+
+        return ClaudeRuntimeConfiguration(
+            executable=self.claude_executable,
+            effort=self.claude_effort,
+            max_budget_usd=self.claude_max_budget_usd,
+        )
+
+    def agent_model(self) -> ModelIdentifier:
+        """Return the model identity the selected worker runs under."""
+
+        if self.agent_runtime is AgentRuntimeName.CLAUDE:
+            return self.claude_model
+        return self.codex_model
 
     def codex_runtime_configuration(self) -> CodexRuntimeConfiguration:
         """Project only values the disposable Codex adapter is permitted to receive."""

@@ -232,6 +232,7 @@ import sys
 _credential = pathlib.Path('/tmp/audit-writer-password')
 _credential.write_text('container-probe-password', encoding='utf-8')
 _credential.chmod(0o400)
+os.environ['MAESTRO_AGENT_RUNTIME'] = 'codex'
 os.environ['MAESTRO_AUDIT_WRITER_USER'] = 'maestro_audit_writer'
 os.environ['MAESTRO_AUDIT_WRITER_PASSWORD_FILE'] = str(_credential)
 
@@ -342,6 +343,7 @@ async def test_mcp_stdio_discovery_and_authorization_survive_audit_outage(
         mounted_repository,
         None,
         {
+            "MAESTRO_AGENT_RUNTIME": "codex",
             "MAESTRO_AUDIT_WRITER_USER": "maestro_audit_writer",
             "MAESTRO_AUDIT_WRITER_PASSWORD_FILE": str(credential),
         },

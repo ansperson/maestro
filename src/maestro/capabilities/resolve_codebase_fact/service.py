@@ -141,7 +141,7 @@ class ResolveCodebaseFactService:
                         "repository": repository.repository_id,
                         "repository_fingerprint": fingerprint.digest,
                         "server_version": __version__,
-                        "model": self._settings.codex_model.value,
+                        "model": self._settings.agent_model().value,
                         "prompt_policy_version": POLICY_VERSION,
                         "duration_ms": round((time.monotonic() - state.started) * 1_000, 2),
                         "queue_duration_ms": queue_duration_ms,
@@ -176,7 +176,7 @@ class ResolveCodebaseFactService:
             question=objective,
             context=request.context,
             repository_fingerprint=fingerprint.digest,
-            model=self._settings.codex_model,
+            model=self._settings.agent_model(),
             max_output_bytes=self._settings.max_agent_output_bytes,
         )
         return await self._runtime.investigate(investigation)
@@ -225,7 +225,7 @@ class ResolveCodebaseFactService:
                     if state.fingerprint is not None
                     else None,
                     "server_version": __version__,
-                    "model": self._settings.codex_model.value,
+                    "model": self._settings.agent_model().value,
                     "prompt_policy_version": POLICY_VERSION,
                     "duration_ms": round((time.monotonic() - state.started) * 1_000, 2),
                     "error_code": error_code.value,

@@ -417,6 +417,7 @@ async def test_real_stdio_server_discovery_call_errors_and_clean_shutdown(reposi
             "MAESTRO_AUDIT_WRITER_PORT": "1",
             "MAESTRO_AUDIT_WRITER_USER": "maestro_audit_writer",
             "MAESTRO_AUDIT_WRITER_PASSWORD_FILE": str(audit_password_file),
+            "MAESTRO_AGENT_RUNTIME": "codex",
             "MAESTRO_LOG_LEVEL": "INFO",
         },
     )
