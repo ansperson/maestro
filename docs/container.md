@@ -1,9 +1,13 @@
 # Hardened local container execution
 
-Maestro Level 2 runs the unchanged local stdio MCP server inside a hardened Linux container.
-The container is the recommended repository-investigation mode because its read-only bind mount
-prevents writes that application-level fingerprint detection can only discover after the fact.
-Native execution remains supported for development and troubleshooting.
+Maestro Level 2 runs the unchanged local stdio MCP server inside a hardened Linux container,
+whose read-only bind mount prevents writes that application-level fingerprint detection can only
+discover after the fact.
+
+This deployment is on hold and native execution is the current default: on macOS the worker's
+provider credential lives in the operating system keychain and cannot reach a container without
+metered billing. Everything here remains implemented and verified in CI. See
+[ADR-0009](adr/0009-native-execution-is-the-default-deployment.md).
 
 ADR-0003 defines the durable decisions. This guide owns operator procedures and commands.
 

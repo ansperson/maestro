@@ -82,18 +82,11 @@ reader queries are documented in [`docs/audit-postgresql.md`](docs/audit-postgre
 migration-owner, runtime-writer, and query-reader credentials separate; Maestro receives only the
 typed writer projection.
 
-The supported local deployment runs Maestro and PostgreSQL as two hardened containers through
-`scripts/maestro_compose.py`. PostgreSQL stays on an internal network with no published database
-port, and role credentials are delivered as read-only bind mounts that an image-owned guard
-re-materializes on a private tmpfs before startup. See [`docs/container.md`](docs/container.md)
-for credential preparation and the full bring-up:
-
-```bash
-python scripts/maestro_compose.py database-up   # start PostgreSQL on the internal network
-python scripts/maestro_compose.py bootstrap     # create the separate SCRAM roles
-python scripts/maestro_compose.py migrate       # apply Audit migrations
-python scripts/maestro_compose.py server        # stdio MCP server; the MCP client spawns this
-```
+Native execution shown above is the default deployment. The hardened two-container deployment
+(`scripts/maestro_compose.py`, [`docs/container.md`](docs/container.md)) is implemented and stays
+verified in CI, but is on hold: on macOS the worker's provider credential lives in the operating
+system keychain, so it cannot reach a container without metered billing. See
+[ADR-0009](docs/adr/0009-native-execution-is-the-default-deployment.md).
 
 An MCP client configuration can launch the server with `uv`:
 
