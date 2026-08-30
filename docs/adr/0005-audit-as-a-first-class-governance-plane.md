@@ -800,6 +800,17 @@ or Compose definition is now permitted as a deployment-adapter implementation ch
 it preserves ADR-0003's security profile and this ADR's private-network, credential, and storage
 constraints. This does not rewrite the historical ADR-0003 rationale.
 
+A deployment adapter must not deliver a non-root role credential through a Compose file secret.
+Docker Desktop materializes file secrets as root-owned copies inside its virtual machine, and
+reports shared-filesystem ownership inconsistently across mounts, so a credential delivered that
+way cannot satisfy the owner-only validation this ADR requires. Role credentials are therefore
+delivered as read-only bind mounts, which preserve host ownership on every supported engine, and
+an image-owned startup guard re-materializes each one on a bounded private tmpfs — where
+ownership and mode are kernel-enforced — before executing a fixed target. PostgreSQL is the one
+exception: its bootstrap credential keeps the official file-secret path because the official
+entrypoint consumes it as root before dropping to the unprivileged database user. This constrains
+any future deployment adapter, not only the Compose one.
+
 The normal Maestro runtime receives only the append-writer credential. Migration, human query,
 dump, and restore commands use explicit short-lived invocations with their separately scoped
 credentials. The hardened deployment does not expose PostgreSQL publicly. Native integration
