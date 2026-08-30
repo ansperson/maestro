@@ -44,17 +44,32 @@ or placeholder package exists for future features.
 
 ### Install and run
 
+The `Makefile` wraps the local development flow: `make up` generates the four role
+credentials, starts the pinned PostgreSQL container with a loopback-only exposure, creates
+the roles, and applies migrations. `make run` then starts the server natively, `make read`
+queries the curated Audit views, and `make clean` removes the volume and credentials. Point
+it at your own checkout with `make up REPO=/absolute/repository/root`.
+
+The equivalent explicit invocation:
+
 ```bash
 uv sync --frozen --all-groups
 cp .env.example .env  # copy values into your launcher; Maestro does not load this file itself
 
 MAESTRO_ALLOWED_ROOTS=/absolute/repository/root \
-MAESTRO_CODEX_AUTH_FILE=/absolute/path/to/codex-auth.json \
+MAESTRO_AGENT_RUNTIME=claude \
 MAESTRO_AUDIT_WRITER_HOST=localhost \
 MAESTRO_AUDIT_WRITER_USER=maestro_audit_writer \
 MAESTRO_AUDIT_WRITER_PASSWORD_FILE=/absolute/path/to/audit-writer-password \
 uv run maestro
 ```
+
+`MAESTRO_AGENT_RUNTIME` is required and has no default, so a Trail never attributes a result to
+a worker nobody selected. The `claude` worker invokes the locally installed Claude Code binary,
+which resolves your own authentication: Maestro holds no provider credential and reports a typed
+error when the binary is not authenticated. Its model, reasoning effort, and per-investigation
+budget cap are operator settings, never caller inputs. The `codex` worker instead requires
+exactly one explicit Codex authentication source.
 
 `MAESTRO_ALLOWED_ROOTS` is required and accepts multiple canonical roots separated by the OS
 path separator (`:` on POSIX). Each root must be a directory below the filesystem anchor;

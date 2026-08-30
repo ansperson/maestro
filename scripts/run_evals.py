@@ -13,7 +13,7 @@ from maestro import __version__
 from maestro.capabilities.resolve_codebase_fact.contracts import ResolveCodebaseFactRequest
 from maestro.capabilities.resolve_codebase_fact.policy import POLICY_VERSION
 from maestro.config import Settings
-from maestro.main import PROVIDER, build_service
+from maestro.main import build_service, selected_provider
 from maestro.versions import verify_runtime_versions
 
 
@@ -51,7 +51,7 @@ async def run() -> int:
         allowed_roots=(repository,)
     )
     service = build_service(settings)
-    versions = verify_runtime_versions(PROVIDER)
+    versions = verify_runtime_versions(selected_provider(settings))
     outcomes: list[dict[str, object]] = []
     passed = True
     try:
@@ -100,7 +100,7 @@ async def run() -> int:
         "mcp_sdk_version": versions.mcp_sdk,
         "agent_runtime": versions.agent_runtime,
         "agent_runtime_version": versions.agent_runtime_version,
-        "model": settings.codex_model,
+        "model": settings.agent_model(),
         "prompt_policy_version": POLICY_VERSION,
         "results": outcomes,
         "passed": passed,

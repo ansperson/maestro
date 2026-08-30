@@ -121,6 +121,7 @@ def _environment(
         "MAESTRO_DOCKER_IMAGE": image,
         "MAESTRO_DOCKER_PROJECT": project,
         "MAESTRO_DOCKER_UID": str(os.getuid() or 65532),
+        "MAESTRO_AGENT_RUNTIME": "codex",
         "MAESTRO_LOG_LEVEL": "WARNING",
         "PATH": os.environ["PATH"],
     }

@@ -11,3 +11,6 @@ coverage.xml
 dist/
 *.egg-info/
 *.py[cod]
+
+# Generated development credentials (make secrets)
+.local/

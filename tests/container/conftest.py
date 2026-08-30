@@ -95,6 +95,7 @@ def hardened_command(container_image: str) -> CommandFactory:
             "MAESTRO_DOCKER_GID": str(gid),
             "MAESTRO_DOCKER_IMAGE": container_image,
             "MAESTRO_DOCKER_UID": str(uid),
+            "MAESTRO_AGENT_RUNTIME": "codex",
             "MAESTRO_LOG_LEVEL": "WARNING",
             "PATH": os.environ["PATH"],
         }
