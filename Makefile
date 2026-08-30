@@ -44,7 +44,7 @@ ADMIN := MAESTRO_AUDIT_BOOTSTRAP_HOST=127.0.0.1 MAESTRO_AUDIT_BOOTSTRAP_PORT=$(D
 	MAESTRO_AUDIT_READER_USER=maestro_audit_reader \
 	MAESTRO_AUDIT_READER_PASSWORD_FILE="$(SECRETS)/reader-password"
 
-.PHONY: help secrets db-up db-down bootstrap migrate up run read status verify clean
+.PHONY: help secrets db-up db-down bootstrap migrate up run ask read status verify clean
 
 help: ## Show the available targets
 	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -86,6 +86,10 @@ run: ## Run the stdio MCP server natively; an MCP client normally spawns this
 		MAESTRO_AUDIT_WRITER_USER=maestro_audit_writer \
 		MAESTRO_AUDIT_WRITER_PASSWORD_FILE="$(SECRETS)/writer-password" \
 		uv run maestro
+
+ask: ## Ask one question end to end: make ask Q="Does X hold?"
+	@test -n "$(Q)" || { echo "  usage: make ask Q=\"your question\""; exit 2; }
+	@uv run python scripts/ask.py "$(REPO)" "$(DB_PORT)" "$(SECRETS)" "$(Q)"
 
 read: ## Query the curated read-only Audit views
 	@$(ADMIN) uv run python -m maestro.audit.postgres.admin read $(ARGS)
