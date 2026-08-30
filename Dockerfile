@@ -46,6 +46,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     && chmod 0400 /run/maestro-auth/auth.json
 
 COPY --from=builder --chown=0:0 /opt/maestro/.venv /opt/maestro/.venv
+COPY --chown=0:0 scripts/maestro_mount_guard.py /opt/maestro/maestro_mount_guard.py
 
 ENV HOME=/nonexistent \
     LANG=C.UTF-8 \

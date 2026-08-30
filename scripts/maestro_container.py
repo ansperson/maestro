@@ -18,11 +18,23 @@ _DEFAULT_PIDS_LIMIT = 256
 _DEFAULT_TMPFS_SIZE = "512m"
 _MAX_CPUS = 64
 _CONTAINER_AUTH_FILE = "/run/maestro-auth/auth.json"
+# Audit is mandatory configuration, so the direct launcher delivers the append-writer
+# credential the same way the Compose adapter does: a read-only mount that the image-owned
+# guard re-materializes on tmpfs before starting Maestro.
+_MOUNT_GUARD = "/opt/maestro/maestro_mount_guard.py"
+_CONTAINER_PYTHON = "/opt/maestro/.venv/bin/python"
+_CONTAINER_CREDENTIAL_ROOT = "/run/maestro-credentials"
+_CONTAINER_WRITER_CREDENTIAL = f"{_CONTAINER_CREDENTIAL_ROOT}/audit-writer-password"
+_CONTAINER_STAGED_ROOT = "/run/maestro-secrets"
 _IMAGE_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/@:-]{0,254}\Z")
 _SIZE_PATTERN = re.compile(r"[1-9][0-9]*(?:[bkmgBKMG])?\Z")
 _CPU_PATTERN = re.compile(r"(?:[1-9][0-9]*|0\.[0-9]*[1-9][0-9]*)\Z")
 _NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 _FORWARDED_SETTINGS = (
+    "MAESTRO_AUDIT_WRITER_DATABASE",
+    "MAESTRO_AUDIT_WRITER_HOST",
+    "MAESTRO_AUDIT_WRITER_PORT",
+    "MAESTRO_AUDIT_WRITER_USER",
     "MAESTRO_CODEX_MODEL",
     "MAESTRO_LOG_LEVEL",
     "MAESTRO_MAX_AGENT_OUTPUT_BYTES",
@@ -51,6 +63,7 @@ class ContainerConfiguration:
     image: str
     allowed_roots: tuple[Path, ...]
     auth_file: Path | None
+    audit_password_file: Path | None
     memory: str
     cpus: str
     pids_limit: int
@@ -76,6 +89,7 @@ def load_configuration(
 
     roots = _allowed_roots(environment)
     auth_file = _auth_file(environment)
+    audit_password_file = _audit_password_file(environment)
     memory = environment.get("MAESTRO_DOCKER_MEMORY", _DEFAULT_MEMORY)
     cpus = environment.get("MAESTRO_DOCKER_CPUS", _DEFAULT_CPUS)
     tmpfs_size = environment.get("MAESTRO_DOCKER_TMPFS_SIZE", _DEFAULT_TMPFS_SIZE)
@@ -99,6 +113,7 @@ def load_configuration(
         image=image,
         allowed_roots=roots,
         auth_file=auth_file,
+        audit_password_file=audit_password_file,
         memory=memory,
         cpus=cpus,
         pids_limit=pids_limit,
@@ -175,6 +190,28 @@ def build_command(
     if environment.get("MAESTRO_CODEX_API_KEY"):
         command.extend(("--env", "MAESTRO_CODEX_API_KEY"))
 
+    if configuration.audit_password_file is not None:
+        command.extend(
+            (
+                "--tmpfs",
+                (
+                    f"{_CONTAINER_STAGED_ROOT}:rw,nosuid,nodev,noexec,size=1m,mode=0700,"
+                    f"uid={configuration.uid},gid={configuration.gid}"
+                ),
+                "--mount",
+                (
+                    f"type=bind,src={configuration.audit_password_file},"
+                    f"dst={_CONTAINER_WRITER_CREDENTIAL},readonly"
+                ),
+                "--env",
+                f"MAESTRO_AUDIT_WRITER_PASSWORD_FILE={_CONTAINER_WRITER_CREDENTIAL}",
+                "--entrypoint",
+                _CONTAINER_PYTHON,
+            )
+        )
+        command.extend((configuration.image, _MOUNT_GUARD))
+        return tuple(command)
+
     command.append(configuration.image)
     return tuple(command)
 
@@ -197,18 +234,26 @@ def _allowed_roots(environment: Mapping[str, str]) -> tuple[Path, ...]:
 
 
 def _auth_file(environment: Mapping[str, str]) -> Path | None:
-    raw = environment.get("MAESTRO_CODEX_AUTH_FILE")
+    return _credential_file(environment, "MAESTRO_CODEX_AUTH_FILE")
+
+
+def _audit_password_file(environment: Mapping[str, str]) -> Path | None:
+    return _credential_file(environment, "MAESTRO_AUDIT_WRITER_PASSWORD_FILE")
+
+
+def _credential_file(environment: Mapping[str, str], variable: str) -> Path | None:
+    raw = environment.get(variable)
     if raw is None:
         return None
     path = Path(raw)
     if path.is_symlink():
-        raise LauncherConfigurationError("MAESTRO_CODEX_AUTH_FILE must not be a symlink")
+        raise LauncherConfigurationError(f"{variable} must not be a symlink")
     try:
         canonical = path.resolve(strict=True)
     except (OSError, RuntimeError) as exc:
-        raise LauncherConfigurationError("MAESTRO_CODEX_AUTH_FILE does not exist") from exc
+        raise LauncherConfigurationError(f"{variable} does not exist") from exc
     if not canonical.is_file():
-        raise LauncherConfigurationError("MAESTRO_CODEX_AUTH_FILE must be a regular file")
+        raise LauncherConfigurationError(f"{variable} must be a regular file")
     _validate_mount_path(canonical)
     return canonical
 

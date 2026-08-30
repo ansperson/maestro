@@ -19,6 +19,17 @@ def packaged_role_bootstrap() -> str:
     return files(__package__).joinpath("bootstrap_roles.sql").read_text(encoding="utf-8")
 
 
+def packaged_role_bootstrap_body() -> str:
+    """Load the bootstrap statements for composition into one caller-owned transaction."""
+
+    resource = packaged_role_bootstrap()
+    prefix = "BEGIN;\n"
+    suffix = "\nCOMMIT;\n"
+    if not resource.startswith(prefix) or not resource.endswith(suffix):
+        raise RuntimeError("Audit role bootstrap transaction envelope is invalid")
+    return resource.removeprefix(prefix).removesuffix(suffix)
+
+
 def packaged_migrations() -> tuple[AuditMigration, ...]:
     """Load ordered SQL resources; normal application startup never calls this."""
 
@@ -35,4 +46,9 @@ def packaged_migrations() -> tuple[AuditMigration, ...]:
     )
 
 
-__all__ = ["AuditMigration", "packaged_migrations", "packaged_role_bootstrap"]
+__all__ = [
+    "AuditMigration",
+    "packaged_migrations",
+    "packaged_role_bootstrap",
+    "packaged_role_bootstrap_body",
+]
