@@ -29,6 +29,7 @@ async def run(executable: Path, repository: Path) -> None:
                 "MAESTRO_AUDIT_WRITER_PORT": "1",
                 "MAESTRO_AUDIT_WRITER_USER": "maestro_audit_writer",
                 "MAESTRO_AUDIT_WRITER_PASSWORD_FILE": str(password_file),
+                "MAESTRO_AGENT_RUNTIME": "codex",
                 "MAESTRO_LOG_LEVEL": "WARNING",
             },
         )
