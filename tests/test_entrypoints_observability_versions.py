@@ -8,6 +8,8 @@ import pytest
 
 import maestro.main as main_module
 import maestro.versions as versions_module
+from maestro.agents.codex import CODEX_PROVIDER
+from maestro.agents.runtime import AgentRuntimeProvider
 from maestro.config import Settings
 from maestro.errors import AgentRuntimeError, RecursionNotAllowedError
 from maestro.observability import JsonFormatter, configure_logging
@@ -72,21 +74,17 @@ def test_configure_logging_replaces_handlers_and_writes_json_to_stderr(
 
 
 def test_verify_runtime_versions_accepts_only_exact_pins(monkeypatch: pytest.MonkeyPatch) -> None:
-    installed = {
-        "mcp": versions_module.MCP_SDK_VERSION,
-        "openai-codex": versions_module.CODEX_SDK_VERSION,
-        "openai-codex-cli-bin": versions_module.CODEX_RUNTIME_VERSION,
-    }
+    installed = {"mcp": versions_module.MCP_SDK_VERSION, **CODEX_PROVIDER.distributions}
     monkeypatch.setattr(versions_module.importlib.metadata, "version", installed.__getitem__)
-    assert verify_runtime_versions() == RuntimeVersions(
+    assert verify_runtime_versions(CODEX_PROVIDER) == RuntimeVersions(
         mcp_sdk="2.1.0",
-        codex_sdk="0.147.0",
-        codex_runtime="0.147.0",
+        agent_runtime="codex",
+        agent_runtime_version="0.147.0",
     )
 
     installed["mcp"] = "99.0.0"
     with pytest.raises(AgentRuntimeError, match="unsupported"):
-        verify_runtime_versions()
+        verify_runtime_versions(CODEX_PROVIDER)
 
 
 def test_verify_runtime_versions_maps_missing_distribution(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -95,7 +93,33 @@ def test_verify_runtime_versions_maps_missing_distribution(monkeypatch: pytest.M
 
     monkeypatch.setattr(versions_module.importlib.metadata, "version", missing)
     with pytest.raises(AgentRuntimeError, match="missing"):
-        verify_runtime_versions()
+        verify_runtime_versions(CODEX_PROVIDER)
+
+
+def test_verify_runtime_versions_requires_only_the_selected_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deployment built against one provider must not need another provider's packages."""
+
+    other = AgentRuntimeProvider(
+        name="other", version="1.2.3", distributions={"other-sdk": "1.2.3"}
+    )
+    installed = {"mcp": versions_module.MCP_SDK_VERSION, **other.distributions}
+
+    def version(distribution: str) -> str:
+        if distribution not in installed:
+            raise versions_module.importlib.metadata.PackageNotFoundError(distribution)
+        return installed[distribution]
+
+    monkeypatch.setattr(versions_module.importlib.metadata, "version", version)
+
+    assert verify_runtime_versions(other) == RuntimeVersions(
+        mcp_sdk="2.1.0",
+        agent_runtime="other",
+        agent_runtime_version="1.2.3",
+    )
+    with pytest.raises(AgentRuntimeError, match="missing"):
+        verify_runtime_versions(CODEX_PROVIDER)
 
 
 def test_main_builds_verified_stdio_server(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -115,13 +139,12 @@ def test_main_builds_verified_stdio_server(tmp_path: Path, monkeypatch: pytest.M
     def fake_create(_service: object) -> _FakeServer:
         return server
 
+    def fake_verify(_provider: AgentRuntimeProvider) -> RuntimeVersions:
+        return RuntimeVersions("2.1.0", "codex", "0.147.0")
+
     monkeypatch.delenv("MAESTRO_VERIFIER_DEPTH", raising=False)
     monkeypatch.setattr(main_module, "Settings", load_settings)
-    monkeypatch.setattr(
-        main_module,
-        "verify_runtime_versions",
-        lambda: RuntimeVersions("2.1.0", "0.147.0", "0.147.0"),
-    )
+    monkeypatch.setattr(main_module, "verify_runtime_versions", fake_verify)
     monkeypatch.setattr(main_module, "build_service", fake_build)
     monkeypatch.setattr(main_module, "create_server", fake_create)
     monkeypatch.setattr(main_module, "configure_logging", log_levels.append)

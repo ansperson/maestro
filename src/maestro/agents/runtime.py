@@ -2,13 +2,27 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
 from maestro.capabilities.resolve_codebase_fact.contracts import VerificationResult
 from maestro.model_identity import ModelIdentifier
+
+
+@dataclass(frozen=True, slots=True)
+class AgentRuntimeProvider:
+    """One worker implementation, named and pinned by the adapter that supplies it.
+
+    Startup verification and Audit metadata read identity from here rather than from
+    literals, so a deployment built against a different provider changes only this value.
+    """
+
+    name: str
+    version: str
+    distributions: Mapping[str, str]
+    """Exact distribution pins the adapter requires, as distribution name to version."""
 
 
 @dataclass(frozen=True, slots=True)
