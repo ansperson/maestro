@@ -225,22 +225,28 @@ async def test_secret_and_prompt_injection_are_not_echoed_or_executed(
 async def test_timeout_cancels_runtime_and_runs_cleanup(
     repository: Path, settings_factory: SettingsFactory
 ) -> None:
+    started = asyncio.Event()
     cleaned = asyncio.Event()
 
     async def block(_request: InvestigationRequest) -> VerificationResult:
+        started.set()
         try:
             await asyncio.Event().wait()
         finally:
             cleaned.set()
         return resolved_result()
 
+    # The repository fingerprint spawns real subprocesses inside the same timeout budget.
+    # A budget tight enough to expire during that work times out before the runtime is ever
+    # invoked, so allow headroom and assert which phase actually expired.
     service = ResolveCodebaseFactService(
-        settings_factory(allowed_roots=(repository,), verifier_timeout_seconds=0.2),
+        settings_factory(allowed_roots=(repository,), verifier_timeout_seconds=2.0),
         FakeAgentRuntime(block),
         fake_audit_recorder(),
     )
     with pytest.raises(AgentTimeoutError):
         await service.execute(request_for(repository))
+    assert started.is_set(), "the timeout expired before the runtime was invoked"
     assert cleaned.is_set()
 
 
