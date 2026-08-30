@@ -2,17 +2,31 @@
 
 Maestro is an engineering execution platform for AI-assisted software development.
 
-> **Current implementation scope: `resolve_codebase_fact` only.** The Job, Checkpoint,
-> PR/Issue orchestration, external integration, remote transport, and
-> multi-agent concepts described later in this architectural README are future direction and
-> are not implemented in v1.
+> **Current implementation scope: `resolve_codebase_fact` and its Audit plane only.** The Job,
+> Checkpoint, PR/Issue orchestration, external integration, remote transport, and multi-agent
+> concepts described later in this architectural README are future direction. They are not
+> implemented, and the sections describing them state a target design rather than current
+> behavior.
 
-## Maestro v1
+## Maestro v2
 
-V1 is a local stdio MCP server with one deterministic tool catalog entry. It accepts an
-authorized repository path and one objective question, runs at most one isolated Codex
+V2 is a local stdio MCP server with one deterministic tool catalog entry. It accepts an
+authorized repository path and one objective question, runs at most one isolated worker
 investigation, validates every evidence anchor against a stable repository fingerprint, and
-returns one of `resolved`, `uncertain`, or `human_decision_required`.
+returns one of `resolved`, `uncertain`, or `human_decision_required`. Every audited execution
+is persisted to PostgreSQL before it can succeed.
+
+### Upgrading from 1.x
+
+Audit is a breaking change. A `1.x` deployment does not start on `2.x` until it is given
+mandatory Audit configuration and an explicit worker selection:
+
+- `MAESTRO_AGENT_RUNTIME` is required and has **no default**. An upgrade that does not set it
+  fails at startup.
+- Audit writer coordinates and an owner-only password file are required, and the database must
+  be bootstrapped and migrated before an audited call can succeed.
+- An audited tool call now fails with `AUDIT_UNAVAILABLE` or `AUDIT_PERSISTENCE_ERROR` when the
+  Trail cannot be established. Tool discovery and authorization stay available during an outage.
 
 Runtime requirements are Python >= 3.13 and `uv`. The implementation uses the official MCP
 Python SDK v2, the official `openai-codex` Python SDK and its pinned runtime, Pydantic v2,
@@ -21,7 +35,7 @@ pytest-cov, pytest-timeout, Hypothesis, Ruff, Pyright strict, Vulture, deptry, p
 pre-commit, and detect-secrets. Packaging is defined in `pyproject.toml`, locked by `uv.lock`,
 and uses a `src/` layout.
 
-The v1 package mirrors the boundaries that already own behavior:
+The package mirrors the boundaries that already own behavior:
 
 ```text
 src/maestro/
@@ -29,7 +43,7 @@ src/maestro/
 ├── audit/                                # contracts, recorder, PostgreSQL adapter/migrations
 ├── capabilities/resolve_codebase_fact/  # contracts, policy, sanitization, service
 ├── repository/                           # authorization, isolated fingerprint helper, evidence guard
-├── agents/                               # runtime protocol and Codex adapter
+├── agents/                               # runtime protocol, Claude and Codex adapters
 ├── execution/                            # admission and lifecycle control
 ├── observability/                        # structured stderr logging
 ├── config.py
@@ -39,7 +53,7 @@ src/maestro/
 
 Transport depends on the capability service, the service depends on the agent-runtime
 protocol and repository/execution controls, and only the Codex adapter imports the official
-Codex SDK. Capability models remain with `resolve_codebase_fact`; no generic contract bucket
+Codex SDK while only the Claude adapter invokes the Claude Code binary. Capability models remain with `resolve_codebase_fact`; no generic contract bucket
 or placeholder package exists for future features.
 
 ### Install and run
@@ -73,10 +87,10 @@ exactly one explicit Codex authentication source.
 
 `MAESTRO_ALLOWED_ROOTS` is required and accepts multiple canonical roots separated by the OS
 path separator (`:` on POSIX). Each root must be a directory below the filesystem anchor;
-the anchor itself (`/` on POSIX, or the platform equivalent) is rejected. Configure exactly
-one explicit Codex authentication source:
-`MAESTRO_CODEX_AUTH_FILE` or `MAESTRO_CODEX_API_KEY`. Neither is inherited by repository
-shell commands. Audit writer host, port, database, user, and password-file settings are also
+the anchor itself (`/` on POSIX, or the platform equivalent) is rejected. The `codex` worker
+requires exactly one explicit authentication source, `MAESTRO_CODEX_AUTH_FILE` or
+`MAESTRO_CODEX_API_KEY`; neither is inherited by repository shell commands. The `claude` worker
+requires none, because the binary resolves the operator's own authentication. Audit writer host, port, database, user, and password-file settings are also
 required. On the supported POSIX native/container boundary, the password file must be an
 owner-owned, regular, non-symlink file with mode `0400` or `0600`, contain 1–4096 bytes of UTF-8
 password data, and remain outside every configured allowed root. Its no-follow open is
@@ -111,7 +125,7 @@ An MCP client configuration can launch the server with `uv`:
   "args": ["--directory", "/absolute/path/to/maestro", "run", "maestro"],
   "env": {
     "MAESTRO_ALLOWED_ROOTS": "/absolute/repository/root",
-    "MAESTRO_CODEX_AUTH_FILE": "/absolute/path/to/codex-auth.json",
+    "MAESTRO_AGENT_RUNTIME": "claude",
     "MAESTRO_AUDIT_WRITER_HOST": "localhost",
     "MAESTRO_AUDIT_WRITER_USER": "maestro_audit_writer",
     "MAESTRO_AUDIT_WRITER_PASSWORD_FILE": "/absolute/path/to/audit-writer-password"

@@ -26,7 +26,7 @@ FROM python:3.13.15-slim-trixie@sha256:7e3a6aca9d74f93cca21a91d86a8dad8c34749afd
 LABEL org.opencontainers.image.title="Maestro Engineering Verifier" \
       org.opencontainers.image.description="Hardened local stdio MCP verifier" \
       org.opencontainers.image.licenses="Apache-2.0" \
-      org.opencontainers.image.version="1.0.0"
+      org.opencontainers.image.version="2.0.0"
 
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
