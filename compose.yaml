@@ -1,0 +1,130 @@
+name: maestro-audit
+
+x-maestro-runtime: &maestro-runtime
+  image: ${MAESTRO_DOCKER_IMAGE:-maestro-verifier:local}
+  user: ${MAESTRO_DOCKER_UID:-65532}:${MAESTRO_DOCKER_GID:-65532}
+  read_only: true
+  init: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges=true
+  privileged: false
+  pids_limit: ${MAESTRO_DOCKER_PIDS_LIMIT:-256}
+  mem_limit: ${MAESTRO_DOCKER_MEMORY:-2g}
+  cpus: ${MAESTRO_DOCKER_CPUS:-2}
+  tmpfs:
+    - /tmp:rw,nosuid,nodev,noexec,size=${MAESTRO_DOCKER_TMPFS_SIZE:-512m},mode=0700,uid=${MAESTRO_DOCKER_UID:-65532},gid=${MAESTRO_DOCKER_GID:-65532}
+    - /run/maestro-secrets:rw,nosuid,nodev,noexec,size=2m,mode=0700,uid=${MAESTRO_DOCKER_UID:-65532},gid=${MAESTRO_DOCKER_GID:-65532}
+
+services:
+  maestro:
+    <<: *maestro-runtime
+    entrypoint:
+      - /opt/maestro/.venv/bin/python
+      - /opt/maestro/maestro_mount_guard.py
+    stdin_open: true
+    tty: false
+    networks:
+      audit-internal: {}
+      provider-egress:
+        gw_priority: 1
+
+  audit-postgres:
+    image: postgres:18.6-trixie@sha256:1957b2ff3137e4ef7f3bc813e74fff50b1e1ffddc85c8b9d6f14ade972be8687
+    read_only: true
+    init: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    security_opt:
+      - no-new-privileges=true
+    privileged: false
+    pids_limit: 128
+    mem_limit: 1g
+    cpus: 1
+    environment:
+      POSTGRES_DB: maestro
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256 --auth-local=peer
+      POSTGRES_PASSWORD_FILE: /run/secrets/audit-bootstrap-password
+      POSTGRES_USER: postgres
+    command:
+      - postgres
+      - -c
+      - password_encryption=scram-sha-256
+    healthcheck:
+      test:
+        - CMD
+        - pg_isready
+        - --username
+        - postgres
+        - --dbname
+        - maestro
+      interval: 1s
+      timeout: 3s
+      retries: 30
+      start_period: 2s
+    stop_grace_period: 30s
+    restart: unless-stopped
+    tmpfs:
+      - /run/postgresql:rw,nosuid,nodev,noexec,size=16m,mode=3775,uid=999,gid=999
+      - /tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777
+    volumes:
+      - type: volume
+        source: audit-postgres-data
+        target: /var/lib/postgresql
+        volume:
+          nocopy: true
+    networks:
+      - audit-internal
+
+  audit-bootstrap:
+    <<: *maestro-runtime
+    profiles:
+      - administration
+    entrypoint:
+      - /opt/maestro/.venv/bin/python
+      - /opt/maestro/maestro_mount_guard.py
+    command:
+      - bootstrap
+    networks:
+      - audit-internal
+
+  audit-migrate:
+    <<: *maestro-runtime
+    profiles:
+      - administration
+    entrypoint:
+      - /opt/maestro/.venv/bin/python
+      - /opt/maestro/maestro_mount_guard.py
+    command:
+      - migrate
+    networks:
+      - audit-internal
+
+  audit-reader:
+    <<: *maestro-runtime
+    profiles:
+      - administration
+    entrypoint:
+      - /opt/maestro/.venv/bin/python
+      - /opt/maestro/maestro_mount_guard.py
+    command:
+      - read
+    networks:
+      - audit-internal
+
+networks:
+  audit-internal:
+    internal: true
+  provider-egress:
+    internal: false
+
+volumes:
+  audit-postgres-data:
+    driver: local

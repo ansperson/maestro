@@ -4,5 +4,6 @@
 !pyproject.toml
 !uv.lock
 !README.md
+!scripts/maestro_mount_guard.py
 !src/
 !src/**

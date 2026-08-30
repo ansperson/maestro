@@ -55,6 +55,7 @@ include = [
   "/docs",
   "/evals",
   "/scripts",
+  "/compose.yaml",
   "/README.md",
   "/SECURITY.md",
   "/CONTRIBUTING.md",
