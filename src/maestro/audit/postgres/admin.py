@@ -90,7 +90,10 @@ def _bootstrap_roles_sync(
     try:
         with connection.transaction():
             _execute_resource_sync(connection, packaged_role_bootstrap_body())
-            connection.execute("SET LOCAL password_encryption = 'scram-sha-256'")
+            # `password_encryption` names the PostgreSQL hashing algorithm, not a credential.
+            connection.execute(
+                "SET LOCAL password_encryption = 'scram-sha-256'"  # pragma: allowlist secret
+            )
             encoding = connection.info.encoding
             for scope, role_name in _ROLE_NAMES.items():
                 connection.pgconn.change_password(

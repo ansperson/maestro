@@ -174,6 +174,67 @@ when the repository itself is untrusted. See <https://code.claude.com/docs/en/mc
 Both clients launch the local Docker CLI and communicate with the container solely over stdio.
 No port or remote MCP transport is involved.
 
+## Compose deployment with Audit
+
+Audit requires PostgreSQL, so the local deployment runs two containers. `scripts/maestro_compose.py`
+is the deployment adapter and `compose.yaml` holds the reviewed service profile. The direct launcher
+in `scripts/maestro_container.py` remains supported for a single container.
+
+PostgreSQL attaches only to an internal network and publishes no host port. Maestro attaches to that
+internal network and a separate provider-egress network, and keeps every ADR-0003 control: non-root
+identity, read-only root, dropped capabilities, `no-new-privileges`, bounded tmpfs, and resource
+limits.
+
+Create four distinct credential files outside every allowed root, owned by the container user with
+mode `0600` or `0400`. The launcher rejects symlinks, wrong ownership, group- or world-readable
+modes, empty or oversized files, and any credential located inside an allowed root, because such a
+file would be mounted into the container as readable repository content.
+
+```bash
+mkdir -p ~/maestro/secrets && chmod 700 ~/maestro/secrets
+for role in bootstrap migration writer reader; do
+  openssl rand -hex 24 > ~/maestro/secrets/"$role"-password
+  chmod 0600 ~/maestro/secrets/"$role"-password
+done
+
+export MAESTRO_ALLOWED_ROOTS=/path/to/repository
+export MAESTRO_DOCKER_UID="$(id -u)" MAESTRO_DOCKER_GID="$(id -g)"
+for role in BOOTSTRAP MIGRATION WRITER READER; do
+  lower="$(echo "$role" | tr 'A-Z' 'a-z')"
+  export "MAESTRO_AUDIT_${role}_PASSWORD_FILE=$HOME/maestro/secrets/${lower}-password"
+done
+
+python scripts/maestro_compose.py database-up   # start PostgreSQL on the internal network
+python scripts/maestro_compose.py bootstrap     # create the separate SCRAM roles
+python scripts/maestro_compose.py migrate       # apply Audit migrations
+python scripts/maestro_compose.py server        # stdio MCP server; the MCP client spawns this
+```
+
+`read --view summary|timeline|evidence` queries the curated read-only views. `down` stops the
+deployment and keeps the durable volume. Administration actions run as short-lived containers and
+exit; only `server` is long-running.
+
+The server receives only the append-writer credential, which cannot update, delete, or change
+schema. Bootstrap, migration, and reader credentials are mounted solely into the administration
+action that requires them.
+
+### How credentials reach the container
+
+Role credentials are delivered as read-only bind mounts rather than Compose file secrets. Docker
+Desktop materializes file secrets as root-owned copies inside its virtual machine and reports
+shared-filesystem ownership inconsistently, so a credential delivered that way cannot satisfy
+Maestro's owner-only validation. Before starting Maestro, the image-owned guard re-materializes
+each credential on a bounded private tmpfs at mode `0400`, where ownership and mode are enforced by
+the kernel rather than by a shared filesystem, then executes a fixed target. It fails closed with
+exit status 78 when a credential or repository mount is not exactly as expected.
+
+PostgreSQL is the single exception: its bootstrap credential uses the official
+`/run/secrets/audit-bootstrap-password` path, because the official entrypoint reads it as root
+before dropping to the unprivileged `postgres` user.
+
+Credentials never appear in environment variables, command arguments, container labels,
+`docker inspect` metadata, logs, or the Codex worker's environment.
+
 ## Networking and credentials
 
 The container uses Docker's bridge network because the Codex SDK must reach the model provider.

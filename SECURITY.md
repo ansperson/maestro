@@ -60,6 +60,18 @@ a complete home or `.codex` directory. File authentication is preferred because 
 as a Docker environment variable is visible in daemon container metadata to principals allowed
 to inspect Docker.
 
+In the two-container deployment, role credentials are delivered as read-only bind mounts rather
+than Compose file secrets, because Docker Desktop materializes file secrets as root-owned copies
+inside its virtual machine and reports shared-filesystem ownership inconsistently, which cannot
+satisfy the owner-only validation above. An image-owned startup guard re-materializes each
+credential on a bounded private tmpfs at mode `0400`, where ownership and mode are kernel-enforced,
+then executes a fixed target; it fails closed rather than starting with an unverified credential or
+a writable repository mount. PostgreSQL's bootstrap credential is the single exception and keeps
+the official file-secret path, because the official entrypoint consumes it as root before dropping
+to the unprivileged database user. Credential files must live outside every allowed root, since a
+credential inside an allowed root would be mounted into the container as readable repository
+content and could reach the model provider.
+
 The cloud model control plane remains reachable and selected repository content may leave the
 host. Do not authorize a repository whose contents may not be sent to that provider. Maestro
 does not persist prompts, transcripts, repository content, or model output.

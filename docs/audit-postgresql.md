@@ -18,6 +18,11 @@ The fixed identities make a role-name collision a hard bootstrap failure. Audit 
 expects its approved dedicated PostgreSQL container/database rather than sharing one cluster among
 independently bootstrapped Maestro installations.
 
+In the supported two-container deployment, `scripts/maestro_compose.py bootstrap` and
+`scripts/maestro_compose.py migrate` perform the steps below as short-lived containers, each
+receiving only the credentials its role requires. Use the manual commands below when operating
+PostgreSQL outside that deployment. See [`container.md`](container.md) for the deployment.
+
 ## Clean installation
 
 Run these commands from a trusted Maestro checkout. `ADMIN_DSN` must identify the PostgreSQL
