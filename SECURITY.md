@@ -17,6 +17,17 @@ history, and instructions), the Codex runtime/model, and model output are untrus
 provider is an explicit data-egress recipient. A stdio client gets the privileges of the user
 who launches Maestro; v1 has no remote authentication, authorization, or multi-tenancy.
 
+Decision authority adds one outbound boundary. When the GitHub work-item adapter is
+configured, Maestro reads an issue body over HTTPS and writes an approval request back as a
+comment. That comment contains the proposed action, the entries that produced the refusal, and
+the block entry that would settle it — never repository content, model output, logs, or a
+credential. Posting a comment is a write to an external service under the operator's own
+account, so the adapter is configured explicitly and does nothing when it is not. Issue bodies
+are untrusted input: only the marked decision block is read, it is parsed against a strict
+grammar, and a malformed block is refused rather than partially accepted. Authority documents
+are read only from explicitly configured paths and are never discovered by scanning, so
+repository content cannot nominate itself as authority.
+
 Maestro canonicalizes allowed roots, rejects filesystem anchors plus traversal/symlink escape,
 performs bounded no-follow file discovery, isolates the Codex home and environment, disables
 inherited MCPs/skills/apps/web/subagents, selects deny-all/read-only at both SDK boundaries,
@@ -37,6 +48,14 @@ no host namespaces/ports/socket, and explicit resource limits. See ADR-0003 and
 `docs/container.md`.
 
 ## Credentials and privacy
+
+`MAESTRO_WORKITEM_GITHUB_TOKEN_FILE` names an owner-only regular non-symlink file read through
+the same bounded no-follow path an Audit role password uses, and the token exists only in
+memory as a `SecretStr` that no repr, log, or serialized model renders. It is re-read per
+request, so rotating the file takes effect without a restart. `MAESTRO_WORKITEM_GITHUB_API_URL`
+must be HTTPS, so a token is never offered over a plaintext connection, and redirects are not
+followed. The token's scope is the operator's to choose: reading an issue and commenting on it
+is all Maestro exercises. Only the GitHub adapter receives the token projection.
 
 Configure exactly one of `MAESTRO_CODEX_AUTH_FILE` or `MAESTRO_CODEX_API_KEY`. The former is
 copied through a no-follow regular-file descriptor into a mode-0700 temporary Codex home; the

@@ -29,7 +29,7 @@ from maestro.config import (
 
 from .migrations import packaged_migrations, packaged_role_bootstrap_body
 
-_SUPPORTED_SCHEMA_VERSION = 3
+_SUPPORTED_SCHEMA_VERSION = 4
 _ROLE_NAMES = {
     "migration": "maestro_audit_migrator",
     "writer": "maestro_audit_writer",

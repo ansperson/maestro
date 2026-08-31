@@ -4,8 +4,9 @@
 
 This model covers the local stdio `resolve_codebase_fact` capability and its PostgreSQL Audit
 tracer at server version 1.0.0. It excludes remote transport, Jobs, non-Audit durable state,
-external MCP/integrations, PR/Issue work,
-multi-tenancy, and subagents. The operator and host kernel are trusted; the MCP caller,
+external MCP servers, Jobs, PR work,
+multi-tenancy, and subagents. It now also covers the decision-authority engine and its GitHub
+work-item adapter, which is the first outbound integration and is inert unless configured. The operator and host kernel are trusted; the MCP caller,
 repository, model/runtime output, and dependency supply chain are not. The model provider is
 trusted to receive selected authorized-repository data under the operator's provider terms.
 Native mode trusts the host user boundary. Hardened mode additionally trusts the Docker daemon,
@@ -29,6 +30,9 @@ Linux kernel/VM, official pinned base manifests, and configured host filesystem 
 | Repository mutation | SDK read-only/deny-all, evidence file identity checks, before/after content/Git fingerprint; hardened mode bind-mounts roots recursively read-only | Native mode retains the upstream bypass risk; Docker daemon/kernel compromise remains outside Level 2 |
 | Compromised dependency/runtime | Exact MCP/Codex/runtime pins, lockfile, startup version check, digest-pinned image inputs, pip-audit, Trivy, Dependabot, CodeQL, pinned actions | Locking/scanning is not compromise prevention; the Docker daemon, host kernel/VM, registry, and scanner databases remain trusted dependencies |
 | Container breakout or daemon exposure | Non-root UID, all capabilities dropped, no-new-privileges, default seccomp/LSM, no privileged/host namespaces/devices/socket, read-only root | Kernel/runtime vulnerabilities and access to the host Docker daemon are outside the container boundary; rootless Docker further reduces daemon impact on native Linux |
+| Authority bypass | Every action requires a covering entry, and a caller states no authority class of its own, so an agent cannot classify its way past the check; the engine is pure and reads no clock or environment; scope and validity are matched exactly, with no prefix, substring, or near match; a tracker that is unreachable, unauthenticated, or serving a malformed block raises rather than reporting an item without decisions; a refusal whose approval request could not be written is reported as unavailable rather than as recorded; conflicts are never resolved by precedence and no configuration enables that | An operator who writes an over-broad rule grants a standing authorization, which is the delegation working as designed rather than a bypass; Maestro records who approved a decision but does not verify that they hold authority for that class, so a tracker account compromise can approve on the operator's behalf; anyone who can edit the work item can write a decision block |
+| Work-item credential and egress | Owner-only bounded no-follow token file reusing the Audit secret path, in-memory `SecretStr` excluded from reprs, logs, and serialization, HTTPS-only API URL, no redirect following, bounded timeout, bounded response size, strict Pydantic response validation, repository pinned to a validated `owner/name` pair, references validated as digits before they reach a request path, and failures mapped to dispositions carrying no tracker, URL, or credential detail | The comment Maestro posts is visible to everyone who can read the issue, and its content is chosen by the operator's own action text; token scope is the operator's responsibility; the adapter trusts GitHub's TLS chain and the platform's authenticated identity for the recorded approver |
+| Trail tampering through the work item | Applied decision content is captured at application time with a canonical digest rather than referenced, and Audit remains append-only with no new writer privilege | A digest proves the entry differs from what was applied but cannot say which version was correct; the migrator and database owner remain trusted |
 | Future external MCP trust | No external MCP server is configured or reachable in v1 | Any future integration needs a new ADR, authentication/authorization, data-flow review, and threat-model extension |
 
 ## Data lifecycle

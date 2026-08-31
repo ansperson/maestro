@@ -214,3 +214,8 @@ def test_a_decision_block_and_a_rule_block_do_not_read_each_other() -> None:
     body = decision_block(decision_entry())
 
     assert parse_rule_block(body, origin=ORIGIN) == ()
+
+
+def test_a_scope_target_longer_than_its_bound_is_rejected() -> None:
+    with pytest.raises(MalformedDecisionBlockError):
+        parse(decision_entry(scope="project " + "x" * 300))

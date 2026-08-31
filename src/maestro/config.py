@@ -21,11 +21,15 @@ from maestro.capabilities.resolve_codebase_fact.contracts import (
 )
 from maestro.model_identity import ModelIdentifier
 
-_MAX_AUDIT_PASSWORD_BYTES = 4_096
+MAX_SECRET_FILE_BYTES = 4_096
 _MAX_POSTGRES_HOST_CHARS = 253
 _POSTGRES_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,62}\Z")
 _DNS_LABEL_PATTERN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z")
 _LEGACY_AUDIT_DATABASE_URL = "MAESTRO_AUDIT_DATABASE_URL"
+_GITHUB_REPOSITORY_PATTERN = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9][A-Za-z0-9._-]{0,99}\Z"
+)
+MAX_WORK_ITEM_RESPONSE_BYTES = 1_048_576
 
 
 def _libpq_environment_names() -> frozenset[str]:
@@ -131,6 +135,77 @@ class AuditReaderConfiguration(_AuditConnectionConfiguration):
     """SELECT-only human/query reader connection projection."""
 
 
+class GitHubWorkItemConfiguration(BaseModel):
+    """The complete configuration projection permitted to reach the GitHub adapter.
+
+    Nothing else in the codebase carries a tracker credential or a tracker address, which is
+    what keeps the adapter the only place that knows GitHub.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    repository: str = Field(repr=False)
+    api_url: str = Field(repr=False)
+    token: SecretStr = Field(repr=False)
+    request_timeout_seconds: Annotated[float, Field(gt=0, le=120)]
+
+
+class GitHubWorkItemSettings(BaseSettings):
+    """Environment-backed work-management credentials for the GitHub adapter."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="MAESTRO_WORKITEM_GITHUB_",
+        extra="forbid",
+        hide_input_in_errors=True,
+        case_sensitive=False,
+    )
+
+    repository: Annotated[str, Field(min_length=3, max_length=200, repr=False)]
+    api_url: Annotated[str, Field(min_length=1, max_length=2_048, repr=False)] = (
+        "https://api.github.com"
+    )
+    token_file: Path = Field(exclude=True, repr=False)
+    request_timeout_seconds: Annotated[float, Field(gt=0, le=120)] = 15.0
+
+    @field_validator("repository")
+    @classmethod
+    def validate_repository(_cls, value: str) -> str:  # noqa: N804
+        """Require an owner/name pair, so a reference can never widen the path it builds."""
+
+        if _GITHUB_REPOSITORY_PATTERN.fullmatch(value) is None:
+            raise ValueError("MAESTRO_WORKITEM_GITHUB_REPOSITORY must read owner/name")
+        return value
+
+    @field_validator("api_url")
+    @classmethod
+    def validate_api_url(_cls, value: str) -> str:  # noqa: N804
+        """Require HTTPS, so a token is never offered over a plaintext connection."""
+
+        trimmed = value.rstrip("/")
+        if not trimmed.startswith("https://") or " " in trimmed:
+            raise ValueError("MAESTRO_WORKITEM_GITHUB_API_URL must be an https URL")
+        return trimmed
+
+    @field_validator("token_file")
+    @classmethod
+    def validate_token_file(_cls, value: Path) -> Path:  # noqa: N804
+        """Apply the same owner-only controls an Audit role password receives."""
+
+        canonical = canonical_secret_file(value)
+        read_owner_only_secret(canonical)
+        return canonical
+
+    def work_item_configuration(self) -> GitHubWorkItemConfiguration:
+        """Read the token afresh, so a rotated file is picked up without a restart."""
+
+        return GitHubWorkItemConfiguration(
+            repository=self.repository,
+            api_url=self.api_url,
+            token=read_owner_only_secret(self.token_file),
+            request_timeout_seconds=self.request_timeout_seconds,
+        )
+
+
 class _AuditRoleSettings(BaseSettings):
     """Shared validation for one role-specific Audit credential source."""
 
@@ -165,8 +240,8 @@ class _AuditRoleSettings(BaseSettings):
     def validate_password_file(_cls, value: Path) -> Path:  # noqa: N804
         """Validate and read the owner-only regular file once during settings construction."""
 
-        canonical = _canonical_secret_file(value)
-        _read_audit_password(canonical)
+        canonical = canonical_secret_file(value)
+        read_owner_only_secret(canonical)
         return canonical
 
     @model_validator(mode="after")
@@ -180,7 +255,7 @@ class _AuditRoleSettings(BaseSettings):
             "port": self.port,
             "database": self.database,
             "user": self.user,
-            "password": _read_audit_password(self.password_file),
+            "password": read_owner_only_secret(self.password_file),
         }
 
 
@@ -438,23 +513,28 @@ def _reject_legacy_audit_database_url() -> None:
         raise ValueError(f"{_LEGACY_AUDIT_DATABASE_URL} is no longer supported")
 
 
-def _canonical_secret_file(path: Path) -> Path:
+def canonical_secret_file(path: Path) -> Path:
     if os.name != "posix":
-        raise ValueError("Audit password file controls require a POSIX platform")
+        raise ValueError("Secret file controls require a POSIX platform")
     try:
         candidate = path.parent.resolve(strict=True) / path.name
         metadata = os.lstat(candidate)
     except (OSError, RuntimeError):
-        raise ValueError("Audit password file is unavailable") from None
+        raise ValueError("The secret file is unavailable") from None
     if stat.S_ISLNK(metadata.st_mode):
-        raise ValueError("Audit password file must be a regular non-symlink file")
+        raise ValueError("A secret file must be a regular non-symlink file")
     if not stat.S_ISREG(metadata.st_mode):
-        raise ValueError("Audit password file must be regular")
+        raise ValueError("A secret file must be regular")
     return candidate
 
 
-def _read_audit_password(path: Path) -> SecretStr:
-    """Read one bounded owner-only password without following symlinks or leaking details."""
+def read_owner_only_secret(path: Path) -> SecretStr:
+    """Read one bounded owner-only secret without following symlinks or leaking details.
+
+    Every credential Maestro holds comes through this one path: an Audit role password and a
+    work-management token are the same kind of thing, and a second reader would be a second
+    place for the controls to drift.
+    """
 
     flags = (
         os.O_RDONLY
@@ -465,56 +545,56 @@ def _read_audit_password(path: Path) -> SecretStr:
     try:
         expected = os.lstat(path)
         if stat.S_ISLNK(expected.st_mode):
-            raise ValueError("Audit password file must be a regular non-symlink file")
+            raise ValueError("A secret file must be a regular non-symlink file")
         if not stat.S_ISREG(expected.st_mode):
-            raise ValueError("Audit password file must be regular")
+            raise ValueError("A secret file must be regular")
         descriptor = os.open(path, flags)
     except OSError:
-        raise ValueError("Audit password file is unavailable") from None
+        raise ValueError("The secret file is unavailable") from None
     try:
         metadata = os.fstat(descriptor)
         if (expected.st_dev, expected.st_ino) != (metadata.st_dev, metadata.st_ino):
-            raise ValueError("Audit password file changed while being opened")
-        _validate_audit_password_metadata(metadata)
-        raw = _read_bounded_password(descriptor)
+            raise ValueError("The secret file changed while being opened")
+        _validate_secret_file_metadata(metadata)
+        raw = _read_bounded_secret(descriptor)
     except OSError:
-        raise ValueError("Audit password file is unreadable") from None
+        raise ValueError("The secret file is unreadable") from None
     finally:
         os.close(descriptor)
-    return SecretStr(_decode_audit_password(raw))
+    return SecretStr(_decode_secret(raw))
 
 
-def _validate_audit_password_metadata(metadata: os.stat_result) -> None:
+def _validate_secret_file_metadata(metadata: os.stat_result) -> None:
     if not stat.S_ISREG(metadata.st_mode):
-        raise ValueError("Audit password file must be regular")
+        raise ValueError("A secret file must be regular")
     if metadata.st_uid != os.geteuid():
-        raise ValueError("Audit password file must be owned by the Maestro user")
+        raise ValueError("A secret file must be owned by the Maestro user")
     if stat.S_IMODE(metadata.st_mode) not in {0o400, 0o600}:
-        raise ValueError("Audit password file permissions must be owner-only")
-    if metadata.st_size > _MAX_AUDIT_PASSWORD_BYTES:
-        raise ValueError("Audit password file is oversized")
+        raise ValueError("Secret file permissions must be owner-only")
+    if metadata.st_size > MAX_SECRET_FILE_BYTES:
+        raise ValueError("The secret file is oversized")
 
 
-def _read_bounded_password(descriptor: int) -> bytearray:
+def _read_bounded_secret(descriptor: int) -> bytearray:
     raw = bytearray()
-    while chunk := os.read(descriptor, min(1_024, _MAX_AUDIT_PASSWORD_BYTES + 1 - len(raw))):
+    while chunk := os.read(descriptor, min(1_024, MAX_SECRET_FILE_BYTES + 1 - len(raw))):
         raw.extend(chunk)
-        if len(raw) > _MAX_AUDIT_PASSWORD_BYTES:
-            raise ValueError("Audit password file is oversized")
+        if len(raw) > MAX_SECRET_FILE_BYTES:
+            raise ValueError("The secret file is oversized")
     return raw
 
 
-def _decode_audit_password(raw: bytearray) -> str:
+def _decode_secret(raw: bytearray) -> str:
     if raw.endswith(b"\r\n"):
         del raw[-2:]
     elif raw.endswith(b"\n"):
         del raw[-1:]
     if not raw:
-        raise ValueError("Audit password file must not be empty")
+        raise ValueError("A secret file must not be empty")
     try:
         value = raw.decode("utf-8")
     except UnicodeDecodeError:
-        raise ValueError("Audit password file must contain UTF-8 text") from None
+        raise ValueError("A secret file must contain UTF-8 text") from None
     if "\x00" in value:
-        raise ValueError("Audit password file contains an invalid value")
+        raise ValueError("A secret file contains an invalid value")
     return value
