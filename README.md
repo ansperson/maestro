@@ -64,6 +64,24 @@ the roles, and applies migrations. `make run` then starts the server natively, `
 queries the curated Audit views, and `make clean` removes the volume and credentials. Point
 it at your own checkout with `make up REPO=/absolute/repository/root`.
 
+### Running the evaluation
+
+`make eval` scores the tool against the corpus in `evals/` and, unless asked otherwise, against
+a control arm answering the same questions without the tool. Both arms are scored by one
+deterministic rubric; see [ADR-0011](docs/adr/0011-tool-evaluation-policy.md).
+
+```bash
+make eval                     # both arms, 3 repetitions per case
+make eval ARMS=tool           # tool only, consuming no control-arm provider capacity
+make eval REPS=5 EFFORT=low   # more repetitions, lower control-arm reasoning effort
+```
+
+The summary marks with `!` any arm that answered differently across repetitions, since a single
+run is not a result. The full JSON report is written to `.local/eval-report.json`. Only the
+control arm's cost is reported: the adapter does not surface provider spend through the tool's
+result contract. The evaluation is not part of the deterministic gate and needs the database
+running, so run `make up` first.
+
 The equivalent explicit invocation:
 
 ```bash

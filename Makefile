@@ -13,6 +13,10 @@ SECRETS ?= $(CURDIR)/.local/secrets
 # configuration for Audit, so exporting it would stop the server from starting.
 DB_PORT ?= 5433
 PROJECT ?= maestro-dev
+REPS ?= 3
+ARMS ?= both
+EFFORT ?= medium
+EVAL_REPORT ?= $(CURDIR)/.local/eval-report.json
 IMAGE ?= maestro-verifier:local
 ROLES := bootstrap migration writer reader
 
@@ -44,7 +48,7 @@ ADMIN := MAESTRO_AUDIT_BOOTSTRAP_HOST=127.0.0.1 MAESTRO_AUDIT_BOOTSTRAP_PORT=$(D
 	MAESTRO_AUDIT_READER_USER=maestro_audit_reader \
 	MAESTRO_AUDIT_READER_PASSWORD_FILE="$(SECRETS)/reader-password"
 
-.PHONY: help secrets db-up db-down bootstrap migrate up run ask read status verify clean
+.PHONY: help secrets db-up db-down bootstrap migrate up run ask eval read status verify clean
 
 help: ## Show the available targets
 	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -90,6 +94,22 @@ run: ## Run the stdio MCP server natively; an MCP client normally spawns this
 ask: ## Ask one question end to end: make ask Q="Does X hold?"
 	@test -n "$(Q)" || { echo "  usage: make ask Q=\"your question\""; exit 2; }
 	@uv run python scripts/ask.py "$(REPO)" "$(DB_PORT)" "$(SECRETS)" "$(Q)"
+
+eval: ## Run the evaluation: make eval [REPS=3] [ARMS=both|tool] [EFFORT=medium]
+	@MAESTRO_AGENT_RUNTIME=claude \
+		MAESTRO_ALLOWED_ROOTS="$(REPO)" \
+		MAESTRO_AUDIT_WRITER_HOST=127.0.0.1 MAESTRO_AUDIT_WRITER_PORT=$(DB_PORT) \
+		MAESTRO_AUDIT_WRITER_DATABASE=maestro \
+		MAESTRO_AUDIT_WRITER_USER=maestro_audit_writer \
+		MAESTRO_AUDIT_WRITER_PASSWORD_FILE="$(SECRETS)/writer-password" \
+		MAESTRO_LOG_LEVEL=ERROR \
+		uv run python scripts/run_evals.py \
+			--repetitions $(REPS) --effort $(EFFORT) $(if $(filter tool,$(ARMS)),--no-control,) \
+		> "$(EVAL_REPORT)" 2>/dev/null; \
+	status=$$?; \
+	uv run python scripts/eval_summary.py "$(EVAL_REPORT)"; \
+	echo "  full report: $(EVAL_REPORT)"; \
+	exit $$status
 
 read: ## Query the curated read-only Audit views
 	@$(ADMIN) uv run python -m maestro.audit.postgres.admin read $(ARGS)

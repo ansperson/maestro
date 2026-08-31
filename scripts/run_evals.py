@@ -191,7 +191,7 @@ async def run(repetitions: int, effort: str, budget: float, control: bool) -> in
     root = Path(__file__).parent.parent
     repository = root / "tests" / "fixtures" / "codebase"
     corpus = EvalCorpus.model_validate_json(
-        (root / "evals" / "resolve_codebase_fact_v1.json").read_text(encoding="utf-8"),
+        (root / "evals" / "resolve_codebase_fact_v2.json").read_text(encoding="utf-8"),
         strict=True,
     )
     settings = Settings(  # pyright: ignore[reportCallIssue] - Audit URL comes from BaseSettings
