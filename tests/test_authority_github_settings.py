@@ -11,7 +11,13 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from maestro.config import GitHubWorkItemSettings
+from maestro.config import (
+    AuditWriterSettings,
+    GitHubWorkItemSettings,
+    Settings,
+    load_work_item_settings,
+    reject_secret_inside_allowed_roots,
+)
 
 TOKEN = "synthetic-work-item-token"  # noqa: S105 - a fixture value, not a credential
 REPOSITORY = "ansperson/maestro"
@@ -71,3 +77,51 @@ def test_a_rotated_token_is_picked_up_without_a_restart(token_file: Path) -> Non
     token_file.write_text("rotated-token", encoding="utf-8")
 
     assert settings.work_item_configuration().token.get_secret_value() == "rotated-token"
+
+
+def test_a_token_inside_an_allowed_root_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A credential a read-only capability may read can reach an append-only Trail.
+
+    `resolve_codebase_fact` returns evidence from anywhere inside an allowed root, and Audit
+    persists what it returns, so a token stored there would be recorded permanently.
+    """
+
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    inside = repository / "github-token"
+    inside.write_text(TOKEN, encoding="utf-8")
+    inside.chmod(0o600)
+    monkeypatch.setenv("MAESTRO_WORKITEM_GITHUB_REPOSITORY", REPOSITORY)
+    monkeypatch.setenv("MAESTRO_WORKITEM_GITHUB_TOKEN_FILE", str(inside))
+    settings = Settings.model_validate(
+        {"allowed_roots": (repository,), "audit_writer": AuditWriterSettings()}  # pyright: ignore[reportCallIssue]
+    )
+
+    with pytest.raises(ValueError, match="outside every allowed root"):
+        load_work_item_settings(settings)
+
+
+def test_a_token_beside_an_allowed_root_is_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, token_file: Path
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    monkeypatch.setenv("MAESTRO_WORKITEM_GITHUB_REPOSITORY", REPOSITORY)
+    monkeypatch.setenv("MAESTRO_WORKITEM_GITHUB_TOKEN_FILE", str(token_file))
+    settings = Settings.model_validate(
+        {"allowed_roots": (repository,), "audit_writer": AuditWriterSettings()}  # pyright: ignore[reportCallIssue]
+    )
+
+    assert load_work_item_settings(settings).token_file == token_file
+
+
+def test_the_allowed_root_itself_cannot_be_the_token_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+
+    with pytest.raises(ValueError, match="outside every allowed root"):
+        reject_secret_inside_allowed_roots(repository, (repository,), "Work-management token file")

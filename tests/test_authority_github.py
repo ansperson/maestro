@@ -7,7 +7,7 @@ the token is a synthetic value from a temporary owner-only file.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -29,7 +29,7 @@ from maestro.authority.engine import (
 )
 from maestro.authority.github import GitHubWorkItemPort
 from maestro.authority.port import ApprovalRequest, WorkItemAccessError, WorkItemFailureKind
-from maestro.config import GitHubWorkItemSettings
+from maestro.config import MAX_WORK_ITEM_RESPONSE_BYTES, GitHubWorkItemSettings
 
 pytestmark = pytest.mark.asyncio
 
@@ -235,6 +235,28 @@ async def test_an_oversized_response_is_refused(token_file: Path) -> None:
         await port.read_work_item(REFERENCE)
 
     assert raised.value.kind is WorkItemFailureKind.MALFORMED
+
+
+async def test_an_endless_body_stops_being_read_at_the_bound(token_file: Path) -> None:
+    """The bound must stop the read, not measure it once the whole body is already in memory."""
+
+    chunk_size = 65_536
+    served = 0
+
+    async def endless() -> AsyncIterator[bytes]:
+        nonlocal served
+        while True:
+            served += 1
+            yield b"x" * chunk_size
+
+    port = build(token_file, lambda _request: httpx.Response(200, content=endless()))
+
+    with pytest.raises(WorkItemAccessError) as raised:
+        await port.read_work_item(REFERENCE)
+
+    assert raised.value.kind is WorkItemFailureKind.MALFORMED
+    # The stream is abandoned just past the bound rather than run to exhaustion.
+    assert served <= (MAX_WORK_ITEM_RESPONSE_BYTES // chunk_size) + 2
 
 
 @pytest.mark.parametrize(

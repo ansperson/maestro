@@ -435,12 +435,11 @@ class Settings(BaseSettings):
             raise ValueError("MAESTRO_MAX_FILE_BYTES cannot exceed MAESTRO_MAX_REPOSITORY_BYTES")
         if self.codex_auth_file is not None and self.codex_api_key is not None:
             raise ValueError("configure only one Codex authentication source")
-        if any(
-            self.audit_writer.password_file == root
-            or self.audit_writer.password_file.is_relative_to(root)
-            for root in self.allowed_roots
-        ):
-            raise ValueError("Audit writer password file must be outside every allowed root")
+        reject_secret_inside_allowed_roots(
+            self.audit_writer.password_file,
+            self.allowed_roots,
+            "Audit writer password file",
+        )
         return self
 
     def claude_runtime_configuration(self) -> ClaudeRuntimeConfiguration:
@@ -471,6 +470,39 @@ class Settings(BaseSettings):
         """Project the normal runtime's single append-writer credential."""
 
         return self.audit_writer.connection_configuration()
+
+
+def reject_secret_inside_allowed_roots(
+    secret_file: Path,
+    allowed_roots: tuple[Path, ...],
+    label: str,
+) -> None:
+    """Refuse a secret that a read-only capability would be authorized to read.
+
+    A credential inside an allowed root is not merely exposed: `resolve_codebase_fact` may
+    return it as evidence, and Audit would then persist it in a Trail that is append-only by
+    design. The check lives here so every secret Maestro holds is tested the same way.
+    """
+
+    if any(secret_file == root or secret_file.is_relative_to(root) for root in allowed_roots):
+        raise ValueError(f"{label} must be outside every allowed root")
+
+
+def load_work_item_settings(settings: Settings) -> GitHubWorkItemSettings:
+    """Load work-management settings and check them against the repository authorization.
+
+    This is the composition point. `GitHubWorkItemSettings` is its own settings source, so
+    nothing inside it can see the allowed roots; a caller that built it directly would skip
+    the containment check, which is why callers use this instead.
+    """
+
+    work_item = GitHubWorkItemSettings()  # pyright: ignore[reportCallIssue] - from environment
+    reject_secret_inside_allowed_roots(
+        work_item.token_file,
+        settings.allowed_roots,
+        "Work-management token file",
+    )
+    return work_item
 
 
 def _is_filesystem_anchor(path: Path) -> bool:

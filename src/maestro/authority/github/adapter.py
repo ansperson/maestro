@@ -60,11 +60,11 @@ class GitHubWorkItemPort:
         """Fetch one issue and parse the marked decision block from its body."""
 
         number = _issue_number(reference)
-        response = await self._request(
+        body = await self._request(
             "GET",
             f"/repos/{self._configuration.repository}/issues/{number}",
         )
-        issue = _decode(response)
+        issue = _decode(body)
         try:
             decisions = parse_decision_block(issue.body or "", origin=f"work item {number}")
         except MalformedDecisionBlockError:
@@ -93,8 +93,13 @@ class GitHubWorkItemPort:
         path: str,
         *,
         json: dict[str, str] | None = None,
-    ) -> httpx.Response:
-        """Perform one bounded authenticated call, mapping every failure to a safe disposition."""
+    ) -> bytes:
+        """Perform one authenticated call and return a body bounded as it arrives.
+
+        The response is streamed rather than fetched whole. Checking a length after the client
+        has already buffered the body is not a bound: a hostile or misbehaving endpoint would
+        have spent the memory before the check ran.
+        """
 
         try:
             async with httpx.AsyncClient(
@@ -103,17 +108,16 @@ class GitHubWorkItemPort:
                 transport=self._transport,
                 follow_redirects=False,
             ) as client:
-                response = await client.request(
-                    method,
-                    path,
-                    json=json,
-                    headers=self._headers(),
-                )
+                request = client.build_request(method, path, json=json, headers=self._headers())
+                response = await client.send(request, stream=True)
+                try:
+                    _raise_for_status(response)
+                    return await _read_bounded_body(response)
+                finally:
+                    await response.aclose()
         except httpx.HTTPError:
             # The exception carries adapter and possibly URL detail, so none of it escapes.
             raise WorkItemAccessError(WorkItemFailureKind.UNREACHABLE) from None
-        _raise_for_status(response)
-        return response
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -147,10 +151,19 @@ def _raise_for_status(response: httpx.Response) -> None:
         raise WorkItemAccessError(WorkItemFailureKind.UNREACHABLE)
 
 
-def _decode(response: httpx.Response) -> _IssuePayload:
-    if len(response.content) > MAX_WORK_ITEM_RESPONSE_BYTES:
-        raise WorkItemAccessError(WorkItemFailureKind.MALFORMED)
+async def _read_bounded_body(response: httpx.Response) -> bytes:
+    """Accumulate the body only up to the bound, then stop reading and refuse."""
+
+    body = bytearray()
+    async for chunk in response.aiter_bytes():
+        body.extend(chunk)
+        if len(body) > MAX_WORK_ITEM_RESPONSE_BYTES:
+            raise WorkItemAccessError(WorkItemFailureKind.MALFORMED)
+    return bytes(body)
+
+
+def _decode(body: bytes) -> _IssuePayload:
     try:
-        return _IssuePayload.model_validate_json(response.content)
+        return _IssuePayload.model_validate_json(body)
     except ValidationError:
         raise WorkItemAccessError(WorkItemFailureKind.MALFORMED) from None

@@ -367,3 +367,35 @@ def test_the_subject_alone_does_not_authorize_an_unrelated_choice() -> None:
     )
 
     assert outcome.kind is AuthorityOutcomeKind.APPROVAL_REQUIRED
+
+
+def test_a_source_that_is_both_lapsed_and_out_of_scope_is_still_reported() -> None:
+    """Regression: an entry disqualified twice fell through both buckets and vanished.
+
+    The result claimed nothing spoke to the subject while something did, which is exactly the
+    distinction the reason codes exist to make.
+    """
+
+    outcome = evaluate_authority(
+        action(),
+        [decision(scope_target="99", validity=until(date(2020, 1, 1)))],
+        evaluated_on=TODAY,
+    )
+
+    assert outcome.reason is not ApprovalReason.NO_COVERING_SOURCE
+    assert len(outcome.considered) == 1
+    assert "No decision or rule speaks to this subject." not in outcome.summary
+
+
+def test_nothing_speaking_to_the_subject_is_the_only_way_to_report_no_covering_source() -> None:
+    speaks = [decision(scope_target="99", superseded=True)]
+    silent = [decision(subject="another.subject")]
+
+    assert (
+        evaluate_authority(action(), speaks, evaluated_on=TODAY).reason
+        is not ApprovalReason.NO_COVERING_SOURCE
+    )
+    assert (
+        evaluate_authority(action(), silent, evaluated_on=TODAY).reason
+        is ApprovalReason.NO_COVERING_SOURCE
+    )

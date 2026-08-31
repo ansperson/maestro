@@ -143,16 +143,15 @@ def _refusal_without_cover(
     speaking: tuple[AuthoritySource, ...],
     evaluated_on: date,
 ) -> AuthorityOutcome:
+    # The two buckets are exhaustive over everything that speaks to the subject: an entry
+    # that is both lapsed and out of scope still falls in one, so an entry can never be
+    # silently dropped and reported as "nothing speaks to this subject".
     lapsed = tuple(
         entry
         for entry in speaking
         if not entry.in_force_on(evaluated_on) and entry.scope.covers(action.target)
     )
-    out_of_scope = tuple(
-        entry
-        for entry in speaking
-        if entry.in_force_on(evaluated_on) and not entry.scope.covers(action.target)
-    )
+    out_of_scope = tuple(entry for entry in speaking if not entry.scope.covers(action.target))
     if lapsed:
         reason, considered = ApprovalReason.VALIDITY_LAPSED, lapsed
     elif out_of_scope:

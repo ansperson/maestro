@@ -54,8 +54,15 @@ the same bounded no-follow path an Audit role password uses, and the token exist
 memory as a `SecretStr` that no repr, log, or serialized model renders. It is re-read per
 request, so rotating the file takes effect without a restart. `MAESTRO_WORKITEM_GITHUB_API_URL`
 must be HTTPS, so a token is never offered over a plaintext connection, and redirects are not
-followed. The token's scope is the operator's to choose: reading an issue and commenting on it
-is all Maestro exercises. Only the GitHub adapter receives the token projection.
+followed. Only the GitHub adapter receives the token projection.
+
+Use a fine-grained personal access token restricted to the single repository Maestro reads,
+with `Issues: Read and write` and nothing else. Maestro exercises exactly two calls: reading an
+issue and commenting on it. A classic token with the `repo` scope grants push access to your
+code, and handing that to a component whose entire premise is that it may not act without
+authority defeats the point of running it. The token file must also sit outside every allowed
+root, which is enforced rather than advised: a credential inside an authorized repository can
+be returned as evidence and then persisted in an append-only Trail.
 
 Configure exactly one of `MAESTRO_CODEX_AUTH_FILE` or `MAESTRO_CODEX_API_KEY`. The former is
 copied through a no-follow regular-file descriptor into a mode-0700 temporary Codex home; the

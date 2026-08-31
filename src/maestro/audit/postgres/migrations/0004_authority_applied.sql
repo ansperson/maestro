@@ -40,6 +40,38 @@ ALTER TABLE audit.events
         )
     );
 
+DROP VIEW audit_read.event_timeline;
+
+-- An authority event carried none of the fields the timeline projected, so it appeared as an
+-- empty row. The timeline is the view that answers "what happened, in order", and an event
+-- that shows up blank there is worse than one that is absent.
+CREATE VIEW audit_read.event_timeline
+WITH (security_barrier = true)
+AS
+SELECT
+    event.audit_id,
+    event.event_id,
+    execution.execution_id,
+    execution.repository_id,
+    event.sequence,
+    event.event_type,
+    event.event_version,
+    event.occurred_at,
+    event.payload ->> 'objective' AS objective,
+    event.payload ->> 'status' AS semantic_status,
+    event.payload ->> 'answer' AS answer,
+    event.payload ->> 'confidence' AS confidence,
+    event.payload ->> 'rationale' AS rationale,
+    event.payload ->> 'error_code' AS error_code,
+    event.payload ->> 'failure_stage' AS failure_stage,
+    event.payload ->> 'subject' AS authority_subject,
+    event.payload ->> 'choice' AS authority_choice,
+    event.payload ->> 'scope' AS authority_scope,
+    event.payload ->> 'approved_by' AS authority_approved_by
+FROM audit.events AS event
+JOIN audit.executions AS execution ON execution.audit_id = event.audit_id
+ORDER BY event.audit_id, event.sequence;
+
 DROP VIEW audit_read.execution_summary;
 
 CREATE VIEW audit_read.execution_summary
@@ -110,6 +142,7 @@ WHERE event.event_type = 'authority.applied';
 -- untouched: it stays append-only over the same two tables and the same two verify functions.
 GRANT SELECT ON audit_read.applied_authority TO maestro_audit_reader;
 GRANT SELECT ON audit_read.execution_summary TO maestro_audit_reader;
+GRANT SELECT ON audit_read.event_timeline TO maestro_audit_reader;
 
 UPDATE audit.schema_version SET version = 4 WHERE singleton;
 

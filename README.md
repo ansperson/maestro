@@ -213,7 +213,9 @@ that class of decision, and removing one narrows autonomy again, with no code ch
 documents are never discovered by scanning; only explicitly configured paths are read, and a
 document confers nothing unless it declares a current status and marks its entries.
 
-Try the whole loop against a real issue. The token file needs mode `0600`:
+Try the whole loop against a real issue. Use a fine-grained token limited to this repository
+with `Issues: Read and write` and nothing else; the file needs mode `0600` and must sit outside
+every allowed root, which Maestro enforces:
 
 ```bash
 printf '%s' "$GITHUB_TOKEN" > .local/secrets/github-token && chmod 0600 .local/secrets/github-token

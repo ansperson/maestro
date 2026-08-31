@@ -25,7 +25,7 @@ from maestro.authority.documents import read_authority_documents
 from maestro.authority.engine import AuthorityOutcome
 from maestro.authority.github import GitHubWorkItemPort
 from maestro.authority.service import AuthorityService
-from maestro.config import GitHubWorkItemSettings, Settings
+from maestro.config import Settings, load_work_item_settings
 from maestro.errors import MaestroError
 from maestro.observability.logging import configure_logging
 from maestro.repository.guard import RepositoryGuard
@@ -65,7 +65,7 @@ async def main() -> int:
     options = _parse_arguments()
     settings = Settings()  # pyright: ignore[reportCallIssue] - values come from environment
     configure_logging(settings.log_level)
-    work_item_settings = GitHubWorkItemSettings()  # pyright: ignore[reportCallIssue]
+    work_item_settings = load_work_item_settings(settings)
     guard = RepositoryGuard(settings)
     repository = guard.authorize(options.repository)
     fingerprint = await guard.fingerprint(repository)
