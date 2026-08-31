@@ -1,11 +1,13 @@
 # ADR-0006: Decision Authority and Human Approval
 
-* **Status:** Proposed
+* **Status:** Accepted
 * **Date:** 2026-08-25
 * **Decision owners:** Project maintainers
 * **Related:** ADR-0001 — Maestro as an Engineering Execution Platform
 * **Related:** ADR-0004 — Separate Work Management, Audit, and Observability Planes
 * **Related:** ADR-0005 — Audit as a First-Class Governance Plane
+* **Depends on:** ADR-0004 — the plane separation that decides where decisions live
+* **Depends on:** ADR-0005 — this model assumes Audit is a fail-closed governance plane
 
 ## Context
 
@@ -90,9 +92,9 @@ Without explicit authority semantics, Maestro risks silently converting:
 
 This is incompatible with trustworthy autonomous engineering.
 
-## Proposed Decision
+## Decision
 
-Maestro will explicitly distinguish:
+Maestro explicitly distinguishes:
 
 ```text
 FACT
@@ -209,7 +211,7 @@ Authority must not be inferred merely from:
 
 ## Authority Precedence
 
-The proposed precedence is conceptually:
+The precedence is conceptually:
 
 ```text
 1. Explicit current human decision
@@ -570,22 +572,41 @@ If those prerequisites are missing, implementation should not begin.
 
 This allows Jobs to adapt their workflow based on what authority already exists.
 
-## Relation to Audit
+## Relation to Work Management and Audit
 
-Governance-relevant decision lifecycle should be auditable.
+An earlier revision of this ADR proposed recording the whole decision lifecycle in Audit. That
+conflicts with ADR-0004, which is accepted: the planes may reference one another but must not
+substitute for one another. Requesting, proposing, approving, rejecting, and superseding a
+decision are coordination between humans and agents, and coordination is Work Management.
 
-Expected semantic events may include:
+The division is:
 
 ```text
-decision.required
-decision.recommended
-decision.approved
-decision.rejected
-decision.superseded
-authority.applied
+Work Management   the decision itself and its lifecycle
+                  content, options, discussion, approval, supersession
+
+Audit             what an execution did with it
+                  halted for missing authority; applied decision X
 ```
 
-Audit should store concise decision rationale and authority references, not private model chain-of-thought.
+Work Management is where a decision is readable and actionable by both a human and an agent,
+without database access. Audit is the durable record used to reconstruct why an execution
+behaved as it did.
+
+Audit therefore gains at most `authority.applied`, plus the existing terminal semantics for an
+execution that stopped because authority was missing. It does not gain a decision lifecycle.
+
+Audit stores concise decision rationale and authority references, never private model
+chain-of-thought, as ADR-0005 already requires.
+
+### Dependency on Audit's purpose
+
+This model assumes Audit is a fail-closed governance plane, as ADR-0005 decided. Audit is what
+proves governance happened, which is why an audited execution cannot succeed without it.
+
+If Audit is ever reclassified as a troubleshooting aid, fail-closed loses its justification and
+applied authority loses its mandatory record. That would be a deliberate change to this model,
+not a side effect of changing Audit.
 
 ## Decision Reuse
 
@@ -630,7 +651,7 @@ rather than silently rewriting history.
 
 This aligns with the proposed append-oriented Audit architecture.
 
-## Proposed Invariants
+## Invariants
 
 Before acceptance, validate whether these should become permanent invariants:
 
@@ -647,68 +668,75 @@ Before acceptance, validate whether these should become permanent invariants:
 11. Decision lifecycle is auditable.
 12. Authority scope and supersession must remain explicit.
 
-## Open Questions Before Acceptance
+## Resolved Before Acceptance
 
-The architecture review should challenge:
+These questions were open when this ADR was proposed. They were resolved by review against the
+accepted ADRs and the existing implementation.
 
-### Authority representation
+### Where decisions are persisted
 
-How should authority be represented in Maestro?
+Work Management owns the decision and its lifecycle; Audit records what an execution did with it.
+This follows from ADR-0004 rather than from preference. See *Relation to Work Management and
+Audit*.
 
-Examples:
+### How authority is represented
 
-```text
-artifact references
-policy IDs
-decision records
-typed authority objects
-```
+A decision lives in a structured block inside a work item, and each entry states what was
+decided, who decided it, and its scope. Maestro reads only that block and treats the rest of the
+item as context.
 
-### Scope
+The block exists to close a specific gap. This ADR forbids inferring authority from source code,
+while accepting a requirements artifact as authoritative. Without an explicit marker, an
+observation about the code can be written into an artifact, accepted, and acquire authority the
+rule denies it. Marking decisions keeps that path closed.
 
-How precisely must the scope of a decision be represented?
+### How precisely scope is represented
 
-### Existing documents
+Each decision names the target it applies to and the validity it carries — this work item, this
+project, or until superseded. Reuse requires an explicit match; anything else is asked again.
 
-How does Maestro determine whether a PRD/ADR/document is accepted and current?
+This also settles whether authority can expire: declared validity is its expiry.
 
-### Conflicts
+### How a document is recognized as authoritative
 
-What happens when two authoritative sources conflict?
+A document must state its status and mark its decisions. The `Status` field these ADRs already
+carry satisfies the first half. A document without marked decisions is read as context and never
+as authority, which extends the same anti-laundering rule to documents.
 
-### Delegation
+### What happens when authoritative sources conflict
 
-How are automated decision classes explicitly delegated?
+A detected conflict is never resolved by machine. Authority is refused and the conflicting
+sources are surfaced for a human decision, which is then recorded.
 
-### Expiration
+Precedence alone is insufficient, demonstrated by this ADR itself: its earlier decision-lifecycle
+events conflicted with the accepted ADR-0004, and neither "older wins" nor "newer wins" would have
+produced the correct outcome. The conflict was a design error, and only a human could see that.
 
-Can authority expire?
+### How automated decision classes are delegated
 
-### Human identity
+Writing a rule delegates that class of decision. `AGENTS.md` already delegates many technical
+choices this way. Delegation therefore has no separate mechanism: the body of written rules is
+the delegation, and it is adjusted by writing rules rather than by redefining authority.
 
-How much identity information is required for approval?
+### Where the line falls between autonomous work and human authority
 
-### Approval channels
+The working agent does not decide what to escalate. A deterministic authority engine evaluates
+written rules and already-approved decisions, then either clears the action or records on the
+work item that approval is required.
 
-Can approval come from:
+An agent may assess its own conditions, but only in one direction. Concluding that it is blocked
+is safe and requires no consultation. Concluding that it may proceed is not sufficient, because
+an agent under pressure to complete will reach that conclusion. This is the same asymmetry
+ADR-0007 states for assurance: an assessment may raise a requirement and never lower one.
 
-```text
-Jira
-GitHub
-CLI
-MCP client
-future UI
-```
+An authority engine that judges rather than evaluates would move the judgement rather than remove
+it, so the engine is deterministic.
 
-and how is authenticity established?
+### What identity an approval requires
 
-### Small technical choices
-
-Where should the line between autonomous implementation detail and human technical authority be drawn?
-
-### Decision persistence
-
-Should decision records belong directly to Audit, Job state, a dedicated Decision model, or a combination?
+Maestro accepts the identity the work-management system authenticated and records who approved.
+It does not verify that the approver holds authority for that class of decision. Recording the
+approver keeps that check an addition rather than a reopening of this model.
 
 ## Non-Goals
 
@@ -726,7 +754,7 @@ This ADR does not define:
 * policy language;
 * a general rules engine.
 
-## Consequences if Accepted
+## Consequences
 
 ### Positive
 
