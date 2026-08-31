@@ -21,6 +21,9 @@ class ErrorCode(StrEnum):
     EVIDENCE_VALIDATION_ERROR = "EVIDENCE_VALIDATION_ERROR"
     RECURSION_NOT_ALLOWED = "RECURSION_NOT_ALLOWED"
     OUTPUT_LIMIT_EXCEEDED = "OUTPUT_LIMIT_EXCEEDED"
+    AUTHORITY_REQUIRED = "AUTHORITY_REQUIRED"
+    AUTHORITY_CONFLICT = "AUTHORITY_CONFLICT"
+    WORK_ITEM_UNAVAILABLE = "WORK_ITEM_UNAVAILABLE"
     AUDIT_UNAVAILABLE = "AUDIT_UNAVAILABLE"
     AUDIT_PERSISTENCE_ERROR = "AUDIT_PERSISTENCE_ERROR"
     INTERNAL_ERROR = "INTERNAL_ERROR"
@@ -118,3 +121,18 @@ class AuditUnavailableError(MaestroError):
 class AuditPersistenceError(MaestroError):
     code = ErrorCode.AUDIT_PERSISTENCE_ERROR
     default_message = "Audit persistence could not establish the required durable record."
+
+
+class AuthorityRequiredError(MaestroError):
+    code = ErrorCode.AUTHORITY_REQUIRED
+    default_message = "The action requires an approved decision; approval has been requested."
+
+
+class AuthorityConflictError(MaestroError):
+    code = ErrorCode.AUTHORITY_CONFLICT
+    default_message = "Authoritative sources disagree about this action; a human must resolve it."
+
+
+class WorkItemUnavailableError(MaestroError):
+    code = ErrorCode.WORK_ITEM_UNAVAILABLE
+    default_message = "The work-management system could not be reached."

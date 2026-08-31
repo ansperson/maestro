@@ -37,6 +37,7 @@ def packaged_migrations() -> tuple[AuditMigration, ...]:
         (1, files(__package__).joinpath("0001_audit_tracer.sql")),
         (2, files(__package__).joinpath("0002_execution_failed.sql")),
         (3, files(__package__).joinpath("0003_roles_and_read_views.sql")),
+        (4, files(__package__).joinpath("0004_authority_applied.sql")),
     )
     return tuple(
         AuditMigration(

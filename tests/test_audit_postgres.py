@@ -139,7 +139,7 @@ class _FakeConnection:
         *,
         transaction_exit_error: Exception | None = None,
         close_error: Exception | None = None,
-        schema_version: int | None = 3,
+        schema_version: int | None = 4,
         durability: _FakeDurability | None = None,
     ) -> None:
         self._transaction_exit_error = transaction_exit_error
@@ -310,6 +310,7 @@ def test_migration_is_an_ordered_packaged_explicit_resource() -> None:
         (1, "0001_audit_tracer.sql"),
         (2, "0002_execution_failed.sql"),
         (3, "0003_roles_and_read_views.sql"),
+        (4, "0004_authority_applied.sql"),
     ]
     assert migrations[0].sql.startswith("BEGIN;")
     assert migrations[0].sql.rstrip().endswith("COMMIT;")

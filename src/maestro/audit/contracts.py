@@ -23,6 +23,8 @@ MAX_AUDIT_SYMBOL_CHARS = 256
 MAX_AUDIT_EVIDENCE_ITEMS = 20
 MAX_AUDIT_CONFLICTS = 10
 MAX_AUDIT_CONFLICT_EVIDENCE_ITEMS = 10
+MAX_AUDIT_AUTHORITY_CHARS = 500
+MAX_AUDIT_AUTHORITY_CHOICE_CHARS = 1_000
 MAX_AUDIT_PAYLOAD_BYTES = 65_536
 _TERMINAL_SEQUENCE = 2
 
@@ -30,6 +32,16 @@ _Digest = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 _VersionText = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=128),
+]
+_AuthorityText = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=MAX_AUDIT_AUTHORITY_CHARS),
+]
+_AuthorityChoiceText = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True, min_length=1, max_length=MAX_AUDIT_AUTHORITY_CHOICE_CHARS
+    ),
 ]
 
 
@@ -41,16 +53,37 @@ class AuditEventType(StrEnum):
     """Semantic event types implemented by the v1 Audit tracer."""
 
     EXECUTION_STARTED = "execution.started"
+    AUTHORITY_APPLIED = "authority.applied"
     INVESTIGATION_COMPLETED = "investigation.completed"
     EXECUTION_FAILED = "execution.failed"
+
+    @property
+    def is_terminal(self) -> bool:
+        """Report whether this type ends an execution.
+
+        A decision-authority execution ends when the decision it applied is recorded, so
+        `authority.applied` is terminal rather than a step inside a longer run. When durable
+        Jobs make an applied decision part of a larger execution, that is the change that
+        moves it, and it is a deliberate one.
+        """
+
+        return self is not AuditEventType.EXECUTION_STARTED
 
 
 class AuditFailureStage(StrEnum):
     """Bounded lifecycle stages safe to persist for operational failures."""
 
+    AUTHORITY = "authority"
     INVESTIGATION = "investigation"
     VALIDATION = "validation"
     TERMINAL_PERSISTENCE = "terminal_persistence"
+
+
+class AuditCapability(StrEnum):
+    """The capabilities whose executions Audit records."""
+
+    RESOLVE_CODEBASE_FACT = "resolve_codebase_fact"
+    DECISION_AUTHORITY = "decision_authority"
 
 
 class AuditResultStatus(StrEnum):
@@ -166,7 +199,51 @@ class ExecutionFailedV1(_StrictFrozenModel):
     prompt_policy_version: _VersionText
 
 
-type AuditPayloadV1 = ExecutionStartedV1 | InvestigationCompletedV1 | ExecutionFailedV1
+class AuthorityAppliedV1(_StrictFrozenModel):
+    """One decision or written rule as it stood when an execution applied it.
+
+    The content is captured rather than referenced. A work item is editable by design, so a
+    reference alone would let a later edit change what the Trail says was authorized. The
+    digest makes such an edit detectable rather than invisible.
+
+    This is the only authority event Audit records. Requesting, proposing, approving,
+    rejecting, and superseding a decision are coordination, and ADR-0004 gives coordination
+    to Work Management.
+    """
+
+    source_kind: _AuthorityText
+    subject: _AuthorityText
+    choice: _AuthorityChoiceText
+    scope: _AuthorityText
+    validity: _AuthorityText
+    approved_by: _AuthorityText | None = None
+    rationale: Annotated[
+        str | None,
+        StringConstraints(
+            strip_whitespace=True, min_length=1, max_length=MAX_AUDIT_RATIONALE_CHARS
+        ),
+    ] = None
+    origin: _AuthorityText
+    work_item: _AuthorityText
+    source_digest: _Digest
+    server_version: _VersionText
+    runtime_name: _VersionText
+    runtime_version: _VersionText
+    model: ModelIdentifier
+    prompt_policy_version: _VersionText
+
+
+type AuditPayloadV1 = (
+    ExecutionStartedV1 | AuthorityAppliedV1 | InvestigationCompletedV1 | ExecutionFailedV1
+)
+
+
+_PAYLOAD_BY_EVENT_TYPE: dict[AuditEventType, type[BaseModel]] = {
+    AuditEventType.EXECUTION_STARTED: ExecutionStartedV1,
+    AuditEventType.AUTHORITY_APPLIED: AuthorityAppliedV1,
+    AuditEventType.INVESTIGATION_COMPLETED: InvestigationCompletedV1,
+    AuditEventType.EXECUTION_FAILED: ExecutionFailedV1,
+}
 
 
 class AuditEventV1(_StrictFrozenModel):
@@ -182,17 +259,15 @@ class AuditEventV1(_StrictFrozenModel):
 
     @model_validator(mode="after")
     def validate_event_shape(self) -> Self:
-        invalid_start = self.event_type is AuditEventType.EXECUTION_STARTED and (
-            self.sequence != 1 or not isinstance(self.payload, ExecutionStartedV1)
-        )
-        invalid_completion = self.event_type is AuditEventType.INVESTIGATION_COMPLETED and (
-            self.sequence != _TERMINAL_SEQUENCE
-            or not isinstance(self.payload, InvestigationCompletedV1)
-        )
-        invalid_failure = self.event_type is AuditEventType.EXECUTION_FAILED and (
-            self.sequence != _TERMINAL_SEQUENCE or not isinstance(self.payload, ExecutionFailedV1)
-        )
-        if invalid_start or invalid_completion or invalid_failure:
+        """Require the type, position, and payload to agree.
+
+        Sequence one is the start and nothing else is; every terminal type takes the second
+        position. An execution therefore has exactly one outcome, whatever kind it is.
+        """
+
+        expected_payload = _PAYLOAD_BY_EVENT_TYPE[self.event_type]
+        expected_sequence = _TERMINAL_SEQUENCE if self.event_type.is_terminal else 1
+        if self.sequence != expected_sequence or not isinstance(self.payload, expected_payload):
             raise ValueError("Audit event type, sequence, and payload do not agree")
         if self.occurred_at.tzinfo is None or self.occurred_at.utcoffset() is None:
             raise ValueError("Audit event timestamps must be timezone-aware")
@@ -215,7 +290,7 @@ class AuditEventV1(_StrictFrozenModel):
 class AuditExecutionV1(_StrictFrozenModel):
     audit_id: UUID
     execution_id: UUID
-    capability: Literal["resolve_codebase_fact"] = "resolve_codebase_fact"
+    capability: AuditCapability = AuditCapability.RESOLVE_CODEBASE_FACT
     repository_id: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{16}$")]
     repository_fingerprint: _Digest
 
@@ -261,4 +336,20 @@ class AuditExecutionFailureV1(_StrictFrozenModel):
             raise ValueError("failure record requires execution.failed")
         if self.content_hash != self.event.content_hash():
             raise ValueError("failure record content hash must match its immutable event")
+        return self
+
+
+class AuditAuthorityApplicationV1(_StrictFrozenModel):
+    """One applied decision recorded against an execution already in progress."""
+
+    execution_id: UUID
+    event: AuditEventV1
+    content_hash: _Digest
+
+    @model_validator(mode="after")
+    def validate_type(self) -> Self:
+        if self.event.event_type is not AuditEventType.AUTHORITY_APPLIED:
+            raise ValueError("authority record requires authority.applied")
+        if self.content_hash != self.event.content_hash():
+            raise ValueError("authority record content hash must match its immutable event")
         return self
