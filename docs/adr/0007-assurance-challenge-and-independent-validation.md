@@ -387,6 +387,20 @@ An AI assessment may increase assurance.
 
 It should not reduce a deterministic minimum imposed by policy.
 
+### Self-reported confidence
+
+A worker's own confidence is one such assessment, and it is subject to the same rule.
+
+Low reported confidence is a reasonable trigger for additional assurance: a second opinion, a
+targeted challenge, or a broader evidence sweep. That direction is additive, so a worker that
+misjudges itself costs effort rather than correctness.
+
+High reported confidence must not remove validation that policy already requires. The verifier
+policy states that model confidence is not proof, and ADR-0002 holds model-produced evidence
+untrusted until application code validates it. Letting a claim decide whether that claim is
+checked would invert both. The baseline checks are deterministic and cheap, so there is no
+saving that would justify it.
+
 ## Agent Assessment
 
 AI may contribute an assessment such as:
