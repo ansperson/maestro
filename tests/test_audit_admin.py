@@ -187,7 +187,7 @@ async def test_migrate_applies_only_pending_ordered_resources_and_verifies(
 ) -> None:
     _configure_role_files(monkeypatch, tmp_path)
     connection = _AsyncConnection()
-    versions: Iterator[int] = iter((1, 3))
+    versions: Iterator[int] = iter((1, admin_module._SUPPORTED_SCHEMA_VERSION))  # pyright: ignore[reportPrivateUsage]
     applied: list[str] = []
 
     async def fake_connect(*_args: object, **_kwargs: object) -> _AsyncConnection:

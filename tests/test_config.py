@@ -332,7 +332,7 @@ def test_writer_secret_file_rejects_device_metadata_before_open(
     monkeypatch.setattr(config_module.os, "open", track_open)
 
     with pytest.raises(ValueError, match="regular"):
-        config_module._read_audit_password(path)  # pyright: ignore[reportPrivateUsage]
+        config_module.read_owner_only_secret(path)
 
     assert open_called is False
 

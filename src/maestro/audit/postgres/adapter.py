@@ -13,6 +13,7 @@ from psycopg import AsyncConnection, Error as PsycopgError, OperationalError
 from psycopg.types.json import Jsonb
 
 from maestro.audit.contracts import (
+    AuditAuthorityApplicationV1,
     AuditEventV1,
     AuditExecutionFailureV1,
     AuditExecutionStartV1,
@@ -21,7 +22,7 @@ from maestro.audit.contracts import (
 from maestro.audit.port import AuditWriteError, AuditWriteFailureKind
 from maestro.config import AuditWriterConfiguration, validate_audit_libpq_environment
 
-_SUPPORTED_SCHEMA_VERSION = 3
+_SUPPORTED_SCHEMA_VERSION = 4
 _RETRYABLE_SQLSTATES = frozenset({"40001", "40P01", "53300", "57P01", "57P02", "57P03"})
 _TRANSACTION_ABORT_SQLSTATES = frozenset({"40001", "40P01"})
 _SAFE_SYNCHRONOUS_COMMIT_VALUES = frozenset({"on", "remote_apply"})
@@ -75,6 +76,21 @@ class PostgresAuditPort:
             )
             if not execution_inserted or not event_inserted:
                 await _verify_start_record(connection, record)
+
+        await _run_transaction(self._configuration, write)
+
+    async def apply_authority(self, record: AuditAuthorityApplicationV1) -> None:
+        """Insert the single sequence-two applied decision in its own short transaction."""
+
+        async def write(connection: AsyncConnection[tuple[object, ...]]) -> None:
+            await _verify_schema(connection)
+            if not await _insert_event(connection, record.event, record.content_hash):
+                await _verify_event_record(
+                    connection,
+                    record.execution_id,
+                    record.event,
+                    record.content_hash,
+                )
 
         await _run_transaction(self._configuration, write)
 

@@ -16,6 +16,7 @@ from typing import cast
 import pytest
 from mcp import Client, StdioServerParameters
 
+from maestro.audit.postgres.migrations import packaged_migrations
 from maestro.capabilities.resolve_codebase_fact.contracts import (
     VerificationResult,
     VerificationStatus,
@@ -385,7 +386,8 @@ async def test_compose_audit_deployment_is_hardened_private_durable_and_fail_clo
     migration = _launcher(environment, "migrate", timeout=120)
     _assert_no_secret_values(bootstrap.stdout + bootstrap.stderr, values)
     _assert_no_secret_values(migration.stdout + migration.stderr, values)
-    assert _psql(postgres_name, "SELECT version FROM audit.schema_version") == "3"
+    latest_schema_version = str(packaged_migrations()[-1].version)
+    assert _psql(postgres_name, "SELECT version FROM audit.schema_version") == latest_schema_version
     assert (
         _psql(
             postgres_name,

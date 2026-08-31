@@ -38,6 +38,9 @@ psql -X --set ON_ERROR_STOP=1 --dbname "$MIGRATOR_DSN" \
   --file src/maestro/audit/postgres/migrations/0002_execution_failed.sql
 psql -X --set ON_ERROR_STOP=1 --dbname "$MIGRATOR_DSN" \
   --file src/maestro/audit/postgres/migrations/0003_roles_and_read_views.sql
+
+psql "$MIGRATOR_DSN" --set ON_ERROR_STOP=1 \
+  --file src/maestro/audit/postgres/migrations/0004_authority_applied.sql
 ```
 
 The bootstrap revokes `PUBLIC` database and `public`-schema privileges. It grants database
@@ -51,6 +54,17 @@ password-file settings; it rejects DSNs and ambient libpq connection variables a
 bootstrap or migration SQL. Keep administrator, migrator, writer, and reader connection material
 separate. The `ADMIN_DSN` and `MIGRATOR_DSN` examples above are operator-only `psql` inputs, not
 Maestro application configuration.
+
+## Forward upgrade from schema v3
+
+For an existing v3 Audit database, run only `0004_authority_applied.sql` as the migrator. It
+refuses any schema version other than v3 and refuses to run as another role.
+
+The v4 migration admits the `decision_authority` capability and the `authority.applied` event
+type, replaces `audit_read.execution_summary` so an applied decision reports as
+`authority_applied`, and adds `audit_read.applied_authority`. It grants the reader `SELECT` on
+the new view and changes no writer privilege: the writer stays append-only over the same two
+tables and the same two verification functions.
 
 ## Forward upgrade from schema v2
 
@@ -81,12 +95,21 @@ SELECT *
 FROM audit_read.evidence
 WHERE repository_id = '0123456789abcdef'
 ORDER BY audit_id, evidence_scope, conflict_ordinal, evidence_ordinal;
+
+SELECT *
+FROM audit_read.applied_authority
+WHERE work_item = '26'
+ORDER BY occurred_at DESC;
 ```
 
-`execution_summary` reports `resolved`, `uncertain`, `human_decision_required`, `failed`, or
-`incomplete` without requiring JSON operators. `event_timeline` exposes event identity, order, and
+`execution_summary` reports `resolved`, `uncertain`, `human_decision_required`, `authority_applied`,
+`failed`, or `incomplete` without requiring JSON operators. `event_timeline` exposes event identity, order, and
 approved semantic fields. `evidence` expands primary and conflict evidence into repository-relative
-references. None of the views exposes the raw JSONB payload or database persistence timestamps.
+references. `applied_authority` reads back the decision or written rule an execution applied,
+with its subject, decided value, scope, validity, approver, origin, and a digest of the entry
+as it stood. That content was captured at application time rather than referenced, so editing
+the work item afterwards changes the item and never this row; a digest that no longer matches
+the current block shows the entry has since changed, without saying which version was right. None of the views exposes the raw JSONB payload or database persistence timestamps.
 
 The views are operational query surfaces, not a public Maestro Capability or tamper-evidence
 mechanism. A database owner remains administratively capable of changing stored data.

@@ -18,6 +18,7 @@ from psycopg.types.json import Jsonb
 from pydantic import SecretStr
 
 import maestro.audit.postgres.adapter as adapter_module
+import maestro.audit.postgres.admin as admin_module
 from maestro.agents import FakeAgentRuntime
 from maestro.audit.contracts import (
     AuditConfidence,
@@ -139,7 +140,7 @@ class _FakeConnection:
         *,
         transaction_exit_error: Exception | None = None,
         close_error: Exception | None = None,
-        schema_version: int | None = 3,
+        schema_version: int | None = 4,
         durability: _FakeDurability | None = None,
     ) -> None:
         self._transaction_exit_error = transaction_exit_error
@@ -297,6 +298,20 @@ def _patch_connection(
     monkeypatch.setattr(adapter_module.AsyncConnection, "connect", staticmethod(connect))
 
 
+def test_the_adapter_and_the_migrator_agree_on_the_supported_schema_version() -> None:
+    """Regression: the two constants drifted, so migrations refused to reach the new version.
+
+    They live apart because runtime and deployment are separate concerns, but a runtime that
+    demanded a version the migrator would never install failed only against a real database.
+    """
+
+    runtime: int = adapter_module._SUPPORTED_SCHEMA_VERSION  # pyright: ignore[reportPrivateUsage]
+    deployment: int = admin_module._SUPPORTED_SCHEMA_VERSION  # pyright: ignore[reportPrivateUsage]
+
+    assert runtime == deployment
+    assert runtime == packaged_migrations()[-1].version
+
+
 def test_migration_is_an_ordered_packaged_explicit_resource() -> None:
     bootstrap = packaged_role_bootstrap()
     migrations = packaged_migrations()
@@ -310,6 +325,7 @@ def test_migration_is_an_ordered_packaged_explicit_resource() -> None:
         (1, "0001_audit_tracer.sql"),
         (2, "0002_execution_failed.sql"),
         (3, "0003_roles_and_read_views.sql"),
+        (4, "0004_authority_applied.sql"),
     ]
     assert migrations[0].sql.startswith("BEGIN;")
     assert migrations[0].sql.rstrip().endswith("COMMIT;")

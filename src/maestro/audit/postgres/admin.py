@@ -29,7 +29,7 @@ from maestro.config import (
 
 from .migrations import packaged_migrations, packaged_role_bootstrap_body
 
-_SUPPORTED_SCHEMA_VERSION = 3
+_SUPPORTED_SCHEMA_VERSION = 4
 _ROLE_NAMES = {
     "migration": "maestro_audit_migrator",
     "writer": "maestro_audit_writer",
@@ -48,6 +48,7 @@ class ReadView(StrEnum):
     SUMMARY = "summary"
     TIMELINE = "timeline"
     EVIDENCE = "evidence"
+    AUTHORITY = "authority"
 
 
 async def bootstrap_roles() -> None:
@@ -243,6 +244,14 @@ def _read_statement(view: ReadView) -> LiteralString:
         """,
             ReadView.TIMELINE: """
             SELECT * FROM audit_read.event_timeline
+            WHERE (%s::uuid IS NULL OR audit_id = %s::uuid)
+              AND (%s::uuid IS NULL OR execution_id = %s::uuid)
+              AND (%s::text IS NULL OR repository_id = %s::text)
+              AND (%s::text IS NULL OR %s::text IS NULL)
+            ORDER BY audit_id DESC LIMIT 100
+        """,
+            ReadView.AUTHORITY: """
+            SELECT * FROM audit_read.applied_authority
             WHERE (%s::uuid IS NULL OR audit_id = %s::uuid)
               AND (%s::uuid IS NULL OR execution_id = %s::uuid)
               AND (%s::text IS NULL OR repository_id = %s::text)

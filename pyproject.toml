@@ -22,6 +22,7 @@ dependencies = [
   "pydantic>=2.12,<3",
   "pydantic-settings>=2.10,<3",
   "psycopg[binary]>=3.2,<4",
+  "httpx>=0.28,<1",
 ]
 
 [project.scripts]
@@ -101,7 +102,8 @@ ignore = [
 max-complexity = 12
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**/*.py" = ["ANN", "PLR2004", "S101", "S603", "S607"]
+# Test constructors take one keyword per contract field, which reads better than a builder.
+"tests/**/*.py" = ["ANN", "PLR0913", "PLR2004", "S101", "S603", "S607"]
 "src/maestro/agents/codex/worker.py" = ["T201"]
 
 [tool.ruff.lint.isort]

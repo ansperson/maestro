@@ -7,6 +7,7 @@ from typing import Protocol
 from uuid import UUID
 
 from maestro.audit.contracts import (
+    AuditAuthorityApplicationV1,
     AuditExecutionFailureV1,
     AuditExecutionStartV1,
     AuditInvestigationCompletionV1,
@@ -38,6 +39,10 @@ class AuditPort(Protocol):
 
     async def start_execution(self, record: AuditExecutionStartV1) -> None:
         """Atomically persist an execution and its sequence-one start event."""
+        ...
+
+    async def apply_authority(self, record: AuditAuthorityApplicationV1) -> None:
+        """Persist one applied decision against an execution already started."""
         ...
 
     async def complete_investigation(self, record: AuditInvestigationCompletionV1) -> None:

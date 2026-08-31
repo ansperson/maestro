@@ -15,6 +15,8 @@ from uuid import UUID, uuid4
 from pydantic import ValidationError
 
 from maestro.audit.contracts import (
+    AuditAuthorityApplicationV1,
+    AuditCapability,
     AuditConfidence,
     AuditConflictV1,
     AuditEventType,
@@ -26,6 +28,7 @@ from maestro.audit.contracts import (
     AuditFailureStage,
     AuditInvestigationCompletionV1,
     AuditResultStatus,
+    AuthorityAppliedV1,
     ExecutionFailedV1,
     ExecutionStartedV1,
     InvestigationCompletedV1,
@@ -113,6 +116,22 @@ class AuditInvestigationCompletionInput:
 
 
 @dataclass(frozen=True, slots=True)
+class AuditAppliedDecisionInput:
+    """One decision or written rule, as it stood when an execution applied it."""
+
+    source_kind: str
+    subject: str
+    choice: str
+    scope: str
+    validity: str
+    approved_by: str | None
+    rationale: str | None
+    origin: str
+    work_item: str
+    source_digest: str
+
+
+@dataclass(frozen=True, slots=True)
 class AuditExecutionHandle:
     """Stable identities generated once for one audited execution lifecycle."""
 
@@ -147,6 +166,78 @@ class AuditRecorder:
     ) -> AuditExecutionHandle:
         """Persist the atomic execution/start pair and return immutable terminal identities."""
 
+        return await self._start_execution(
+            AuditCapability.RESOLVE_CODEBASE_FACT,
+            repository,
+            fingerprint,
+            objective,
+        )
+
+    async def start_authority_check(
+        self,
+        repository: AuthorizedRepository,
+        fingerprint: RepositoryFingerprint,
+        objective: str,
+    ) -> AuditExecutionHandle:
+        """Begin the audited execution of one authority evaluation."""
+
+        return await self._start_execution(
+            AuditCapability.DECISION_AUTHORITY,
+            repository,
+            fingerprint,
+            objective,
+        )
+
+    async def record_authority_applied(
+        self,
+        handle: AuditExecutionHandle,
+        repository: AuthorizedRepository,
+        applied: AuditAppliedDecisionInput,
+    ) -> None:
+        """Persist the decision an execution applied, with its content as it stood.
+
+        The content is captured here rather than referenced, so a later edit to the work item
+        cannot change what the Trail says was authorized.
+        """
+
+        try:
+            payload = AuthorityAppliedV1(
+                source_kind=applied.source_kind,
+                subject=sanitize_audit_text(applied.subject, repository.root),
+                choice=sanitize_audit_text(applied.choice, repository.root),
+                scope=sanitize_audit_text(applied.scope, repository.root),
+                validity=applied.validity,
+                approved_by=self._sanitize_optional(applied.approved_by, repository.root),
+                rationale=self._sanitize_optional(applied.rationale, repository.root),
+                origin=sanitize_audit_text(applied.origin, repository.root),
+                work_item=sanitize_audit_text(applied.work_item, repository.root),
+                source_digest=applied.source_digest,
+                **self._metadata_fields(),
+            )
+            event = AuditEventV1(
+                event_id=handle.terminal_event_id,
+                audit_id=handle.audit_id,
+                sequence=2,
+                event_type=AuditEventType.AUTHORITY_APPLIED,
+                occurred_at=self._clock(),
+                payload=payload,
+            )
+            record = AuditAuthorityApplicationV1(
+                execution_id=handle.execution_id,
+                event=event,
+                content_hash=event.content_hash(),
+            )
+        except ValidationError:
+            self._raise_public(AuditPersistenceError(), "authority", 0)
+        await self._persist("authority", lambda: self._port.apply_authority(record))
+
+    async def _start_execution(
+        self,
+        capability: AuditCapability,
+        repository: AuthorizedRepository,
+        fingerprint: RepositoryFingerprint,
+        objective: str,
+    ) -> AuditExecutionHandle:
         handle = AuditExecutionHandle(
             audit_id=self._id_factory(),
             execution_id=self._id_factory(),
@@ -157,6 +248,7 @@ class AuditRecorder:
             execution = AuditExecutionV1(
                 audit_id=handle.audit_id,
                 execution_id=handle.execution_id,
+                capability=capability,
                 repository_id=repository.repository_id,
                 repository_fingerprint=fingerprint.digest,
             )

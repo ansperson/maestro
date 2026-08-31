@@ -6,6 +6,7 @@ from collections.abc import Awaitable, Callable
 from uuid import UUID
 
 from maestro.audit.contracts import (
+    AuditAuthorityApplicationV1,
     AuditEventV1,
     AuditExecutionFailureV1,
     AuditExecutionStartV1,
@@ -16,6 +17,7 @@ from maestro.audit.recorder import AuditRecorder, AuditRetryTiming, AuditRuntime
 from maestro.model_identity import ModelIdentifier
 
 type StartHook = Callable[[AuditExecutionStartV1], Awaitable[None] | None]
+type AuthorityHook = Callable[[AuditAuthorityApplicationV1], Awaitable[None] | None]
 type CompletionHook = Callable[[AuditInvestigationCompletionV1], Awaitable[None] | None]
 type FailureHook = Callable[[AuditExecutionFailureV1], Awaitable[None] | None]
 type FailureAbortHook = Callable[[UUID], None]
@@ -28,18 +30,22 @@ class FakeAuditPort:
         self,
         *,
         on_start: StartHook | None = None,
+        on_authority: AuthorityHook | None = None,
         on_completion: CompletionHook | None = None,
         on_failure: FailureHook | None = None,
         on_failure_abort: FailureAbortHook | None = None,
     ) -> None:
         self._on_start = on_start
+        self._on_authority = on_authority
         self._on_completion = on_completion
         self._on_failure = on_failure
         self._on_failure_abort = on_failure_abort
         self.start_attempts: list[AuditExecutionStartV1] = []
+        self.authority_attempts: list[AuditAuthorityApplicationV1] = []
         self.completion_attempts: list[AuditInvestigationCompletionV1] = []
         self.failure_attempts: list[AuditExecutionFailureV1] = []
         self.starts: list[AuditExecutionStartV1] = []
+        self.applied_authority: list[AuditAuthorityApplicationV1] = []
         self.completions: list[AuditInvestigationCompletionV1] = []
         self.failures: list[AuditExecutionFailureV1] = []
         self.failure_aborts: list[UUID] = []
@@ -51,6 +57,14 @@ class FakeAuditPort:
             if isinstance(outcome, Awaitable):
                 await outcome
         self._store_start(record)
+
+    async def apply_authority(self, record: AuditAuthorityApplicationV1) -> None:
+        self.authority_attempts.append(record)
+        if self._on_authority is not None:
+            outcome = self._on_authority(record)
+            if isinstance(outcome, Awaitable):
+                await outcome
+        self._store_intermediate(record)
 
     async def complete_investigation(self, record: AuditInvestigationCompletionV1) -> None:
         self.completion_attempts.append(record)
@@ -90,6 +104,15 @@ class FakeAuditPort:
             return
         raise AuditWriteError(AuditWriteFailureKind.PERMANENT)
 
+    def _store_intermediate(self, record: AuditAuthorityApplicationV1) -> None:
+        event_conflicts = self._event_conflicts(record.event)
+        if not event_conflicts:
+            self.applied_authority.append(record)
+            return
+        if event_conflicts == [record.event] and record in self.applied_authority:
+            return
+        raise AuditWriteError(AuditWriteFailureKind.PERMANENT)
+
     def _store_terminal(
         self,
         record: AuditInvestigationCompletionV1 | AuditExecutionFailureV1,
@@ -108,6 +131,7 @@ class FakeAuditPort:
 
     def _event_conflicts(self, event: AuditEventV1) -> list[AuditEventV1]:
         events = [record.event for record in self.starts]
+        events.extend(record.event for record in self.applied_authority)
         events.extend(record.event for record in self.completions)
         events.extend(record.event for record in self.failures)
         return [

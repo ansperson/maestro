@@ -17,6 +17,9 @@ REPS ?= 3
 ARMS ?= both
 EFFORT ?= medium
 EVAL_REPORT ?= $(CURDIR)/.local/eval-report.json
+GITHUB_REPOSITORY ?= ansperson/maestro
+AUTHORITY_DOCUMENTS ?= $(CURDIR)/docs/authority/rules.md
+PROJECT_NAME ?= maestro
 IMAGE ?= maestro-verifier:local
 ROLES := bootstrap migration writer reader
 
@@ -48,7 +51,7 @@ ADMIN := MAESTRO_AUDIT_BOOTSTRAP_HOST=127.0.0.1 MAESTRO_AUDIT_BOOTSTRAP_PORT=$(D
 	MAESTRO_AUDIT_READER_USER=maestro_audit_reader \
 	MAESTRO_AUDIT_READER_PASSWORD_FILE="$(SECRETS)/reader-password"
 
-.PHONY: help secrets db-up db-down bootstrap migrate up run ask eval read status verify clean
+.PHONY: help secrets db-up db-down bootstrap migrate up run ask authority eval read status verify clean
 
 help: ## Show the available targets
 	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -94,6 +97,21 @@ run: ## Run the stdio MCP server natively; an MCP client normally spawns this
 ask: ## Ask one question end to end: make ask Q="Does X hold?"
 	@test -n "$(Q)" || { echo "  usage: make ask Q=\"your question\""; exit 2; }
 	@uv run python scripts/ask.py "$(REPO)" "$(DB_PORT)" "$(SECRETS)" "$(Q)"
+
+authority: ## Ask whether an action may proceed: make authority ISSUE=26 SUBJECT=x CHOICE=y
+	@test -n "$(ISSUE)" -a -n "$(SUBJECT)" -a -n "$(CHOICE)" || { \
+		echo "  usage: make authority ISSUE=26 SUBJECT=audit.backend CHOICE=postgresql"; exit 2; }
+	@MAESTRO_ALLOWED_ROOTS="$(REPO)" MAESTRO_AGENT_RUNTIME=claude \
+		MAESTRO_AUDIT_WRITER_HOST=127.0.0.1 MAESTRO_AUDIT_WRITER_PORT=$(DB_PORT) \
+		MAESTRO_AUDIT_WRITER_DATABASE=maestro \
+		MAESTRO_AUDIT_WRITER_USER=maestro_audit_writer \
+		MAESTRO_AUDIT_WRITER_PASSWORD_FILE="$(SECRETS)/writer-password" \
+		MAESTRO_WORKITEM_GITHUB_REPOSITORY="$(GITHUB_REPOSITORY)" \
+		MAESTRO_WORKITEM_GITHUB_TOKEN_FILE="$(SECRETS)/github-token" \
+		uv run python scripts/check_authority.py \
+			--repository "$(REPO)" --project "$(PROJECT_NAME)" --issue "$(ISSUE)" \
+			--subject "$(SUBJECT)" --choice "$(CHOICE)" \
+			$(foreach doc,$(AUTHORITY_DOCUMENTS),--document "$(doc)")
 
 eval: ## Run the evaluation: make eval [REPS=3] [ARMS=both|tool] [EFFORT=medium]
 	@MAESTRO_AGENT_RUNTIME=claude \

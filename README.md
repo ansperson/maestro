@@ -41,6 +41,7 @@ The package mirrors the boundaries that already own behavior:
 src/maestro/
 ├── mcp/                                  # stdio/MCP adapter
 ├── audit/                                # contracts, recorder, PostgreSQL adapter/migrations
+├── authority/                            # decision contracts, engine, WorkItemPort, GitHub adapter
 ├── capabilities/resolve_codebase_fact/  # contracts, policy, sanitization, service
 ├── repository/                           # authorization, isolated fingerprint helper, evidence guard
 ├── agents/                               # runtime protocol, Claude and Codex adapters
@@ -170,6 +171,75 @@ limits. Docker remains outside `src/maestro`; native behavior and the MCP contra
 See `docs/container.md` and ADR-0003 for setup, client configurations, supported platforms,
 tests, and residual risks.
 
+### Decision authority
+
+Maestro reads authority from the work item it is acting on, and refuses to act beyond it.
+This implements [ADR-0006](docs/adr/0006-decision-authority-and-human-approval.md) and is not
+part of the MCP contract: the tool catalog is unchanged.
+
+A work item carries a decision block. Only entries inside the markers are authority, so an
+observation about the code cannot be written into an artifact and acquire authority the model
+denies it. Everything outside the block is context.
+
+```markdown
+<!-- maestro:decisions:begin -->
+### Decision: audit.persistence_backend
+- Decided: postgresql
+- Scope: project maestro
+- Validity: until superseded
+- Approved-by: an-operator
+- Rationale: a shared durable store with a human query requirement
+<!-- maestro:decisions:end -->
+```
+
+`Scope` reads `project <name>` or `work-item <reference>`, and `Validity` reads
+`until superseded` or `until YYYY-MM-DD`. Reuse requires an exact match: a decision made for
+one work item does not govern another, and a lapsed decision stops clearing actions. An entry
+may also carry `- Superseded: yes`.
+
+A deterministic engine compares a proposed action against the decisions in force and the
+project's written rules, and returns one of three answers. It performs no I/O, makes no model
+call, and reads no clock, because an engine that judged would move the judgement rather than
+remove it.
+
+```text
+cleared              a decision or rule in force covers the action
+approval required    nothing covers it; the request is recorded on the work item
+conflict             two sources in force disagree; Maestro surfaces both and picks neither
+```
+
+Rules live in [`docs/authority/rules.md`](docs/authority/rules.md). Writing a rule delegates
+that class of decision, and removing one narrows autonomy again, with no code change. Authority
+documents are never discovered by scanning; only explicitly configured paths are read, and a
+document confers nothing unless it declares a current status and marks its entries.
+
+Try the whole loop against a real issue. Use a fine-grained token limited to this repository
+with `Issues: Read and write` and nothing else; the file needs mode `0600` and must sit outside
+every allowed root, which Maestro enforces:
+
+```bash
+printf '%s' "$GITHUB_TOKEN" > .local/secrets/github-token && chmod 0600 .local/secrets/github-token
+
+make authority ISSUE=26 SUBJECT=audit.persistence_backend CHOICE=postgresql
+```
+
+The first run is refused with `AUTHORITY_REQUIRED` and posts a comment carrying the block
+entry that would settle it. Paste that entry into the issue's decision block, run again, and
+the action is cleared and recorded in the Trail as `authority.applied`. Re-running after
+approval is the flow for now: pausing and resuming a run needs durable Jobs
+([ADR-0008](docs/adr/0008-adaptive-engineering-job-orchestration.md)).
+
+The Trail records what an execution did with authority and nothing more. Requesting,
+proposing, approving, and superseding a decision are coordination, and
+[ADR-0004](docs/adr/0004-separate-work-management-audit-and-observability-planes.md) gives
+coordination to Work Management. Applied content is captured rather than referenced, so a
+later edit to the work item cannot change what the Trail says was authorized. Read it with
+`make read ARGS="--view authority"`.
+
+Maestro records who approved a decision. It does not verify that the approver holds authority
+for that class of decision; that check is a later addition rather than a reopening of the
+model.
+
 ### Public tool contract
 
 Tool metadata is stable at server version `1.0.0`:
@@ -223,6 +293,16 @@ questions and never includes an answer. Operational failures are typed tool erro
 `EVIDENCE_VALIDATION_ERROR`, `RECURSION_NOT_ALLOWED`, `OUTPUT_LIMIT_EXCEEDED`, and
 `AUDIT_UNAVAILABLE`, `AUDIT_PERSISTENCE_ERROR`, and `INTERNAL_ERROR`.
 
+The authority engine adds `AUTHORITY_REQUIRED`, `AUTHORITY_CONFLICT`, and
+`WORK_ITEM_UNAVAILABLE`. They are not part of the MCP tool contract; the tool catalog is
+unchanged. Each message is client-safe and names no subject, work item, or tracker.
+
+Authority is fail-closed too. A tracker that is unreachable, unauthenticated, or serving a
+malformed decision block raises `WORK_ITEM_UNAVAILABLE` rather than reporting an item that
+states no decisions, because those two are indistinguishable to a caller and the second one
+turns an outage into unrestricted autonomy. A refusal whose approval request could not be
+written is likewise reported as unavailable rather than as a recorded request.
+
 Audit is fail-closed. Maestro attempts each start or terminal write at most three times within
 one five-second budget, with fixed 100 ms and 250 ms backoffs. Transient failures known not
 committed and ambiguous acknowledgement/commit outcomes are retried using the original immutable
@@ -266,6 +346,12 @@ and 1 MiB per file. Every limit is environment-configurable with the correspondi
 `MAESTRO_` setting in `.env.example`. Invalid configuration fails before the server starts.
 Allowed roots are canonicalized and filesystem anchors are prohibited; repository requests for
 an anchor fail with the existing `REPOSITORY_NOT_ALLOWED` public error.
+
+Work-management configuration is separate and optional: `MAESTRO_WORKITEM_GITHUB_REPOSITORY`
+names an `owner/name` pair, `MAESTRO_WORKITEM_GITHUB_TOKEN_FILE` points at an owner-only regular
+file holding the token, and `MAESTRO_WORKITEM_GITHUB_API_URL` must be an HTTPS URL so a token is
+never offered over a plaintext connection. The token file passes the same controls an Audit role
+password does. Only the GitHub adapter receives these values.
 
 `MAESTRO_CODEX_MODEL` is an Audit- and log-safe identifier, not free-form metadata. It must begin
 with an ASCII letter or digit, contain only ASCII letters, digits, dots, underscores, or hyphens,
