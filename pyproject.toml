@@ -17,7 +17,7 @@ classifiers = [
   "Typing :: Typed",
 ]
 dependencies = [
-  "mcp==2.1.0",
+  "mcp==2.1.1",
   "openai-codex==0.147.0",
   "pydantic>=2.12,<3",
   "pydantic-settings>=2.10,<3",
