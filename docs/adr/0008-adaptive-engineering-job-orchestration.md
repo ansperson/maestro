@@ -1,1047 +1,182 @@
-# ADR-0008: Adaptive Engineering Job Orchestration
+# ADR-0008: Durable Pull Request Review Job
 
-* **Status:** Proposed
-* **Date:** 2026-08-25
-* **Decision owners:** Project maintainers
-* **Depends on:** ADR-0006 — Decision Authority and Human Approval
-* **Depends on:** ADR-0007 — Assurance, Challenge, and Independent Validation
-* **Related:** ADR-0001 — Maestro as an Engineering Execution Platform
-* **Related:** ADR-0005 — Audit as a First-Class Governance Plane
+Date: 2026-08-25
+
+Status: Proposed
+
+Depends on: ADR-0006, ADR-0007
+
+Related: ADR-0001, ADR-0004, ADR-0013
 
 ## Context
 
-A central goal of Maestro v2 is to coordinate a feature or issue from initial intent to a verified engineering outcome.
+Maestro currently executes bounded Capabilities within one request. It cannot durably coordinate
+work that pauses for another worker, an external change, or human authority. Audit cannot fill
+that role: ADR-0013 assigns resumable execution state to Jobs and keeps Audit outside ordinary Job
+transitions.
 
-A naive implementation could hardcode:
-
-```text
-refine requirements
-→ write PRD
-→ technical design
-→ grill
-→ implement
-→ review
-→ validate
-```
-
-for every task.
-
-That would recreate the inefficiency of the current interactive `grill` workflow.
-
-Many tasks do not need every stage.
-
-Example:
+The first demonstrated orchestration need is pull request review:
 
 ```text
-Add middle_name to an existing response object using the established pattern.
+review an exact PR revision
+-> wait for or perform corrections
+-> inspect the new revision
+-> independently validate the outcome
 ```
 
-may require:
-
-```text
-context
-→ implement
-→ test
-→ validate
-```
-
-while:
-
-```text
-Support multiple billing accounts per organization.
-```
-
-may require substantial domain clarification, technical design, approvals, challenge, migration analysis, implementation, and independent validation.
-
-The workflow therefore needs to adapt to:
-
-* existing artifacts;
-* unresolved domain ambiguity;
-* technical novelty;
-* risk;
-* authority;
-* assurance requirements.
-
-At the same time, Maestro must not give an unrestricted LLM planner permission to invent arbitrary workflows.
+This workflow can span processes and external actors. It therefore needs durable identity,
+checkpoints, revision binding, idempotency, and bounded recovery. It does not yet justify a generic
+adaptive workflow engine.
 
 ## Proposed Decision
 
-Maestro will support adaptive, policy-driven engineering Jobs.
+Introduce a durable `review_pull_request` Job as the first Job implementation.
 
-A Job should execute:
-
-> the minimum workflow necessary to reach a sufficiently specified, appropriately authorized, and independently validated outcome for the task's risk profile.
-
-Adaptive does not mean arbitrary.
-
-Routing will be constrained by:
+The initial workflow is fixed and explicit:
 
 ```text
-Job state
-+
-stage prerequisites
-+
-Decision Authority policy
-+
-Assurance policy
-+
-deterministic routing rules
-+
-agent assessment/recommendation
+load PR and work-item authority
+-> pin the current PR revision
+-> run a read-only review
+-> publish actionable findings
+-> address findings or wait for an external correction
+-> pin the resulting revision
+-> run deterministic gates and independent validation
+-> complete, repeat within a bound, or wait for human authority
 ```
 
-An LLM recommendation may influence routing but must not bypass hard policy requirements.
+The implementation must remain specific to this outcome. Shared primitives should be extracted
+only after a second Job demonstrates the same boundary.
 
-## Initial Target Job
+## Job Ownership
 
-The first general end-to-end Job is expected to be conceptually:
+The Job owns the minimum durable state needed to resume safely:
 
-```text
-implement_feature
-```
+- stable Job identity and type;
+- current state and checkpoint reason;
+- repository and pull request identity;
+- expected and observed PR revisions;
+- current bounded attempt;
+- references to findings, validations, and external side effects;
+- idempotency keys for replayable operations;
+- terminal outcome and typed failure when applicable.
 
-or an equivalent name determined during v2 design.
+MCP transport state, Audit events, logs, and issue comments are not the source of truth for Job
+progress.
 
-Its potential stages include:
+## Initial States
 
-```text
-Context Assembly
-Task Assessment
-Requirements Refinement
-PRD Authoring
-Domain Approval
-Technical Design
-Technical Approval
-Challenge / Grill
-Implementation
-Review
-Independent Validation
-Completion
-```
-
-Not every stage executes for every Job.
-
-## Context Assembly
-
-Before asking humans or designing solutions, Maestro should assemble relevant context.
-
-Potential sources include:
-
-* issue/work item;
-* repository;
-* accepted PRDs;
-* accepted ADRs;
-* authoritative domain documentation;
-* `CONTEXT.md`;
-* related Audit Trails;
-* existing implementation;
-* related tests;
-* external references.
-
-The objective is:
+Use only states required by the first workflow:
 
 ```text
-evidence first
-questions second
-```
-
-Maestro should not ask a human for information that authoritative context already resolves.
-
-## Task Assessment
-
-A Job should assess dimensions such as:
-
-```text
-technical complexity
-domain ambiguity
-architecture novelty
-security impact
-data impact
-breaking-change impact
-external side effects
-reversibility
-existing authority completeness
-```
-
-The result should be structured.
-
-Conceptually:
-
-```text
-TaskAssessment
-
-complexity
-domain_ambiguity
-architecture_impact
-security_impact
-data_impact
-reversibility
-breaking_change
-human_decisions_required
-recommended_assurance_profile
-```
-
-Exact fields remain open.
-
-## Deterministic Minimums
-
-Some signals impose mandatory routing or assurance.
-
-Examples may include:
-
-```text
-unresolved domain ambiguity
-→ requirements refinement
-
-new material technology
-→ technical approval
-
-breaking public API
-→ explicit authority + elevated assurance
-
-destructive migration
-→ risk approval + critical assurance
-
-security boundary change
-→ elevated/critical assurance
-
-accepted PRD already exists
-→ domain refinement may be skipped
-
-accepted ADR fully resolves technical choice
-→ do not ask the same technical decision again
-```
-
-These rules must not be bypassed merely because an agent classifies a task as simple.
-
-## Existing Artifacts as State
-
-Jobs should consume authoritative artifacts rather than recreate them.
-
-Example:
-
-```text
-Issue
-  ↓
-accepted PRD exists?
-  ↓ yes
-skip domain refinement/PRD generation
-```
-
-Another:
-
-```text
-accepted ADR resolves architecture?
-  ↓ yes
-apply authority
-```
-
-The principle is:
-
-> Jobs should consume existing authority instead of regenerating it.
-
-## Requirements Refinement
-
-Requirements refinement should focus exclusively on unresolved domain/product behavior.
-
-Its objective is not to conduct a broad technical interview.
-
-Conceptually:
-
-```text
-issue + authoritative context + repository facts
-       ↓
-refine-requirements agent
-       ↓
-domain decision set
-```
-
-The workflow should:
-
-1. gather existing authority;
-2. resolve repository facts automatically;
-3. identify only real domain ambiguities;
-4. group related decisions where useful;
-5. ask humans only for missing authority;
-6. produce requirements with no silent business assumptions.
-
-A future skill such as:
-
-```text
-refine-requirements
-```
-
-may perform this role.
-
-This ADR does not define the skill implementation.
-
-## PRD Authoring
-
-Authoring should be separable from requirements discovery.
-
-Conceptually:
-
-```text
-resolved domain decisions
-        ↓
-to-prd
-        ↓
-PRD
-```
-
-The PRD should contain enough domain behavior to prevent implementation from inventing requirements.
-
-Expected qualities include:
-
-* goals;
-* non-goals;
-* actors;
-* behavior;
-* domain rules;
-* edge cases;
-* acceptance criteria;
-* explicit human decisions;
-* known constraints;
-* no unresolved blocking domain questions.
-
-The precise PRD format remains a skill/artifact decision.
-
-## Domain Approval
-
-For meaningful domain changes, the Job may require explicit approval of the PRD/domain decisions.
-
-The approval view should emphasize decisions rather than requiring the maintainer to reconstruct the entire conversation.
-
-Conceptually:
-
-```text
-PRD READY
-
-Decisions:
-- archived invoices searchable by admins
-- applies retroactively
-- deletion prohibited after settlement
-
-Open blocking domain questions:
-0
-
-Approve?
-```
-
-Approved PRDs become authority for later stages.
-
-## Technical Design
-
-Technical Design begins only when domain prerequisites are sufficient.
-
-It may use:
-
-* approved PRD;
-* repository facts;
-* ADRs;
-* existing architecture;
-* established patterns;
-* security constraints;
-* operational constraints.
-
-It should produce:
-
-```text
-proposed architecture
-affected components
-data model
-API impact
-migration strategy
-compatibility impact
-security impact
-alternatives
-risks
-test strategy
-rollout considerations
-technical decisions required
-```
-
-The exact Technical Design artifact remains outside this ADR.
-
-## Technical Approval
-
-New material technical decisions require authority according to ADR-0006.
-
-Example:
-
-```text
-Recommendation:
-PostgreSQL
-
-Existing ADR deciding this:
-No
-
-Authority:
-HUMAN_TECHNICAL
-```
-
-The Job pauses until the decision is resolved.
-
-Routine decisions already covered by established architecture should proceed automatically.
-
-## Challenge / Grill Stage
-
-The `grill` workflow is expected to become a challenge/pressure-test stage rather than primary requirements discovery.
-
-A Job may invoke Grill depending on Assurance policy.
-
-Examples:
-
-```text
-PRD
-  ↓
-Grill
-  ↓
-missing domain branch discovered
-```
-
-or:
-
-```text
-Technical Design
-  ↓
-Grill
-  ↓
-unsupported architecture assumption discovered
-```
-
-Routine work may skip full Grill.
-
-High-risk work may require it.
-
-## Targeted Challenge
-
-Grill may identify assumptions that require targeted Challenger investigation.
-
-Example:
-
-```text
-Technical Design assumes legacy_account_id is unused.
-        ↓
-Challenger investigates that assumption independently.
-```
-
-This composes broad artifact challenge with fine-grained evidence verification.
-
-## Returning to Prior Stages
-
-If challenge discovers a gap, the Job should return only to the necessary stage.
-
-Example:
-
-```text
-Technical Design
-      ↓
-Grill
-      ↓
-missing domain rule
-      ↓
-Requirements Refinement
-      ↓
-PRD update/approval
-      ↓
-Technical Design delta
-      ↓
-Challenge
-```
-
-The Job should not restart from zero unnecessarily.
-
-## Stage Preconditions and Outputs
-
-Each stage should declare prerequisites and outputs.
-
-Conceptually:
-
-```text
-TechnicalDesignStage
-
-requires:
-- approved requirements
-- resolved blocking domain decisions
-- repository context
-
-produces:
-- TechnicalDesign
-- TechnicalDecisionRequests[]
-- Risks[]
-```
-
-Implementation:
-
-```text
-ImplementationStage
-
-requires:
-- approved requirements
-- required technical decisions approved
-- no blocking authority gaps
-
-produces:
-- repository changes
-- tests
-- artifacts
-```
-
-This makes orchestration state-driven rather than relying only on a hardcoded sequence.
-
-## Stage Skipping
-
-A stage may be skipped only when its required outcome already exists or policy does not require it.
-
-Examples:
-
-```text
-approved PRD exists
-→ requirements refinement may be skipped
-
-no architecture novelty
-→ full technical design may be skipped
-
-ROUTINE assurance
-→ full Grill may be skipped
-```
-
-Skipping should be explainable and auditable.
-
-## Policy-Driven Planning
-
-The Job should not expose all tools/skills to an LLM and ask:
-
-```text
-"What workflow would you like to invent?"
-```
-
-Instead:
-
-```text
-State Machine
-+
-Policy Engine
-+
-Agent Assessment
-```
-
-determines valid next stages.
-
-An AI may recommend:
-
-```text
-"Elevated assurance is appropriate."
-```
-
-but deterministic policy may enforce:
-
-```text
-security impact = high
-→ challenge cannot be skipped
-```
-
-## Job State
-
-A Feature Job should own structured state.
-
-Conceptually:
-
-```text
-FeatureJob
-
-context
-assessment
-
-requirements_status
-technical_design_status
-
-open_domain_decisions
-open_technical_decisions
-open_risk_decisions
-
-assurance_profile
-
-current_stage
-completed_stages
-skipped_stages
-
-implementation_artifacts
-validation_status
-```
-
-Exact persistence is outside this ADR.
-
-## Durable State
-
-The fundamental ADR-0001 principle applies:
-
-> Agents are disposable workers. Jobs own durable state.
-
-No agent thread should need to remain open while:
-
-* waiting for human approval;
-* waiting for Jira response;
-* waiting for external state;
-* transitioning between stages.
-
-## Human Checkpoints
-
-When authority is missing:
-
-```text
-Job
- ↓
+CREATED
+RUNNING
+WAITING_FOR_EXTERNAL
 WAITING_FOR_HUMAN
+FAILED
+COMPLETED
+CANCELLED
 ```
 
-The Job persists enough information to resume later.
+Detailed progress is represented by a typed checkpoint within `RUNNING` or a waiting state. Do not
+create a state for every implementation step unless recovery semantics differ.
 
-The checkpoint should include:
+## Revision Safety
 
-* decision required;
-* authority class;
-* recommendation when appropriate;
-* alternatives;
-* concise rationale;
-* relevant evidence;
-* affected artifacts.
+Every review and validation result is bound to the exact commit it inspected. Before applying a
+result or completing the Job, Maestro confirms that the pull request still has the expected
+revision.
 
-## Assurance Integration
+If the revision changes unexpectedly, stale conclusions are not applied. The Job records the new
+revision and restarts from the nearest safe checkpoint within its attempt bounds.
 
-ADR-0007 determines minimum assurance.
+## Corrections
 
-Conceptually:
+The Job supports two correction paths:
 
-```text
-TaskAssessment
-       ↓
-AssurancePolicy
-       ↓
-ROUTINE / STANDARD / ELEVATED / CRITICAL
-       ↓
-required stages
-```
+- a bounded write-capable worker addresses findings under explicit repository authorization; or
+- the Job enters `WAITING_FOR_EXTERNAL` until a person or external agent updates the PR.
 
-Assurance can add mandatory:
+The design must not assume that Maestro always has write authority. External comments, labels,
+reviews, and branch updates require idempotency and reconciliation against the provider's observed
+state.
 
-* Grill;
-* Challenger;
-* review;
-* independent validation;
-* human approval.
+## Assurance and Authority
 
-## Decision Authority Integration
+ADR-0007 governs review challenge and independent validation. A worker that changes the code
+cannot be the final validator when independent validation is required.
 
-ADR-0006 determines which choices can proceed automatically.
+ADR-0006 governs human and technical decision authority. A Job persists a checkpoint when required
+authority is absent; it does not infer approval from agent confidence or surrounding prose.
 
-Conceptually:
+## Separation of Planes
 
-```text
-choice needed
-    ↓
-authority already exists?
-   / \
- yes  no
- │     │
-apply  checkpoint
-```
+- **Work Management** contains findings, decisions, blockers, and outcomes that participants need
+  to continue.
+- **Job state** contains resumable execution state, expected revisions, attempts, and idempotency.
+- **Audit** receives a bounded projection of material actions and terminal outcomes according to
+  ADR-0013.
+- **Observability** contains model/tool calls, timings, diagnostics, and low-level failures.
 
-Job orchestration must not turn recommendations into decisions.
+Ordinary Job transitions do not synchronously depend on a separate Audit write. The persistence
+design must define how material Audit projections are eventually made reliable.
 
-## Audit Integration
+## Initial Non-Goals
 
-Routing and governance-significant stage events should be auditable.
+The first implementation does not include:
 
-Examples:
+- a generic DAG or workflow-definition language;
+- an adaptive LLM planner or numeric task-assessment engine;
+- distributed scheduling or multiple worker hosts;
+- `implement_feature` or general issue implementation orchestration;
+- Jira or multiple Work Management providers;
+- arbitrary user-defined Jobs;
+- Audit as a Job store or transaction coordinator;
+- MCP Tasks as durable Job state.
 
-```text
-job.started
-assessment.completed
-stage.required
-stage.skipped
-decision.required
-decision.approved
-challenge.required
-stage.completed
-validation.completed
-job.completed
-```
+## Decisions Required Before Acceptance
 
-Important routing decisions should include concise rationale.
+Implementation is not authorized until follow-up design closes:
 
-Example:
+1. persistence backend, schema, concurrency control, and migration ownership;
+2. public MCP contract for starting, reading, resuming, and cancelling a Job;
+3. secure execution boundary for write-capable correction and repository-controlled validation;
+4. GitHub authentication, idempotency, stale-revision handling, and side-effect reconciliation;
+5. checkpoint authorization and the event that resumes external or human waits;
+6. bounded retry, cancellation, timeout, and orphan-worker behavior;
+7. acceptance of the proportional assurance policy in ADR-0007;
+8. reliable bounded Audit projection without placing Audit on the transition critical path.
 
-```text
-stage.skipped
+These may be resolved in one implementation ADR if the design is cohesive. Do not create one ADR
+per routine implementation choice.
 
-stage:
-requirements_refinement
+## Alternatives Rejected
 
-reason:
-Accepted PRD v3 already resolves the domain requirements.
-```
+### Implement a generic adaptive orchestrator first
 
-The Job must not audit every low-level agent/tool operation.
+Rejected because there is no second implemented Job demonstrating reusable routing semantics. It
+would front-load abstractions before persistence and recovery behavior are proven.
 
-## Work Management Integration
+### Use Audit as Job state
 
-Jobs may originate from:
+Rejected because an append-only governance history is not a resumable workflow model and would
+make Audit a critical-path bottleneck.
 
-```text
-Jira
-GitHub Issue
-direct user request
-future WorkItem adapter
-```
+### Keep the workflow entirely inside one MCP request
 
-The external tracker represents Work Management.
+Rejected because external corrections and approvals can outlive the request or process.
 
-Job state and Audit remain separate.
-
-A Job should reference the external work item rather than duplicate its full history unnecessarily.
-
-## Simple Task Example
-
-```text
-Issue:
-Add middle_name to Customer response.
-
-Assessment:
-domain ambiguity = none
-architecture novelty = none
-security impact = none
-reversible = yes
-assurance = ROUTINE
-
-Existing patterns:
-sufficient
-
-Workflow:
-
-context
-→ implementation
-→ tests
-→ validation
-→ complete
-```
-
-No unnecessary PRD/Grill interview.
-
-## Medium Feature Example
-
-```text
-Feature:
-Archive invoices.
-
-Assessment:
-domain ambiguity = medium
-architecture impact = local
-risk = standard/elevated
-
-Workflow:
-
-context
-→ refine requirements
-→ PRD
-→ domain approval
-→ technical design
-→ light challenge
-→ implementation
-→ review
-→ validation
-```
-
-## Large Feature Example
-
-```text
-Feature:
-Multiple billing accounts per organization.
-
-Assessment:
-domain ambiguity = high
-architecture novelty = high
-data impact = high
-assurance = ELEVATED/CRITICAL
-
-Workflow:
-
-context
-→ deep requirements refinement
-→ PRD
-→ domain Grill
-→ human domain approval
-→ technical design
-→ targeted challenge
-→ technical Grill
-→ human technical decisions
-→ implementation
-→ PR review cycle
-→ independent validation
-→ verified outcome
-```
-
-## Adaptive Workflow Principle
-
-The permanent architectural principle proposed is:
-
-> Maestro should execute the minimum workflow necessary to reach a sufficiently specified, appropriately authorized, and independently validated outcome for the task's risk profile.
-
-This is distinct from:
-
-```text
-always run every stage
-```
-
-and from:
-
-```text
-let an LLM freely invent the workflow
-```
-
-## Skill Independence
-
-Skills remain independently maintained.
-
-Potential skills include:
-
-```text
-refine-requirements
-to-prd
-technical-design
-grill
-implementation
-pr-review
-pr-address
-```
-
-Maestro Jobs coordinate workers configured with the required skill.
-
-Maestro should not absorb all skill logic into Job implementation.
-
-## Artifact Ownership
-
-Artifacts such as:
-
-```text
-PRD
-Technical Design
-Review Findings
-Validation Result
-```
-
-should have explicit ownership/status.
-
-Future orchestration must determine:
-
-* draft vs approved;
-* version;
-* authority;
-* supersession;
-* references.
-
-Exact artifact registry design remains open.
-
-## Idempotency and Resumption
-
-Durable Jobs must eventually handle:
-
-* process restart;
-* stage retry;
-* duplicate external events;
-* side effects already completed.
-
-The future technical design must define stage idempotency and reconciliation.
-
-This ADR does not prescribe the persistence implementation.
-
-## Bounded Execution
-
-Adaptive does not mean unbounded.
-
-Jobs require limits such as:
-
-```text
-maximum agent executions
-maximum challenge rounds
-maximum address rounds
-maximum duration
-optional cost/token budget
-```
-
-Limits may vary by Assurance profile.
-
-When exceeded, the Job escalates rather than looping indefinitely.
-
-## Proposed Invariants
-
-Before acceptance, validate:
-
-1. Jobs are adaptive rather than universally fixed pipelines.
-2. Adaptive routing is policy-constrained, not free-form LLM planning.
-3. Context/evidence gathering precedes human questioning.
-4. Existing approved artifacts can satisfy stage prerequisites.
-5. Domain ambiguity routes to requirements refinement.
-6. Material technical decisions route to authority.
-7. Grill becomes conditional challenge, not mandatory discovery.
-8. Assurance determines mandatory challenge/validation stages.
-9. Stages declare prerequisites and outputs.
-10. Jobs return only to stages needed to resolve discovered gaps.
-11. Stage skips are explainable and auditable.
-12. Agents remain disposable; Job state is durable.
-13. Skills remain independent from orchestration implementation.
-14. Jobs execute the minimum sufficient workflow for risk and ambiguity.
-
-## Open Questions Before Acceptance
-
-### First Job scope
-
-Should v2 first implement:
-
-```text
-implement_feature
-```
-
-or a narrower Job?
-
-### Assessment
-
-Which dimensions are required in `TaskAssessment`?
-
-### Policy representation
-
-Should routing rules be code, configuration, typed policy objects, or another mechanism?
-
-### Artifact model
-
-How are approved PRDs/designs discovered and versioned?
-
-### Skills
-
-How does Maestro explicitly provide a skill to an isolated worker?
-
-### Stage model
-
-Does Maestro need a generic `Stage` abstraction initially or should the first Job use explicit application code?
-
-### Persistence
-
-What minimum durable state is necessary for v2?
-
-### Human checkpoints
-
-How are answers authenticated and correlated?
-
-### Work Management
-
-Should v2 initially support direct requests only, or one external issue tracker?
-
-### Routing evals
-
-How do we measure:
-
-```text
-unnecessary stage rate
-missed required stage rate
-unnecessary human questions
-unsafe automatic decisions
-time/cost to completion
-```
-
-### Recovery
-
-How does a Job resume after crashes or deployment restart?
-
-## Implementation Strategy
-
-If accepted, avoid creating a generic workflow framework before implementing a real Job.
-
-Preferred sequence:
-
-```text
-1. Implement one real Feature Job.
-2. Encode concrete stages/policies.
-3. Observe duplication and real extension points.
-4. Extract abstractions only when demonstrated.
-```
-
-Do not begin with a universal DAG/workflow engine.
-
-## Non-Goals
-
-This ADR does not select:
-
-* database;
-* queue;
-* workflow engine;
-* Temporal/Celery/etc.;
-* generic DAG framework;
-* Job storage schema;
-* issue tracker;
-* skill format;
-* artifact storage;
-* UI;
-* scheduler;
-* distributed execution.
-
-## Consequences if Accepted
+## Consequences
 
 ### Positive
 
-Adaptive orchestration would:
-
-* reduce unnecessary human questioning;
-* make simple tasks fast;
-* give complex tasks sufficient rigor;
-* reuse approved project knowledge;
-* connect domain refinement, design, implementation, and validation;
-* preserve explicit authority;
-* integrate assurance proportionally to risk;
-* create a path to end-to-end issue implementation.
+- The first Job solves a concrete end-to-end orchestration problem.
+- Durable state has one explicit owner.
+- Exact-revision and idempotency rules prevent stale or duplicate actions.
+- Generic orchestration abstractions are deferred until evidence supports them.
 
 ### Negative
 
-Routing policy becomes a critical system component.
-
-Bad classification may skip necessary stages or add unnecessary work.
-
-Artifact status/authority must become explicit.
-
-Durable state and recovery will be required.
-
-The first Feature Job may reveal that some abstractions proposed here need simplification.
-
-## Decision Summary
-
-This ADR proposes a Maestro v2 execution model:
-
-```text
-Feature / Issue
-      ↓
-Context Assembly
-      ↓
-Task Assessment
-      ↓
-Decision Authority + Assurance Policy
-      ↓
-Adaptive Stage Selection
-      ↓
-Requirements / PRD when needed
-      ↓
-Technical Design / Approval when needed
-      ↓
-Challenge / Grill when needed
-      ↓
-Implementation
-      ↓
-Review / Independent Validation as required
-      ↓
-Verified Outcome
-```
-
-with the guiding rule:
-
-> **Execute the minimum workflow necessary to produce a sufficiently specified, appropriately authorized, and independently validated outcome for the task's risk profile.**
-
-The proposal remains **Proposed** until validated against the current Maestro implementation and refined into the concrete Maestro v2 design.
+- A later Job may reveal a better shared model and require refactoring.
+- Durable persistence and write-capable execution introduce new security boundaries.
+- The proposal cannot be accepted until its listed design decisions are resolved.

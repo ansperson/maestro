@@ -2,7 +2,7 @@
 
 Date: 2026-09-05
 
-Status: Accepted
+Status: Superseded by ADR-0013
 
 Amends: ADR-0004, ADR-0005
 

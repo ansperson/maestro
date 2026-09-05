@@ -1,6 +1,6 @@
 # ADR-0005: Audit as a First-Class Governance Plane
 
-* **Status:** Accepted
+* **Status:** Superseded by [ADR-0013](0013-bounded-audit-boundary.md)
 * **Date:** 2026-08-25
 * **Decision owners:** Project maintainers
 * **Extends:** ADR-0004 — Separate Work Management, Audit, and Observability Planes
