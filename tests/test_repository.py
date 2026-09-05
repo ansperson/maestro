@@ -677,8 +677,9 @@ async def test_git_fingerprint_includes_head_dirty_state_without_widening(
     guard = RepositoryGuard(settings_factory(allowed_roots=(repository,)))
     authorized = guard.authorize(str(repository / "src"))
     clean = await guard.fingerprint(authorized)
-    assert clean.head is not None, _git_diagnostics(repository / "src")
-    assert clean.git_top_level_id is not None
+    assert clean.git_top_level_id is not None, await _git_diagnostics(repository / "src")
+    assert clean.head is not None, await _git_diagnostics(repository / "src")
+    assert clean.dirty_digest is not None, await _git_diagnostics(repository / "src")
     assert clean.git_top_level_id != clean.repository_id
     (repository / "src" / "models.py").write_text("dirty\n", encoding="utf-8")
     dirty = await guard.fingerprint(authorized)
@@ -686,9 +687,17 @@ async def test_git_fingerprint_includes_head_dirty_state_without_widening(
     assert authorized.root == (repository / "src").resolve()
 
 
-def _git_diagnostics(root: Path) -> str:
+async def _git_diagnostics(root: Path) -> str:
     """Report why Git produced no state, since the guard deliberately discards its stderr."""
 
+    lines = await asyncio.to_thread(_direct_git_diagnostics, root)
+    # Git succeeding is not sufficient: the guard also canonicalizes the reported top level
+    # in a second owned subprocess, and drops all Git state when that step returns nothing.
+    lines.append(f"canonicalized top level -> {await _canonical_top_level(root)!r}")
+    return "\n".join(lines)
+
+
+def _direct_git_diagnostics(root: Path) -> list[str]:
     git = which("git") or "git"
     environment = {"HOME": os.devnull, "LANG": "C", "LC_ALL": "C", "PATH": os.defpath}
     lines = [f"git={git} root={root}"]
@@ -706,23 +715,17 @@ def _git_diagnostics(root: Path) -> str:
             f"{' '.join(arguments)} -> rc={completed.returncode} "
             f"out={completed.stdout.strip()!r} err={completed.stderr.strip()!r}"
         )
-    # Git succeeding is not sufficient: the guard also canonicalizes the reported top level
-    # in a second owned subprocess, and drops all Git state when that step returns nothing.
-    lines.append(f"canonicalized top level -> {_canonical_top_level(root)!r}")
-    return "\n".join(lines)
+    return lines
 
 
-def _canonical_top_level(root: Path) -> object:
-    async def resolve() -> object:
+async def _canonical_top_level(root: Path) -> object:
+    try:
         output = await repository_module._run_git(  # pyright: ignore[reportPrivateUsage]
             root, "rev-parse", "--show-toplevel"
         )
         if output is None:
             return "git returned nothing"
         return await repository_module._canonicalize_git_top_level(root, output)  # pyright: ignore[reportPrivateUsage]
-
-    try:
-        return asyncio.run(resolve())
     except Exception as exc:
         return f"raised {type(exc).__name__}: {exc}"
 
