@@ -16,6 +16,10 @@ jobs:
   deterministic:
     name: Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
+    env:
+      # Keep every `uv run` on the matrix interpreter instead of falling back to
+      # the repository's developer default in `.python-version`.
+      UV_PYTHON: ${{ matrix.python-version }}
     strategy:
       fail-fast: false
       matrix:
@@ -49,7 +53,10 @@ jobs:
           uv run vulture src tests --min-confidence 100
           uv run deptry .
           uv run pip-audit
-          uv run pre-commit run --all-files
+
+      - name: Run repository hooks
+        if: matrix.python-version == '3.13'
+        run: uv run pre-commit run --all-files
 
       - name: Build and validate distributions
         if: matrix.python-version == '3.13'

@@ -1,767 +1,136 @@
-# ADR-0007: Assurance, Challenge, and Independent Validation
+# ADR-0007: Proportional Assurance and Independent Validation
 
-* **Status:** Proposed
-* **Date:** 2026-08-25
-* **Decision owners:** Project maintainers
-* **Depends on:** ADR-0006 — Decision Authority and Human Approval
-* **Related:** ADR-0001 — Maestro as an Engineering Execution Platform
-* **Related:** ADR-0005 — Audit as a First-Class Governance Plane
+Date: 2026-08-25
+
+Status: Proposed
+
+Depends on: ADR-0006
+
+Related: ADR-0008, ADR-0011, ADR-0013
 
 ## Context
 
-Maestro should not blindly trust the first AI-generated conclusion.
+An agent saying that its own work is correct is not independent validation. At the same time,
+running several agents, judges, and voting rounds for every change adds cost and latency without
+necessarily reducing correlated errors.
 
-Today, human users often provide an informal challenge layer by asking another agent:
+Maestro needs enough assurance for the risk of the action, with deterministic checks doing the
+work that does not require model judgement.
 
-> Is this answer actually correct?
-
-> Try to find a reason this design is wrong.
-
-> Does the repository contradict this conclusion?
-
-As Maestro coordinates work autonomously, this manual challenge pattern must become an explicit assurance capability.
-
-However, invoking several identical agents for every question would:
-
-* increase latency;
-* increase cost;
-* produce correlated errors;
-* create unnecessary complexity;
-* still fail to establish authority.
-
-The architecture therefore needs risk-proportional assurance rather than universal multi-agent voting.
+The first concrete consumer is the proposed `review_pull_request` Job in ADR-0008. That Job may
+ask one worker to review a revision, another to address findings, and then must determine whether
+the resulting revision satisfies the review and repository gates.
 
 ## Proposed Decision
 
-Maestro will use a policy-driven Assurance model.
+Assurance is proportional to risk and uses the smallest combination of these roles that provides
+independent evidence:
 
-The amount of independent challenge and validation applied to a conclusion or engineering outcome should be proportional to:
+- **Producer** creates a conclusion or change.
+- **Challenger** searches for contradictions, defects, and unsupported assumptions.
+- **Validator** checks the resulting artifact against explicit acceptance criteria and
+  deterministic evidence.
+- **Human authority** decides matters reserved by ADR-0006.
 
-* risk;
-* ambiguity;
-* novelty;
-* reversibility;
-* security impact;
-* data impact;
-* architectural significance;
-* quality of evidence.
+These are roles, not permanent agent types. One worker may perform more than one role only when
+independence is not required for that outcome.
 
-The central pattern is:
+## Deterministic Minimums
 
-```text
-Produce
-   ↓
-Challenge when required
-   ↓
-Accept / Escalate / Adjudicate
-   ↓
-Validate outcome
-```
+Model judgement never replaces available deterministic checks. Depending on the change, assurance
+includes the relevant subset of:
 
-Challenge is intended to falsify or qualify a conclusion, not merely repeat the original analysis.
+- exact repository revision checks;
+- schema and semantic validation;
+- tests, type checking, linting, and security gates required by project policy;
+- evidence that findings refer to the reviewed revision;
+- validation that external side effects reached their intended state;
+- explicit authority checks for decisions or actions governed by ADR-0006.
 
-## Roles
+An operational failure is not reported as uncertainty, and uncertainty is not coerced into a pass.
 
-### Investigator / Producer
+## Risk Profiles
 
-The Investigator answers:
+The initial vocabulary is deliberately small:
 
-> What does the evidence support?
+- **Routine**: established, reversible work with no material security, data, architecture, or
+  public-contract impact. Deterministic gates may be sufficient.
+- **Standard**: meaningful implementation work requiring review plus deterministic validation.
+- **Elevated**: security, data, architecture, irreversible, or public-contract impact requiring an
+  independent challenger or validator and explicit authority where applicable.
 
-For repository facts it may produce:
-
-```text
-answer
-evidence
-confidence
-conflicts
-```
-
-For technical work a Producer may create:
-
-* PRD draft;
-* technical design;
-* implementation;
-* recommendation.
-
-### Challenger / Skeptic
-
-The Challenger answers:
-
-> How might this conclusion or artifact be wrong, incomplete, unsafe, or unsupported?
-
-Its goal is adversarial falsification.
-
-The Challenger should actively search for:
-
-* counterevidence;
-* hidden assumptions;
-* contradictions;
-* unhandled edge cases;
-* conflicting ADRs;
-* incomplete requirements;
-* security risks;
-* backwards-compatibility issues;
-* invalid inference;
-* missing validation.
-
-The Challenger is not a second agent asked merely:
-
-```text
-"Do you agree?"
-```
-
-### Adjudicator
-
-The Adjudicator may be introduced when meaningful disagreement remains and evidence appears sufficient for resolution.
-
-It answers:
-
-> Given the competing claims and evidence, what conclusion is best supported?
-
-Possible outcomes include:
-
-```text
-resolved
-uncertain
-recommendation
-human_decision_required
-```
-
-The Adjudicator does not gain decision authority merely by acting as judge.
-
-### Human / Policy Authority
-
-Authority remains governed by ADR-0006.
-
-For example:
-
-```text
-Investigator recommends PostgreSQL.
-Challenger recommends SQLite.
-Adjudicator favors PostgreSQL.
-
-Authority class:
-HUMAN_TECHNICAL
-
-Result:
-Recommendation = PostgreSQL
-Decision = WAITING_FOR_HUMAN
-```
-
-## Challenger Before Judge
-
-The initial preferred assurance model is:
-
-```text
-Investigator
-     ↓
-Challenger
-     ↓
-agree?
- ┌───┴───┐
-yes      no
- │        │
-accept   uncertain / escalate
-```
-
-An Adjudicator should not be introduced merely because it is possible.
-
-The first implementation should determine from real cases whether adjudication materially improves outcomes.
-
-Disagreement is itself useful evidence.
-
-The correct result may be:
-
-```text
-uncertain
-```
-
-rather than forcing artificial consensus.
+No numeric risk score or configurable policy engine is introduced initially. The first Job may
+encode a small deterministic policy and collect evidence for later refinement.
 
 ## Independence
 
-Challenge quality depends on independence.
+Independence comes primarily from:
 
-Prefer independence through:
+- fresh execution context;
+- an objective different from producing or fixing the artifact;
+- independently gathered repository evidence;
+- validation against an exact revision and explicit criteria;
+- inability to mark one's own work complete when policy requires another validator.
 
-1. fresh context;
-2. independently gathered evidence;
-3. different investigative objective;
-4. adversarial instructions;
-5. independent tools/harness when useful;
-6. different model family when materially beneficial.
+Different model providers may reduce some correlated errors, but provider diversity is optional
+and is not proof of independence. Multiple votes over the same context are not an assurance model.
 
-Do not assume that multiple model calls equal independent opinions.
+## First Job Constraint
 
-Voting alone is not sufficient assurance.
+For `review_pull_request`:
 
-## Confirmation Bias
+1. the review is bound to an exact PR revision;
+2. a worker that changes the code does not perform the final independent validation;
+3. deterministic repository gates run at the depth required by project policy;
+4. validation confirms that material findings are fixed, explicitly rejected with evidence, or
+   escalated;
+5. correction and validation rounds are bounded;
+6. unresolved disagreement or unavailable authority becomes a durable checkpoint, not forced
+   consensus.
 
-The Challenger should not be primed unnecessarily with the Investigator's confidence or persuasive narrative.
+The review worker and final validator may use the same runtime implementation if they have fresh
+contexts and distinct objectives. Whether a different model materially improves outcomes is an
+evaluation question under ADR-0011.
 
-Prefer neutral framing.
+## Audit and Evidence
 
-Poor:
+Work Management contains findings and decisions needed to continue. Job state contains the
+checkpoint and exact revisions needed to resume. Audit records only material assurance outcomes
+as bounded by ADR-0013. Low-level prompts, votes, and tool traces are observability data or are
+discarded.
 
-```text
-The first agent is highly confident that X is safe.
-Verify it.
-```
+## Not Decided Here
 
-Better:
+This proposal does not define:
 
-```text
-Question:
-Is X safe under the documented constraints?
+- a generic multi-agent debate framework;
+- an adjudicator for every disagreement;
+- model-provider routing;
+- numeric scoring or configurable risk rules;
+- Job persistence or MCP contracts;
+- authority beyond ADR-0006.
 
-Candidate evidence:
-...
+## Acceptance Evidence
 
-Search specifically for evidence that contradicts, qualifies,
-or invalidates the candidate conclusion.
-```
+Before this ADR is accepted, the first Job design should demonstrate:
 
-Where practical, the Challenger may first investigate the original question independently before seeing the candidate conclusion.
+- which review outcomes require independent validation;
+- how exact-revision validation is enforced;
+- which deterministic gates are mandatory;
+- how bounded retries and human escalation behave;
+- an evaluation comparing the chosen assurance flow with a simpler control arm.
 
-## Evidence-First Adjudication
-
-If adjudication is used, it should compare evidence rather than agent rhetoric.
-
-The Adjudicator should receive structured information such as:
-
-```text
-original question
-candidate conclusion
-counterclaim
-evidence A
-evidence B
-known authority
-rubric
-```
-
-It should not choose based on which agent sounds more confident.
-
-## Assurance Dimensions
-
-Assurance should not be based only on "complexity."
-
-Relevant dimensions include:
-
-```text
-technical complexity
-domain ambiguity
-architecture novelty
-security impact
-data impact
-external side effects
-reversibility
-breaking-change risk
-confidence/evidence quality
-```
-
-A change can be:
-
-```text
-technically simple
-+
-security critical
-```
-
-and require strong assurance.
-
-## Assurance Profiles
-
-The initial conceptual profiles are:
-
-```text
-ROUTINE
-STANDARD
-ELEVATED
-CRITICAL
-```
-
-Exact naming and thresholds remain open.
-
-### ROUTINE
-
-Typical characteristics:
-
-* established implementation pattern;
-* low ambiguity;
-* reversible;
-* no material security/data/public-contract impact.
-
-Possible assurance:
-
-```text
-implementation
-→ tests
-→ deterministic validation
-```
-
-### STANDARD
-
-Typical characteristics:
-
-* moderate change;
-* known domain behavior;
-* some cross-component impact.
-
-Possible assurance:
-
-```text
-implementation
-→ review
-→ validation
-```
-
-### ELEVATED
-
-Typical characteristics:
-
-* architecture novelty;
-* meaningful schema/data change;
-* non-trivial domain behavior;
-* security-relevant change;
-* external side effects.
-
-Possible assurance:
-
-```text
-explicit design
-→ grill/challenge
-→ implementation
-→ independent review
-→ independent validation
-```
-
-### CRITICAL
-
-Typical characteristics:
-
-* destructive action;
-* security boundary;
-* production migration;
-* material breaking change;
-* high-risk data behavior.
-
-Possible assurance:
-
-```text
-explicit human approval
-→ multiple independent challenge stages
-→ tightly bounded implementation
-→ independent final validation
-```
-
-The policy must be validated empirically rather than implemented as arbitrary thresholds.
-
-## Deterministic Assurance Signals
-
-Some signals should impose minimum assurance regardless of model opinion.
-
-Potential examples:
-
-```text
-breaking public API
-→ at least ELEVATED
-
-security boundary change
-→ at least ELEVATED
-
-destructive migration
-→ CRITICAL
-
-new persistence technology
-→ explicit technical approval
-
-production infrastructure action
-→ explicit risk/technical approval
-
-high domain ambiguity
-→ requirements refinement required
-```
-
-An AI assessment may increase assurance.
-
-It should not reduce a deterministic minimum imposed by policy.
-
-### Self-reported confidence
-
-A worker's own confidence is one such assessment, and it is subject to the same rule.
-
-Low reported confidence is a reasonable trigger for additional assurance: a second opinion, a
-targeted challenge, or a broader evidence sweep. That direction is additive, so a worker that
-misjudges itself costs effort rather than correctness.
-
-High reported confidence must not remove validation that policy already requires. The verifier
-policy states that model confidence is not proof, and ADR-0002 holds model-produced evidence
-untrusted until application code validates it. Letting a claim decide whether that claim is
-checked would invert both. The baseline checks are deterministic and cheap, so there is no
-saving that would justify it.
-
-## Agent Assessment
-
-AI may contribute an assessment such as:
-
-```text
-architecture_impact: cross_cutting
-domain_ambiguity: medium
-security_impact: low
-reversibility: medium
-```
-
-This is an input to policy, not the sole authority.
-
-Conceptually:
-
-```text
-Assurance Profile
-=
-deterministic minimums
-+
-task assessment
-+
-existing artifacts
-+
-agent recommendation
-```
-
-## Grill as Challenge Workflow
-
-The future role of `grill` is expected to become more explicitly adversarial.
-
-Rather than rediscovering all requirements, `grill` should primarily pressure-test an existing artifact or proposal.
-
-Examples:
-
-```text
-PRD
-  ↓
-grill
-  ↓
-domain gaps / contradictions / unsupported assumptions
-
-Technical Design
-  ↓
-grill
-  ↓
-architecture gaps / risks / missing decisions
-```
-
-The Grill should avoid reopening decisions already settled by authoritative artifacts unless it discovers evidence that they are inconsistent or incomplete.
-
-## Fine-Grained Challenger
-
-The Maestro Challenger is conceptually narrower than the `grill` skill.
-
-Example:
-
-```text
-Grill:
-The technical design assumes legacy_account_id is unused.
-
-        ↓
-
-Challenger:
-Attempt to falsify that assumption using repository evidence.
-```
-
-This allows broad artifact challenge to compose with targeted evidence challenge.
-
-## Independent Validation
-
-Validation should be independent when the assurance profile requires it.
-
-The Validator should inspect actual artifacts/state.
-
-It should not simply consume:
-
-```text
-"The implementation agent says all tests pass and the issue is complete."
-```
-
-A Validator may inspect:
-
-```text
-requirements
-approved decisions
-final diff
-repository state
-tests/results
-review findings
-relevant artifacts
-```
-
-Independent validation is particularly important before declaring a durable Job complete.
-
-## Challenge Outcomes
-
-Challenge should produce structured outcomes.
-
-Conceptually:
-
-```text
-PASS
-COUNTEREVIDENCE_FOUND
-INCOMPLETE
-UNCERTAIN
-AUTHORITY_REQUIRED
-```
-
-Exact schemas remain open.
-
-A challenge failure should return the workflow only to the stage necessary to resolve the gap where possible.
-
-## Bounded Challenge
-
-Challenge loops must be bounded.
-
-Avoid:
-
-```text
-agent → challenger → agent → challenger → ...
-```
-
-without explicit policy limits.
-
-Possible limits include:
-
-```text
-max challenge rounds
-max address rounds
-max wall-clock duration
-max agent executions
-```
-
-When limits are reached, escalate explicitly.
-
-## Relation to Decision Authority
-
-Challenge may modify:
-
-```text
-confidence
-recommendation
-identified risks
-evidence
-```
-
-Challenge cannot independently grant:
-
-```text
-domain authority
-technical authority
-risk acceptance
-```
-
-ADR-0006 remains authoritative for decision rights.
-
-## Relation to Audit
-
-Semantic assurance events should be auditable.
-
-Examples:
-
-```text
-assurance.assessed
-challenge.required
-challenge.completed
-counterevidence.found
-adjudication.completed
-validation.completed
-```
-
-Audit should record:
-
-* outcome;
-* concise rationale;
-* relevant evidence;
-* role/runtime;
-* assurance profile.
-
-It should not persist private chain-of-thought.
-
-## Relation to Observability
-
-Detailed agent traces, model calls, tool calls, token usage, and timing belong to Observability.
-
-Audit records assurance meaning.
-
-Example:
-
-```text
-Audit:
-Independent challenge found no counterevidence.
-
-Observability:
-- model X
-- 12 searches
-- 28 files
-- latency
-- token usage
-```
-
-## Runtime Diversity
-
-The architecture may later allow:
-
-```text
-Investigator → CodexRuntime
-Challenger   → ClaudeCodeRuntime
-```
-
-or another combination.
-
-Runtime diversity may improve independence but should not be assumed automatically superior.
-
-The assurance contract must remain provider-independent.
-
-## Eval Requirement
-
-Assurance policies must eventually be evaluated empirically.
-
-A future eval corpus should include:
-
-* straightforward facts;
-* subtle counterexamples;
-* conflicting ADR/code;
-* domain ambiguity;
-* plausible but wrong technical recommendations;
-* security-sensitive changes;
-* missing requirements;
-* hallucinated evidence.
-
-Metrics may include:
-
-```text
-false acceptance
-false escalation
-counterevidence detection
-unnecessary challenge rate
-human disagreement
-latency/cost
-```
-
-Assurance level should be calibrated using evidence, not intuition alone.
-
-## Proposed Invariants
-
-Before acceptance, validate:
-
-1. Assurance is proportional to risk/ambiguity, not universal multi-agent voting.
-2. Challenger and Investigator have distinct objectives.
-3. Challenger actively seeks falsification/counterevidence.
-4. Disagreement may legitimately yield `uncertain`.
-5. Adjudication is optional, not mandatory.
-6. Judge/adjudicator does not gain decision authority.
-7. Deterministic policy can impose minimum assurance.
-8. AI may increase but not bypass minimum assurance.
-9. Independent validation inspects actual outcomes.
-10. Challenge loops are bounded.
-11. Assurance outcomes are auditable.
-12. Detailed technical traces remain Observability.
-13. Policies should be calibrated with evals.
-
-## Open Questions Before Acceptance
-
-### Profiles
-
-Are four profiles appropriate?
-
-### Scoring
-
-Should policy use categorical rules, numeric score, or both?
-
-### Challenger implementation
-
-Should Challenger reuse `AgentRuntime` with a role-specific policy?
-
-### Runtime diversity
-
-When does using a different runtime materially improve assurance?
-
-### Adjudicator
-
-When is an Adjudicator worth its added cost/latency?
-
-### Grill integration
-
-Should `grill` call targeted Challenger capabilities directly or only through Maestro Job orchestration?
-
-### Evidence isolation
-
-How much of the candidate conclusion should Challenger see initially?
-
-### Assurance persistence
-
-Does the assurance profile belong in Job state, an artifact, Audit, or all three?
-
-### Human override
-
-Can a maintainer deliberately reduce required assurance for a Job, and how is that audited?
-
-## Non-Goals
-
-This ADR does not implement:
-
-* multi-agent consensus;
-* model voting;
-* challenger runtime;
-* adjudicator runtime;
-* assurance scoring;
-* new `grill` skill;
-* PR review Job;
-* feature Job;
-* provider routing;
-* automatic model selection.
-
-## Consequences if Accepted
+## Consequences
 
 ### Positive
 
-Risk-proportional assurance would:
-
-* avoid blindly trusting the first model;
-* reduce unnecessary multi-agent cost;
-* detect hidden assumptions;
-* provide stronger validation for high-risk work;
-* keep simple tasks fast;
-* allow model/runtime diversity;
-* integrate naturally with Audit and Jobs.
+- Assurance effort follows material risk.
+- Self-validation is prevented where it matters.
+- Deterministic checks remain the primary evidence for deterministic claims.
+- The first implementation does not require a general debate or voting system.
 
 ### Negative
 
-Assurance policy itself can be wrong.
-
-Overly aggressive challenge increases cost and latency.
-
-Weak challenge creates false confidence.
-
-Multiple agents may still make correlated errors.
-
-The system needs evals and operational feedback to calibrate policies.
-
-## Decision Summary
-
-This ADR proposes:
-
-```text
-Produce
-   ↓
-Challenge proportional to risk
-   ↓
-Accept / Uncertain / Escalate
-   ↓
-Independent validation when required
-```
-
-with:
-
-```text
-Challenge improves evidence quality.
-Challenge does not create authority.
-```
-
-The proposal remains **Proposed** until validated against the current Maestro architecture, Decision Authority model, and real evaluation cases.
+- The initial policy is intentionally narrow and may need revision after evaluations.
+- Independent validation adds cost and latency to non-routine work.
+- Some outcomes will correctly stop for human input rather than complete autonomously.

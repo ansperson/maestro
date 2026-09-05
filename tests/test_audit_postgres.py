@@ -1519,7 +1519,7 @@ async def _bootstrap_v2_database(raw_dsn: str) -> tuple[str, str, str]:
     return migrator_password, writer_password, reader_password
 
 
-async def _apply_roles_and_views(raw_dsn: str, migrator_password: str) -> str:
+async def _apply_remaining_migrations(raw_dsn: str, migrator_password: str) -> str:
     migrator_dsn = _role_dsn(
         raw_dsn,
         _MIGRATOR_ROLE,
@@ -1528,7 +1528,8 @@ async def _apply_roles_and_views(raw_dsn: str, migrator_password: str) -> str:
     )
     connection = await AsyncConnection.connect(migrator_dsn)
     try:
-        await _execute_resource(connection, packaged_migrations()[2].sql)
+        for migration in packaged_migrations()[2:]:
+            await _execute_resource(connection, migration.sql)
         await connection.commit()
         await connection.execute("CREATE SCHEMA audit_migrator_probe")
         await connection.execute("DROP SCHEMA audit_migrator_probe")
@@ -1973,7 +1974,7 @@ async def test_postgres_roles_views_and_forward_migration() -> None:
     if raw_dsn is None:
         pytest.skip(f"set {_TEST_DSN_ENV} to run PostgreSQL Audit adapter tests")
     migrator_password, writer_password, reader_password = await _bootstrap_v2_database(raw_dsn)
-    migrator_dsn = await _apply_roles_and_views(raw_dsn, migrator_password)
+    migrator_dsn = await _apply_remaining_migrations(raw_dsn, migrator_password)
     writer_dsn = _role_dsn(raw_dsn, _WRITER_ROLE, writer_password, "maestro-audit-issue11")
     reader_dsn = _role_dsn(raw_dsn, _READER_ROLE, reader_password, "maestro-audit-reader")
     port = PostgresAuditPort(_writer_configuration_from_dsn(writer_dsn))

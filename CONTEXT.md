@@ -4,10 +4,11 @@ Domain vocabulary for this project. Agents and contributors rely on these terms 
 exactly this. Where a term comes from an accepted ADR, the ADR is authoritative and this
 entry is a summary.
 
-## Planes
+## Information ownership
 
-Maestro separates three planes (ADR-0004). They reference one another through stable
-identifiers and never substitute for one another.
+Maestro separates three planes (ADR-0004) and reserves resumable execution state for future
+Jobs (ADR-0013). They reference one another through stable identifiers and never substitute
+for one another.
 
 ### Work Management Plane
 Engineering intent and coordination: what needs doing, its status, and the decisions and
@@ -15,14 +16,19 @@ clarifications humans provide. Lives in an issue tracker, so a human and an agen
 read and act on it without database access.
 
 ### Audit Plane
-The semantic governance history of execution: what Maestro decided and did, why, on what
-evidence, and with what outcome. Fail-closed — an audited execution cannot succeed without a
-durable Trail (ADR-0005). Not a troubleshooting convenience: it is the evidence that
-governance happened.
+The bounded semantic record proving material actions and outcomes. It is not a transcript,
+workflow engine, artifact registry, or source of resumable state. The implemented
+`resolve_codebase_fact` boundary remains fail-closed: an audited execution cannot succeed
+without its required durable Trail. Further expansion is frozen by ADR-0013.
+
+### Job state
+The minimum durable state required to resume a future Job safely: its checkpoint, expected
+revisions, attempts, idempotency identities, and references to artifacts or external side
+effects. Jobs own this state. Audit is not queried to decide the next transition.
 
 ### Observability Plane
-How execution technically happened. Structured logs to stderr, never the record of what was
-decided.
+How execution technically happened: model and tool calls, timings, retries, diagnostics, and
+logs. Structured logs go to stderr and never substitute for authority, Job state, or Audit.
 
 ## Decisions and authority
 
@@ -77,13 +83,5 @@ extractor, and one deterministic rubric scores both arms.
 
 ### Verifiability
 Whether evidence resolves against the repository, whether the fingerprint proves the
-repository was unchanged, and whether a Trail was recorded. Measured, never judged. These are
-the properties that distinguish a tool from a plain model invocation.
-
-## Recurring rule
-
-### Assessment asymmetry
-A model assessment may raise a requirement and never lower one. It holds for assurance level
-(ADR-0007), for self-reported confidence, and for an agent judging whether it may unblock
-itself (ADR-0006). Concluding "this needs more scrutiny" is safe; concluding "this needs
-less" is the claim deciding whether the claim is checked.
+repository was unchanged, and whether the required Trail was recorded. Measured, never
+judged. These are the properties that distinguish a tool from a plain model invocation.

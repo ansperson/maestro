@@ -151,7 +151,9 @@ exclude_also = [
 
 [tool.deptry]
 extend_exclude = ["tests/fixtures"]
-known_first_party = ["maestro"]
+# `scripts/` modules import each other by bare name when run directly as scripts, which is
+# first-party code rather than an undeclared dependency.
+known_first_party = ["maestro", "eval_control"]
 
 [tool.deptry.per_rule_ignores]
 DEP002 = [

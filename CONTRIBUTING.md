@@ -1,8 +1,8 @@
 # Contributing
 
-Use Python 3.13+ and `uv`. Keep v1 limited to `resolve_codebase_fact`; changes that introduce
-Jobs, durable state, remote transport, integrations, or subagents require separate planning
-and architectural decisions.
+Use Python 3.13+ and `uv`. Keep the current scope limited to `resolve_codebase_fact`; changes that
+introduce Jobs, durable state, remote transport, integrations, or subagents require separate
+planning and architectural decisions.
 
 ```bash
 uv sync --frozen --all-groups
