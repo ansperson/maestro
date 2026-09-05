@@ -236,6 +236,13 @@ coordination to Work Management. Applied content is captured rather than referen
 later edit to the work item cannot change what the Trail says was authorized. Read it with
 `make read ARGS="--view authority"`.
 
+[ADR-0012](docs/adr/0012-keep-audit-bounded-and-off-the-job-critical-path.md) freezes further
+speculative Audit expansion. Work Management retains what people and later executions need to
+continue, future Jobs own resumable state, Audit records only material semantic actions and
+outcomes, and Observability owns technical traces. Audit is not a transcript or a Job store, and
+future ordinary Job transitions must not synchronously depend on the current self-committing
+Audit recorder.
+
 Maestro records who approved a decision. It does not verify that the approver holds authority
 for that class of decision; that check is a later addition rather than a reopening of the
 model.
